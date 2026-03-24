@@ -675,3 +675,10 @@ void DexCache::AtomicStoreRelease16B(
 }  // namespace art
 
 // XzCompress/XzDecompress by-value overloads now provided by xz_utils.o
+
+// Android 15 additional stubs
+
+
+// Android 15 hidden symbol stubs
+extern "C" __attribute__((visibility("default"))) void* _ZN3art3jit10jit_createEv() { return nullptr; }
+extern "C" __attribute__((visibility("default"))) void* _ZN3artlsERNSt3__113basic_ostreamIcNS0_11char_traitsIcEEEERKNS_10IntrinsicsE(void* os, const void*) { return os; }

@@ -510,14 +510,14 @@ nativehelper:
 dalvikvm-main:
 	@mkdir -p $(BUILDDIR)/dalvikvm
 	@echo "=== dalvikvm main ==="
-	@$(CXX) $(NATIVEHELPER_CXXFLAGS) \
+	@$(CXX) $(CXXFLAGS) \
 	  -I$(ART)/dalvikvm \
 	  -c $(ART)/dalvikvm/dalvikvm.cc \
 	  -o $(BUILDDIR)/dalvikvm/dalvikvm.o 2>&1 && echo "OK: dalvikvm.cc" || echo "FAIL: dalvikvm.cc"
 
 # ============ link-runtime (dalvikvm without compiler) ============
-link-runtime: all ziparchive sigchain nativehelper dalvikvm-main asm-x86_64
-	@echo "=== Linking dalvikvm (runtime only, no compiler) ==="
+link-runtime: all ziparchive sigchain nativehelper dalvikvm-main asm-x86_64 sve-stub
+	@echo "=== Linking dalvikvm (runtime + compiler for JIT) ==="
 	@mkdir -p $(BUILDDIR)/bin
 	$(HOSTLD) -o $(BUILDDIR)/bin/dalvikvm \
 	    -rdynamic -Wl,--unresolved-symbols=ignore-all \
