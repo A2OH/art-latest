@@ -516,7 +516,7 @@ dalvikvm-main:
 	  -o $(BUILDDIR)/dalvikvm/dalvikvm.o 2>&1 && echo "OK: dalvikvm.cc" || echo "FAIL: dalvikvm.cc"
 
 # ============ link-runtime (dalvikvm without compiler) ============
-link-runtime: all ziparchive sigchain nativehelper dalvikvm-main asm-x86_64 sve-stub
+link-runtime: all ziparchive sigchain nativehelper dalvikvm-main asm-x86_64 fmtlib tinyxml2 sve-stub
 	@echo "=== Linking dalvikvm (runtime + compiler for JIT) ==="
 	@mkdir -p $(BUILDDIR)/bin
 	$(HOSTLD) -o $(BUILDDIR)/bin/dalvikvm \
@@ -539,6 +539,10 @@ link-runtime: all ziparchive sigchain nativehelper dalvikvm-main asm-x86_64 sve-
 	  $(STUBS_OBJ) \
 	  $(BUILDDIR)/stubs/fault_handler_stubs.o \
 	  $(BUILDDIR)/stubs/template_instantiations.o \
+	  $(BUILDDIR)/fmtlib/format.o \
+	  $(BUILDDIR)/tinyxml2/tinyxml2.o \
+	  $(BUILDDIR)/stubs/metrics_stubs.o \
+	  $(BUILDDIR)/stubs/code_generator_vector_arm64_sve_stub.o \
 	  $(LDFLAGS) -lrt
 	@echo "Built: $(BUILDDIR)/bin/dalvikvm"
 	@ls -lh $(BUILDDIR)/bin/dalvikvm
