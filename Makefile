@@ -225,9 +225,18 @@ RUNTIME_EXCLUDE = %backtrace_helper.cc \
   %runtime_intrinsics.cc \
   %runtime/class_linker.cc \
   %runtime/thread.cc \
+  %runtime/runtime.cc \
   %interpreter/unstarted_runtime.cc
 RUNTIME_SRCS = $(filter-out $(RUNTIME_EXCLUDE),$(RUNTIME_SRCS_ALL))
 RUNTIME_OBJS = $(patsubst $(ART)/%.cc,$(BUILDDIR)/%.o,$(RUNTIME_SRCS))
+
+# Patched runtime.cc (tolerant JNI native registration for version-mismatched core JARs)
+RT_PATCH_SRC = patches/runtime/runtime.cc
+RT_PATCH_OBJ = $(BUILDDIR)/runtime/runtime.o
+$(RT_PATCH_OBJ): $(RT_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@ 2>&1 && echo "OK: runtime.cc (patched)" || { echo "FAIL: runtime.cc (patched)"; rm -f $@; }
+RUNTIME_OBJS += $(RT_PATCH_OBJ)
 
 # Patched class_linker.cc (tolerant CheckSystemClass, non-fatal EnsureRootInitialized)
 CL_PATCH_SRC = patches/runtime/class_linker.cc

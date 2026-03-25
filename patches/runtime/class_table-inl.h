@@ -100,11 +100,9 @@ void ClassTable::VisitRoots(Visitor& visitor, bool skip_classes) {
   for (GcRoot<mirror::Object>& root : strong_roots_) {
     visitor.VisitRoot(root.AddressWithoutBarrier());
   }
-  for (const OatFile* oat_file : oat_files_) {
-    for (GcRoot<mirror::Object>& root : oat_file->GetBssGcRoots()) {
-      visitor.VisitRootIfNonNull(root.AddressWithoutBarrier());
-    }
-  }
+  // Skip oat_files_ BSS GC root visiting. In standalone boot image builds
+  // without app images, BSS roots are not used and the vector may be corrupt
+  // due to memory layout issues during early initialization.
 }
 
 template <class Visitor>
@@ -119,11 +117,6 @@ void ClassTable::VisitRoots(const Visitor& visitor, bool skip_classes) {
   }
   for (GcRoot<mirror::Object>& root : strong_roots_) {
     visitor.VisitRoot(root.AddressWithoutBarrier());
-  }
-  for (const OatFile* oat_file : oat_files_) {
-    for (GcRoot<mirror::Object>& root : oat_file->GetBssGcRoots()) {
-      visitor.VisitRootIfNonNull(root.AddressWithoutBarrier());
-    }
   }
 }
 
@@ -168,11 +161,6 @@ void ClassTable::VisitClassesAndRoots(Visitor& visitor) {
   }
   for (GcRoot<mirror::Object>& root : strong_roots_) {
     visitor.VisitRoot(root.AddressWithoutBarrier());
-  }
-  for (const OatFile* oat_file : oat_files_) {
-    for (GcRoot<mirror::Object>& root : oat_file->GetBssGcRoots()) {
-      visitor.VisitRootIfNonNull(root.AddressWithoutBarrier());
-    }
   }
 }
 

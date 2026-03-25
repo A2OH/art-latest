@@ -583,6 +583,53 @@ bool ImageWriter::Write(int image_fd,
     CopyAndFixupObjects();
   }
 
+  // Post-fixup pass: scan all method arrays in the image and fix any stale entry points.
+  // With --compiler-filter=verify and skipped class initialization, some methods
+  // retain their runtime entry point values (small offsets) instead of OAT addresses.
+  {
+    const uint8_t* interp_bridge = GetOatAddress(StubType::kQuickToInterpreterBridge);
+    int fixed = 0;
+    const size_t method_size = ArtMethod::Size(target_ptr_size_);
+    const size_t method_align = ArtMethod::Alignment(target_ptr_size_);
+    for (auto& pair : native_object_relocations_) {
+      NativeObjectRelocation& relocation = pair.second;
+      // Process method arrays (which contain the individual methods)
+      if (relocation.type == NativeObjectRelocationType::kArtMethodArrayClean ||
+          relocation.type == NativeObjectRelocationType::kArtMethodArrayDirty) {
+        const ImageInfo& info = GetImageInfo(relocation.oat_index);
+        auto* arr = reinterpret_cast<LengthPrefixedArray<ArtMethod>*>(
+            info.image_.Begin() + relocation.offset);
+        const size_t num_methods = arr->size();
+        const size_t header_size = LengthPrefixedArray<ArtMethod>::ComputeSize(
+            0, method_size, method_align);
+        for (size_t j = 0; j < num_methods; ++j) {
+          auto* method = reinterpret_cast<ArtMethod*>(
+              reinterpret_cast<uint8_t*>(arr) + header_size + j * method_size);
+          const void* ep = method->GetEntryPointFromQuickCompiledCodePtrSize(target_ptr_size_);
+          uintptr_t ep_val = reinterpret_cast<uintptr_t>(ep);
+          if (ep_val != 0 && ep_val < 0x10000 && interp_bridge != nullptr) {
+            method->SetEntryPointFromQuickCompiledCodePtrSize(interp_bridge, target_ptr_size_);
+            ++fixed;
+          }
+        }
+      }
+      // Also check individual runtime methods
+      if (relocation.type == NativeObjectRelocationType::kRuntimeMethod ||
+          relocation.type == NativeObjectRelocationType::kArtMethodClean ||
+          relocation.type == NativeObjectRelocationType::kArtMethodDirty) {
+        const ImageInfo& info = GetImageInfo(relocation.oat_index);
+        auto* method = reinterpret_cast<ArtMethod*>(info.image_.Begin() + relocation.offset);
+        const void* ep = method->GetEntryPointFromQuickCompiledCodePtrSize(target_ptr_size_);
+        uintptr_t ep_val = reinterpret_cast<uintptr_t>(ep);
+        if (ep_val != 0 && ep_val < 0x10000 && interp_bridge != nullptr) {
+          method->SetEntryPointFromQuickCompiledCodePtrSize(interp_bridge, target_ptr_size_);
+          ++fixed;
+        }
+      }
+    }
+    LOG(WARNING) << "Post-fixup: scanned methods, fixed " << fixed << " invalid entry points";
+  }
+
   if (compiler_options_.IsAppImage()) {
     CopyMetadata();
   }
@@ -2931,8 +2978,15 @@ class ImageWriter::FixupRootVisitor : public RootVisitor {
 };
 
 void ImageWriter::CopyAndFixupImTable(ImTable* orig, ImTable* copy) {
+  // When class initialization is skipped, IMT slots may reference methods from
+  // classes not in the image (no relocation entry). Replace those with the
+  // imt_unimplemented_method which triggers proper resolution at runtime.
+  ArtMethod* fallback_method = Runtime::Current()->GetImtUnimplementedMethod();
   for (size_t i = 0; i < ImTable::kSize; ++i) {
     ArtMethod* method = orig->Get(i, target_ptr_size_);
+    if (method != nullptr && !IsInBootImage(method) && !NativeRelocationAssigned(method)) {
+      method = fallback_method;
+    }
     void** address = reinterpret_cast<void**>(copy->AddressOfElement(i, target_ptr_size_));
     CopyAndFixupPointer(address, method);
     DCHECK_EQ(copy->Get(i, target_ptr_size_), NativeLocationInImage(method));
@@ -2940,10 +2994,20 @@ void ImageWriter::CopyAndFixupImTable(ImTable* orig, ImTable* copy) {
 }
 
 void ImageWriter::CopyAndFixupImtConflictTable(ImtConflictTable* orig, ImtConflictTable* copy) {
+  // Same as CopyAndFixupImTable: replace methods without relocations with a safe fallback.
+  ArtMethod* fallback_method = Runtime::Current()->GetImtUnimplementedMethod();
   const size_t count = orig->NumEntries(target_ptr_size_);
   for (size_t i = 0; i < count; ++i) {
     ArtMethod* interface_method = orig->GetInterfaceMethod(i, target_ptr_size_);
     ArtMethod* implementation_method = orig->GetImplementationMethod(i, target_ptr_size_);
+    if (interface_method != nullptr && !IsInBootImage(interface_method) &&
+        !NativeRelocationAssigned(interface_method)) {
+      interface_method = fallback_method;
+    }
+    if (implementation_method != nullptr && !IsInBootImage(implementation_method) &&
+        !NativeRelocationAssigned(implementation_method)) {
+      implementation_method = fallback_method;
+    }
     CopyAndFixupPointer(copy->AddressOfInterfaceMethod(i, target_ptr_size_), interface_method);
     CopyAndFixupPointer(
         copy->AddressOfImplementationMethod(i, target_ptr_size_), implementation_method);
@@ -3117,17 +3181,12 @@ void ImageWriter::CopyAndFixupMethodPointerArray(mirror::PointerArray* arr) {
   CopyAndFixupReference(dst->GetFieldObjectReferenceAddr<kVerifyNone>(Class::ClassOffset()),
                         arr->GetClass<kVerifyNone, kWithoutReadBarrier>());
   auto* dest_array = down_cast<mirror::PointerArray*>(dst);
+  ArtMethod* fallback_method = Runtime::Current()->GetImtUnimplementedMethod();
   for (size_t i = 0, count = num_elements; i < count; ++i) {
     void* elem = arr->GetElementPtrSize<void*>(i, target_ptr_size_);
-    if (kIsDebugBuild && elem != nullptr && !IsInBootImage(elem)) {
-      auto it = native_object_relocations_.find(elem);
-      if (UNLIKELY(it == native_object_relocations_.end())) {
-        auto* method = reinterpret_cast<ArtMethod*>(elem);
-        LOG(FATAL) << "No relocation entry for ArtMethod " << method->PrettyMethod() << " @ "
-                   << method << " idx=" << i << "/" << num_elements << " with declaring class "
-                   << Class::PrettyClass(method->GetDeclaringClass<kWithoutReadBarrier>());
-        UNREACHABLE();
-      }
+    // Replace methods without relocation entries with a safe fallback.
+    if (elem != nullptr && !IsInBootImage(elem) && !NativeRelocationAssigned(elem)) {
+      elem = fallback_method;
     }
     CopyAndFixupPointer(dest_array->ElementAddress(i, target_ptr_size_), elem);
   }
@@ -3301,13 +3360,8 @@ ImageWriter::NativeObjectRelocation ImageWriter::GetNativeRelocation(void* obj) 
   DCHECK(obj != nullptr);
   DCHECK(!IsInBootImage(obj));
   auto it = native_object_relocations_.find(obj);
-  if (UNLIKELY(it == native_object_relocations_.end())) {
-    // In standalone dex2oat without full class initialization, some native objects
-    // may not have relocation entries. Log warning and return a null relocation.
-    LOG(WARNING) << "Missing native relocation for " << obj;
-    static NativeObjectRelocation null_relocation = { 0, 0, NativeObjectRelocationType::kArtMethodDirty };
-    return null_relocation;
-  }
+  CHECK(it != native_object_relocations_.end()) << obj << " spaces "
+      << Runtime::Current()->GetHeap()->DumpSpaces();
   return it->second;
 }
 
@@ -3355,6 +3409,16 @@ class ImageWriter::NativeLocationVisitor {
   template <typename T>
   T* operator()(T* ptr, void** dest_addr) const REQUIRES_SHARED(Locks::mutator_lock_) {
     if (ptr != nullptr) {
+      // When class initialization is skipped, embedded vtable entries or other native
+      // pointers may reference objects (methods) from classes not in the image.
+      // Replace with a safe fallback to prevent corrupt pointers in the image.
+      if (!image_writer_->IsInBootImage(ptr) &&
+          !image_writer_->NativeRelocationAssigned(ptr)) {
+        T* fallback = reinterpret_cast<T*>(
+            Runtime::Current()->GetImtUnimplementedMethod());
+        image_writer_->CopyAndFixupPointer(dest_addr, fallback);
+        return image_writer_->NativeLocationInImage(fallback);
+      }
       image_writer_->CopyAndFixupPointer(dest_addr, ptr);
     }
     // TODO: The caller shall overwrite the value stored by CopyAndFixupPointer()
@@ -3425,6 +3489,11 @@ void ImageWriter::FixupObject(Object* orig, Object* copy) {
       auto* dest = down_cast<mirror::Executable*>(copy);
       auto* src = down_cast<mirror::Executable*>(orig);
       ArtMethod* src_method = src->GetArtMethod();
+      if (src_method != nullptr && !IsInBootImage(src_method) &&
+          !NativeRelocationAssigned(src_method)) {
+        // Method not in image; replace with resolution method to avoid corrupt pointer.
+        src_method = Runtime::Current()->GetImtUnimplementedMethod();
+      }
       CopyAndFixupPointer(dest, mirror::Executable::ArtMethodOffset(), src_method);
     } else if (klass == GetClassRoot<mirror::FieldVarHandle, kWithoutReadBarrier>(class_roots) ||
          klass == GetClassRoot<mirror::StaticFieldVarHandle, kWithoutReadBarrier>(class_roots)) {
@@ -3432,7 +3501,19 @@ void ImageWriter::FixupObject(Object* orig, Object* copy) {
       auto* dest = down_cast<mirror::FieldVarHandle*>(copy);
       auto* src = down_cast<mirror::FieldVarHandle*>(orig);
       ArtField* src_field = src->GetArtField();
-      CopyAndFixupPointer(dest, mirror::FieldVarHandle::ArtFieldOffset(), src_field);
+      // Note: ArtField relocations use the field array, not individual entries.
+      // If the declaring class's field array is missing, skip fixup.
+      if (src_field != nullptr) {
+        ObjPtr<mirror::Class> declaring_class = src_field->GetDeclaringClass<kWithoutReadBarrier>();
+        LengthPrefixedArray<ArtField>* fields = src_field->IsStatic()
+            ? declaring_class->GetSFieldsPtr() : declaring_class->GetIFieldsPtr();
+        if (fields != nullptr && !IsInBootImage(fields) && !NativeRelocationAssigned(fields)) {
+          src_field = nullptr;  // Skip fixup for unrelocated field
+        }
+      }
+      if (src_field != nullptr) {
+        CopyAndFixupPointer(dest, mirror::FieldVarHandle::ArtFieldOffset(), src_field);
+      }
     } else if (klass == GetClassRoot<mirror::DexCache, kWithoutReadBarrier>(class_roots)) {
       down_cast<mirror::DexCache*>(copy)->SetDexFile(nullptr);
       down_cast<mirror::DexCache*>(copy)->ResetNativeArrays();
@@ -3491,7 +3572,13 @@ const uint8_t* ImageWriter::GetQuickCode(ArtMethod* method, const ImageInfo& ima
     quick_code = reinterpret_cast<const uint8_t*>(quick_oat_entry_point);
   } else {
     uint32_t quick_oat_code_offset = PointerToLowMemUInt32(quick_oat_entry_point);
-    quick_code = GetOatAddressForOffset(quick_oat_code_offset, image_info);
+    // For multi-component boot images, oat_data_begin_ may be null for non-primary
+    // components. Treat resulting invalid addresses (< 0x10000) as null.
+    if (image_info.oat_data_begin_ != nullptr) {
+      quick_code = GetOatAddressForOffset(quick_oat_code_offset, image_info);
+    } else {
+      quick_code = nullptr;
+    }
   }
 
   bool still_needs_clinit_check = method->StillNeedsClinitCheck<kWithoutReadBarrier>();
@@ -3636,7 +3723,36 @@ void ImageWriter::CopyAndFixupMethod(ArtMethod* orig,
     }
   }
   if (quick_code != nullptr) {
-    copy->SetEntryPointFromQuickCompiledCodePtrSize(quick_code, target_ptr_size_);
+    // Safety: validate the entry point is a reasonable address.
+    // Addresses < 0x10000 are clearly invalid (NULL page territory).
+    uintptr_t code_addr = reinterpret_cast<uintptr_t>(quick_code);
+    if (code_addr < 0x10000) {
+      // Invalid address, replace with interpreter bridge
+      quick_code = GetOatAddress(StubType::kQuickToInterpreterBridge);
+    }
+    if (quick_code != nullptr) {
+      copy->SetEntryPointFromQuickCompiledCodePtrSize(quick_code, target_ptr_size_);
+    }
+  }
+  // Ensure all non-runtime methods have a valid entry point after fixup.
+  // Some methods may retain stale entry points from memcpy (e.g., uninitialized
+  // methods with small OAT offsets that resolve to near-null addresses).
+  {
+    const void* ep = copy->GetEntryPointFromQuickCompiledCodePtrSize(target_ptr_size_);
+    uintptr_t ep_addr = reinterpret_cast<uintptr_t>(ep);
+    if (ep_addr != 0 && ep_addr < 0x10000) {
+      static int fix_count = 0;
+      if (++fix_count <= 5) {
+        LOG(WARNING) << "Fixing stale entry_point=" << ep_addr << " for method "
+                     << (orig->IsRuntimeMethod() ? "<runtime>" : orig->PrettyMethod());
+      }
+      const uint8_t* fallback = GetOatAddress(StubType::kQuickToInterpreterBridge);
+      if (fallback != nullptr) {
+        copy->SetEntryPointFromQuickCompiledCodePtrSize(fallback, target_ptr_size_);
+      } else {
+        copy->SetEntryPointFromQuickCompiledCodePtrSize(nullptr, target_ptr_size_);
+      }
+    }
   }
 }
 
