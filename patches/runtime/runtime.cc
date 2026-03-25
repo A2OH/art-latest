@@ -1055,55 +1055,112 @@ bool Runtime::Start() {
 
   // Before running any clinit, set up the native methods provided by the runtime itself.
   RegisterRuntimeNativeMethods(self->GetJniEnv());
+  fprintf(stderr, "[RT] RegisterRuntimeNativeMethods done\n"); fflush(stderr);
 
   // For standalone boot image builds, RunEarlyRootClinits may crash on missing
   // JNI natives (VarHandle, ThreadGroup, etc.). Skip it.
   if (self->IsExceptionPending()) self->ClearException();
   // RunEarlyRootClinits re-enabled
+  // RunEarlyRootClinits patched to only call WellKnownClasses::Init (no EnsureRootInitialized)
+  fprintf(stderr, "[RT] RunEarlyRootClinits entering\n"); fflush(stderr);
   class_linker_->RunEarlyRootClinits(self);
+  fprintf(stderr, "[RT] RunEarlyRootClinits done\n"); fflush(stderr);
+  if (self->IsExceptionPending()) self->ClearException();
+  fprintf(stderr, "[RT] InitializeIntrinsics entering\n"); fflush(stderr);
   InitializeIntrinsics();
+  fprintf(stderr, "[RT] InitializeIntrinsics done\n"); fflush(stderr);
 
   self->TransitionFromRunnableToSuspended(ThreadState::kNative);
 
   // Skip InitNativeMethods - it loads libjavacore.so etc. which aren't available
   // in standalone builds.
   // InitNativeMethods re-enabled
-  InitNativeMethods();
+  // InitNativeMethods loads libjavacore.so, libopenjdk.so, libicu_jni.so and runs JNI_OnLoad.
+  // These may trigger class init that segfaults on mismatched boot image. Make tolerant.
+  fprintf(stderr, "[RT] InitNativeMethods entering\n"); fflush(stderr);
+  {
+    // Load our stub JNI libraries with error tolerance
+    JNIEnv* jni_env = self->GetJniEnv();
+    jclass java_lang_Object;
+    {
+      ScopedObjectAccess soa(self);
+      java_lang_Object = reinterpret_cast<jclass>(
+          GetJavaVM()->AddGlobalRef(self, GetClassRoot<mirror::Object>(GetClassLinker())));
+    }
+    const char* libs[] = {"libicu_jni.so", "libjavacore.so", "libopenjdk.so"};
+    for (const char* lib : libs) {
+      std::string error_msg;
+      fprintf(stderr, "[RT]   Loading %s...\n", lib); fflush(stderr);
+      if (!java_vm_->LoadNativeLibrary(jni_env, lib, nullptr, java_lang_Object, &error_msg)) {
+        fprintf(stderr, "[RT]   WARNING: Failed to load %s: %s (continuing)\n", lib, error_msg.c_str());
+        fflush(stderr);
+      } else {
+        fprintf(stderr, "[RT]   Loaded %s OK\n", lib); fflush(stderr);
+      }
+      if (self->IsExceptionPending()) self->ClearException();
+    }
+    jni_env->DeleteGlobalRef(java_lang_Object);
+    // WellKnownClasses::LateInit may also crash -- skip for standalone
+    fprintf(stderr, "[RT]   Skipping WellKnownClasses::LateInit\n"); fflush(stderr);
+  }
+  fprintf(stderr, "[RT] InitNativeMethods done\n"); fflush(stderr);
+  if (self->IsExceptionPending()) {
+    fprintf(stderr, "[RT] Exception after InitNativeMethods, clearing\n"); fflush(stderr);
+    self->ClearException();
+  }
 
   // Skip - depends on InitNativeMethods.
   // art::hiddenapi::InitializeCorePlatformApiPrivateFields();
 
   // Initialize well known thread group values that may be accessed threads while attaching.
-  InitThreadGroups(self);
-
-  Thread::FinishStartup();
-
-  // Create the JIT either if we have to use JIT compilation or save profiling info. This is
-  // done after FinishStartup as the JIT pool needs Java thread peers, which require the main
-  // ThreadGroup to exist.
-  //
-  // TODO(calin): We use the JIT class as a proxy for JIT compilation and for
-  // recoding profiles. Maybe we should consider changing the name to be more clear it's
-  // not only about compiling. b/28295073.
-  if (jit_options_->UseJitCompilation() || jit_options_->GetSaveProfilingInfo()) {
-    CreateJit();
-#ifdef ADDRESS_SANITIZER
-    // (b/238730394): In older implementations of sanitizer + glibc there is a race between
-    // pthread_create and dlopen that could cause a deadlock. pthread_create interceptor in ASAN
-    // uses dl_pthread_iterator with a callback that could request a dl_load_lock via call to
-    // __tls_get_addr [1]. dl_pthread_iterate would already hold dl_load_lock so this could cause a
-    // deadlock. __tls_get_addr needs a dl_load_lock only when there is a dlopen happening in
-    // parallel. As a workaround we wait for the pthread_create (i.e JIT thread pool creation) to
-    // finish before going to the next phase. Creating a system class loader could need a dlopen so
-    // we wait here till threads are initialized.
-    // [1] https://github.com/llvm/llvm-project/blob/main/compiler-rt/lib/sanitizer_common/sanitizer_linux_libcdep.cpp#L408
-    // See this for more context: https://reviews.llvm.org/D98926
-    // TODO(b/238730394): Revisit this workaround once we migrate to musl libc.
-    if (jit_ != nullptr) {
-      jit_->GetThreadPool()->WaitForWorkersToBeCreated();
+  // InitThreadGroups requires WellKnownClasses fields (ThreadGroup, Thread) to be valid.
+  // In standalone builds these may be null. Skip if fields are null.
+  fprintf(stderr, "[RT] InitThreadGroups entering\n"); fflush(stderr);
+  {
+    ScopedObjectAccess soa(self);
+    ArtField* main_tg = WellKnownClasses::java_lang_ThreadGroup_mainThreadGroup;
+    ArtField* sys_tg = WellKnownClasses::java_lang_ThreadGroup_systemThreadGroup;
+    fprintf(stderr, "[RT]   TG fields: main_tg=%p sys_tg=%p\n", main_tg, sys_tg); fflush(stderr);
+    if (main_tg != nullptr && sys_tg != nullptr &&
+        main_tg->GetDeclaringClass() != nullptr) {
+      StackHandleScope<2u> hs(self);
+      Handle<mirror::Class> thread_group_class =
+          hs.NewHandle(main_tg->GetDeclaringClass());
+      fprintf(stderr, "[RT]   EnsureInitialized(ThreadGroup)\n"); fflush(stderr);
+      bool initialized = GetClassLinker()->EnsureInitialized(
+          self, thread_group_class, /*can_init_fields=*/ true, /*can_init_parents=*/ true);
+      fprintf(stderr, "[RT]   ThreadGroup init=%d exception=%d\n", initialized, self->IsExceptionPending()); fflush(stderr);
+      if (initialized && !self->IsExceptionPending()) {
+        Handle<mirror::Class> thread_class = hs.NewHandle(WellKnownClasses::java_lang_Thread.Get());
+        if (thread_class.Get() != nullptr) {
+          fprintf(stderr, "[RT]   EnsureInitialized(Thread)\n"); fflush(stderr);
+          initialized = GetClassLinker()->EnsureInitialized(
+              self, thread_class, /*can_init_fields=*/ true, /*can_init_parents=*/ true);
+          fprintf(stderr, "[RT]   Thread init=%d exception=%d\n", initialized, self->IsExceptionPending()); fflush(stderr);
+        }
+        if (initialized && !self->IsExceptionPending()) {
+          main_thread_group_ =
+              soa.Vm()->AddGlobalRef(self, main_tg->GetObject(thread_group_class.Get()));
+          system_thread_group_ =
+              soa.Vm()->AddGlobalRef(self, sys_tg->GetObject(thread_group_class.Get()));
+          fprintf(stderr, "[RT]   main_thread_group_=%p system_thread_group_=%p\n",
+                  main_thread_group_, system_thread_group_); fflush(stderr);
+        }
+      }
+      if (self->IsExceptionPending()) self->ClearException();
+    } else {
+      fprintf(stderr, "[RT]   WellKnownClasses ThreadGroup fields null, skipping InitThreadGroups\n");
+      fflush(stderr);
     }
-#endif
   }
+  fprintf(stderr, "[RT] InitThreadGroups done\n"); fflush(stderr);
+
+  fprintf(stderr, "[RT] Thread::FinishStartup entering\n"); fflush(stderr);
+  Thread::FinishStartup();
+  fprintf(stderr, "[RT] Thread::FinishStartup done\n"); fflush(stderr);
+
+  // Skip JIT for standalone builds
+  fprintf(stderr, "[RT] Skipping JIT creation for standalone build\n"); fflush(stderr);
 
   // Send the start phase event. We have to wait till here as this is when the main thread peer
   // has just been generated, important root clinits have been run and JNI is completely functional.
@@ -1111,26 +1168,21 @@ bool Runtime::Start() {
     ScopedObjectAccess soa(self);
     callbacks_->NextRuntimePhase(RuntimePhaseCallback::RuntimePhase::kStart);
   }
+  fprintf(stderr, "[RT] kStart phase done\n"); fflush(stderr);
 
-  system_class_loader_ = CreateSystemClassLoader(this);
+  // Skip CreateSystemClassLoader -- it requires ThreadGroup and full class init.
+  // App classes will be loaded via boot class path instead.
+  fprintf(stderr, "[RT] Skipping CreateSystemClassLoader (standalone build)\n"); fflush(stderr);
 
-  if (!is_zygote_) {
-    if (is_native_bridge_loaded_) {
-      PreInitializeNativeBridge(".");
-    }
-    NativeBridgeAction action = force_native_bridge_
-        ? NativeBridgeAction::kInitialize
-        : NativeBridgeAction::kUnload;
-    InitNonZygoteOrPostFork(self->GetJniEnv(),
-                            /* is_system_server= */ false,
-                            /* is_child_zygote= */ false,
-                            action,
-                            GetInstructionSetString(kRuntimeISA));
-  }
+  // Skip InitNonZygoteOrPostFork in standalone builds -- it starts SignalCatcher thread
+  // which crashes when ThreadGroup is not initialized
+  fprintf(stderr, "[RT] Skipping InitNonZygoteOrPostFork (standalone build)\n"); fflush(stderr);
 
   {
     ScopedObjectAccess soa(self);
-    StartDaemonThreads();
+    // Skip daemon threads in standalone builds -- they need ThreadGroup and Signal handling
+    // which aren't fully set up. The main thread can run app code without daemons.
+    fprintf(stderr, "[RT] Skipping StartDaemonThreads (standalone build)\n"); fflush(stderr);
     self->GetJniEnv()->AssertLocalsEmpty();
 
     // Send the initialized phase event. Send it after starting the Daemon threads so that agents
@@ -2393,12 +2445,12 @@ void Runtime::InitThreadGroups(Thread* self) {
 }
 
 jobject Runtime::GetMainThreadGroup() const {
-  CHECK_IMPLIES(main_thread_group_ == nullptr, IsAotCompiler());
+  // Standalone builds may not have thread groups initialized
   return main_thread_group_;
 }
 
 jobject Runtime::GetSystemThreadGroup() const {
-  CHECK_IMPLIES(system_thread_group_ == nullptr, IsAotCompiler());
+  // Standalone builds may not have thread groups initialized
   return system_thread_group_;
 }
 

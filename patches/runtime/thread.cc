@@ -2450,15 +2450,36 @@ void Thread::FinishStartup() {
 
   // Finish attaching the main thread.
   ScopedObjectAccess soa(Thread::Current());
-  soa.Self()->CreatePeer("main", false, runtime->GetMainThreadGroup());
-  soa.Self()->AssertNoPendingException();
+  jobject main_group = runtime->GetMainThreadGroup();
+  fprintf(stderr, "[RT] Thread::FinishStartup: CreatePeer(main_group=%p)\n", main_group);
+  fflush(stderr);
+  soa.Self()->CreatePeer("main", false, main_group);
+  if (soa.Self()->IsExceptionPending()) {
+    fprintf(stderr, "[RT] Thread::FinishStartup: exception after CreatePeer, clearing\n");
+    fflush(stderr);
+    soa.Self()->ClearException();
+  }
 
+  fprintf(stderr, "[RT] Thread::FinishStartup: RunRootClinits\n"); fflush(stderr);
   runtime->RunRootClinits(soa.Self());
+  if (soa.Self()->IsExceptionPending()) {
+    fprintf(stderr, "[RT] Thread::FinishStartup: exception after RunRootClinits, clearing\n");
+    fflush(stderr);
+    soa.Self()->ClearException();
+  }
 
-  // The thread counts as started from now on. We need to add it to the ThreadGroup. For regular
-  // threads, this is done in Thread.start() on the Java side.
-  soa.Self()->NotifyThreadGroup(soa, runtime->GetMainThreadGroup());
-  soa.Self()->AssertNoPendingException();
+  // The thread counts as started from now on. We need to add it to the ThreadGroup.
+  if (main_group != nullptr) {
+    soa.Self()->NotifyThreadGroup(soa, main_group);
+    if (soa.Self()->IsExceptionPending()) {
+      fprintf(stderr, "[RT] Thread::FinishStartup: exception after NotifyThreadGroup, clearing\n");
+      fflush(stderr);
+      soa.Self()->ClearException();
+    }
+  } else {
+    fprintf(stderr, "[RT] Thread::FinishStartup: main_group is null, skipping NotifyThreadGroup\n");
+    fflush(stderr);
+  }
 }
 
 void Thread::Shutdown() {

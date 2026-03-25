@@ -678,5 +678,12 @@ void DexCache::AtomicStoreRelease16B(
 
 // Android 15 additional stubs
 
+// OHBridge JNI_OnLoad stub -- the real one is in the OHOS shim layer.
+// For standalone x86_64 builds, we just return JNI_VERSION_1_6.
+extern "C" int JNI_OnLoad_ohbridge(void* vm, void* reserved) {
+    fprintf(stderr, "[STUB] JNI_OnLoad_ohbridge called (no-op)\n");
+    fflush(stderr);
+    return 0x00010006;  // JNI_VERSION_1_6
+}
 
 // Android 15 hidden symbol stubs

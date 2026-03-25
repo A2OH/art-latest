@@ -227,7 +227,10 @@ RUNTIME_EXCLUDE = %backtrace_helper.cc \
   %runtime/thread.cc \
   %runtime/runtime.cc \
   %interpreter/unstarted_runtime.cc
-RUNTIME_SRCS = $(filter-out $(RUNTIME_EXCLUDE),$(RUNTIME_SRCS_ALL))
+# Exclude ALL runtime/native/*.cc -- we compile patched copies from patches/runtime/native/
+# that use tolerant_native_util.h (graceful fallback when core JARs lack some native methods)
+RUNTIME_NATIVE_ORIG = $(filter-out %_test.cc %_fuzzer.cc %_bench.cc,$(wildcard $(ART)/runtime/native/*.cc))
+RUNTIME_SRCS = $(filter-out $(RUNTIME_EXCLUDE) $(RUNTIME_NATIVE_ORIG),$(RUNTIME_SRCS_ALL))
 RUNTIME_OBJS = $(patsubst $(ART)/%.cc,$(BUILDDIR)/%.o,$(RUNTIME_SRCS))
 
 # Patched runtime.cc (tolerant JNI native registration for version-mismatched core JARs)
@@ -285,6 +288,15 @@ $(UNSTARTED_PATCH_OBJ): $(UNSTARTED_PATCH_SRC)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -I$(ART)/runtime/interpreter -c $< -o $@ 2>&1 && echo "OK: unstarted_runtime.cc (patched)" || { echo "FAIL: unstarted_runtime.cc (patched)"; rm -f $@; }
 RUNTIME_OBJS += $(UNSTARTED_PATCH_OBJ)
+
+# Patched runtime/native/*.cc (tolerant JNI registration via tolerant_native_util.h)
+# These are sed-processed copies where #include "native_util.h" -> #include "tolerant_native_util.h"
+NATIVE_PATCH_SRCS = $(wildcard patches/runtime/native/*.cc)
+NATIVE_PATCH_OBJS = $(patsubst patches/runtime/native/%.cc,$(BUILDDIR)/runtime/native/%.o,$(NATIVE_PATCH_SRCS))
+$(BUILDDIR)/runtime/native/%.o: patches/runtime/native/%.cc
+	@mkdir -p $(dir $@)
+	@$(CXX) $(CXXFLAGS) -I$(ART)/runtime/native -c $< -o $@ 2>&1 && echo "OK: $(notdir $<) (tolerant)" || { echo "FAIL: $(notdir $<) (tolerant)"; rm -f $@; }
+RUNTIME_OBJS += $(NATIVE_PATCH_OBJS)
 
 # ============ libelffile ============
 # In A15, xz_utils.cc is included (was excluded in A11)
@@ -594,11 +606,11 @@ nativehelper:
 # ============ dalvikvm main ============
 dalvikvm-main:
 	@mkdir -p $(BUILDDIR)/dalvikvm
-	@echo "=== dalvikvm main ==="
+	@echo "=== dalvikvm main (patched) ==="
 	@$(CXX) $(CXXFLAGS) \
 	  -I$(ART)/dalvikvm \
-	  -c $(ART)/dalvikvm/dalvikvm.cc \
-	  -o $(BUILDDIR)/dalvikvm/dalvikvm.o 2>&1 && echo "OK: dalvikvm.cc" || echo "FAIL: dalvikvm.cc"
+	  -c patches/dalvikvm/dalvikvm.cc \
+	  -o $(BUILDDIR)/dalvikvm/dalvikvm.o 2>&1 && echo "OK: dalvikvm.cc (patched)" || echo "FAIL: dalvikvm.cc (patched)"
 
 # ============ link-runtime (dalvikvm without compiler) ============
 link-runtime: all ziparchive sigchain nativehelper dalvikvm-main asm-x86_64 fmtlib tinyxml2 sve-stub

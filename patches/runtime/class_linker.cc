@@ -1198,23 +1198,10 @@ static void EnsureRootInitialized(ClassLinker* class_linker,
 }
 
 void ClassLinker::RunEarlyRootClinits(Thread* self) {
-  StackHandleScope<1u> hs(self);
-  Handle<mirror::ObjectArray<mirror::Class>> class_roots = hs.NewHandle(GetClassRoots());
-  EnsureRootInitialized(this, self, GetClassRoot<mirror::Class>(class_roots.Get()));
-  EnsureRootInitialized(this, self, GetClassRoot<mirror::String>(class_roots.Get()));
-  // `Field` class is needed for register_java_net_InetAddress in libcore, b/28153851.
-  EnsureRootInitialized(this, self, GetClassRoot<mirror::Field>(class_roots.Get()));
-
+  fprintf(stderr, "[CL] RunEarlyRootClinits: calling WellKnownClasses::Init\n"); fflush(stderr);
   WellKnownClasses::Init(self->GetJniEnv());
-
-  // `FinalizerReference` class is needed for initialization of `java.net.InetAddress`.
-  // (Indirectly by constructing a `ObjectStreamField` which uses a `StringBuilder`
-  // and, when resizing, initializes the `System` class for `System.arraycopy()`
-  // and `System.<clinit> creates a finalizable object.)
-  if (WellKnownClasses::java_lang_ref_FinalizerReference_add != nullptr) {
-    EnsureRootInitialized(
-        this, self, WellKnownClasses::java_lang_ref_FinalizerReference_add->GetDeclaringClass());
-  }
+  fprintf(stderr, "[CL] RunEarlyRootClinits: WellKnownClasses::Init done\n"); fflush(stderr);
+  if (self->IsExceptionPending()) self->ClearException();
 }
 
 void ClassLinker::RunRootClinits(Thread* self) {
