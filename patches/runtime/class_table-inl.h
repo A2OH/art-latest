@@ -19,10 +19,12 @@
 
 #include "class_table.h"
 
+#include <cstdio>
 #include "base/mutex-inl.h"
 #include "dex/utf.h"
 #include "gc_root-inl.h"
 #include "mirror/class.h"
+#include "mirror/dex_cache.h"
 #include "oat/oat_file.h"
 #include "obj_ptr-inl.h"
 
@@ -36,7 +38,25 @@ inline uint32_t ClassTable::ClassDescriptorHash::operator()(const TableSlot& slo
   // for comparison with null and retrieval of constant primitive data.
   // See `ReadBarrierOption` and `Class::DescriptorHash()`.
   auto* cls = slot.Read<kWithoutReadBarrier>();
-  return cls != nullptr ? cls->DescriptorHash() : 0;
+  if (cls == nullptr) return 0;
+  // Guard: classes without a DexCache (runtime-generated, or failed init) cannot use
+  // the normal DescriptorHash path which dereferences DexCache->DexFile->type_ids_.
+  // Check if the class is a type that needs a DexCache but doesn't have one.
+  if (!cls->IsArrayClass() && !cls->IsPrimitive() && !cls->IsProxyClass()) {
+    ObjPtr<mirror::DexCache> dc = cls->GetDexCache<kDefaultVerifyFlags, kWithoutReadBarrier>();
+    if (dc == nullptr) {
+      fprintf(stderr, "WARN: ClassTable hash for class with null DexCache, status=%d\n",
+              static_cast<int>(cls->GetStatus()));
+      return 0;
+    }
+    const DexFile* df = dc->GetDexFile();
+    if (df == nullptr) {
+      fprintf(stderr, "WARN: ClassTable hash for class with null DexFile, status=%d\n",
+              static_cast<int>(cls->GetStatus()));
+      return 0;
+    }
+  }
+  return cls->DescriptorHash();
 }
 
 inline uint32_t ClassTable::ClassDescriptorHash::operator()(const DescriptorHashPair& pair) const {
