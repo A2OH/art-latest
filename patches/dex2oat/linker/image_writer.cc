@@ -399,7 +399,38 @@ static ObjPtr<mirror::ObjectArray<mirror::Object>> AllocateBootImageLiveObjects(
   set_entry(ImageHeader::kClearedJniWeakSentinel, runtime->GetSentinel().Read());
 
   DCHECK_EQ(index, enum_cast<int32_t>(ImageHeader::kIntrinsicObjectsStart));
-  IntrinsicObjects::FillIntrinsicObjects(live_objects, index);
+  // Guard against null intrinsic cache fields (boxing classes not initialized in standalone build)
+  // Check ALL boxing cache fields: Byte, Short, Character, Integer
+  bool caches_ready =
+      WellKnownClasses::java_lang_Byte_ByteCache_cache != nullptr &&
+      WellKnownClasses::java_lang_Short_ShortCache_cache != nullptr &&
+      WellKnownClasses::java_lang_Character_CharacterCache_cache != nullptr &&
+      WellKnownClasses::java_lang_Integer_IntegerCache_cache != nullptr;
+  if (caches_ready) {
+    // Also check that the cache ArtFields point to initialized classes with non-null arrays
+    auto check_cache = [](ArtField* field) -> bool {
+      if (field == nullptr) return false;
+      ObjPtr<mirror::Class> cls = field->GetDeclaringClass();
+      if (cls == nullptr || !cls->IsInitialized()) return false;
+      // Check the static field value (the cache array) is non-null
+      ObjPtr<mirror::Object> arr = field->GetObject(cls);
+      return arr != nullptr;
+    };
+    caches_ready = check_cache(WellKnownClasses::java_lang_Byte_ByteCache_cache) &&
+                   check_cache(WellKnownClasses::java_lang_Short_ShortCache_cache) &&
+                   check_cache(WellKnownClasses::java_lang_Character_CharacterCache_cache) &&
+                   check_cache(WellKnownClasses::java_lang_Integer_IntegerCache_cache);
+  }
+  if (caches_ready) {
+    IntrinsicObjects::FillIntrinsicObjects(live_objects, index);
+  } else {
+    LOG(WARNING) << "Skipping FillIntrinsicObjects: boxing caches not initialized";
+    // Fill the intrinsic object slots with null to maintain the expected array size
+    size_t num_intrinsic = IntrinsicObjects::GetNumberOfIntrinsicObjects();
+    for (size_t i = 0; i < num_intrinsic; ++i) {
+      live_objects->Set(index + i, nullptr);
+    }
+  }
   return live_objects;
 }
 

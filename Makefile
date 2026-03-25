@@ -226,7 +226,8 @@ RUNTIME_EXCLUDE = %backtrace_helper.cc \
   %runtime/class_linker.cc \
   %runtime/thread.cc \
   %runtime/runtime.cc \
-  %interpreter/unstarted_runtime.cc
+  %interpreter/unstarted_runtime.cc \
+  %runtime/art_method.cc
 # Exclude ALL runtime/native/*.cc -- we compile patched copies from patches/runtime/native/
 # that use tolerant_native_util.h (graceful fallback when core JARs lack some native methods)
 RUNTIME_NATIVE_ORIG = $(filter-out %_test.cc %_fuzzer.cc %_bench.cc,$(wildcard $(ART)/runtime/native/*.cc))
@@ -256,6 +257,14 @@ $(THREAD_PATCH_OBJ): $(THREAD_PATCH_SRC)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@ 2>&1 && echo "OK: thread.cc (patched)" || { echo "FAIL: thread.cc (patched)"; rm -f $@; }
 RUNTIME_OBJS += $(THREAD_PATCH_OBJ)
+
+# Patched art_method.cc (interpreter fallback when quick code is null in dex2oat)
+AM_PATCH_SRC = patches/runtime/art_method.cc
+AM_PATCH_OBJ = $(BUILDDIR)/runtime/art_method.o
+$(AM_PATCH_OBJ): $(AM_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@ 2>&1 && echo "OK: art_method.cc (patched)" || { echo "FAIL: art_method.cc (patched)"; rm -f $@; }
+RUNTIME_OBJS += $(AM_PATCH_OBJ)
 
 # Patched well_known_classes.cc (tolerant of missing classes/methods for standalone dex2oat)
 WKC_PATCH_SRC = patches/runtime/well_known_classes.cc

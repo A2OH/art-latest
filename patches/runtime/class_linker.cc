@@ -1198,15 +1198,135 @@ static void EnsureRootInitialized(ClassLinker* class_linker,
 }
 
 void ClassLinker::RunEarlyRootClinits(Thread* self) {
+  fprintf(stderr, "[CL] RunEarlyRootClinits: entering\n"); fflush(stderr);
+  StackHandleScope<1u> hs(self);
+  Handle<mirror::ObjectArray<mirror::Class>> class_roots = hs.NewHandle(GetClassRoots());
+
+  // Initialize Class, String, Field before WellKnownClasses::Init (matches AOSP)
+  EnsureRootInitialized(this, self, GetClassRoot<mirror::Class>(class_roots.Get()));
+  if (self->IsExceptionPending()) { self->ClearException(); }
+  EnsureRootInitialized(this, self, GetClassRoot<mirror::String>(class_roots.Get()));
+  if (self->IsExceptionPending()) { self->ClearException(); }
+  EnsureRootInitialized(this, self, GetClassRoot<mirror::Field>(class_roots.Get()));
+  if (self->IsExceptionPending()) { self->ClearException(); }
+
   fprintf(stderr, "[CL] RunEarlyRootClinits: calling WellKnownClasses::Init\n"); fflush(stderr);
   WellKnownClasses::Init(self->GetJniEnv());
   fprintf(stderr, "[CL] RunEarlyRootClinits: WellKnownClasses::Init done\n"); fflush(stderr);
   if (self->IsExceptionPending()) self->ClearException();
+
+  // Initialize FinalizerReference (needed for InetAddress, matches AOSP)
+  if (WellKnownClasses::java_lang_ref_FinalizerReference_add != nullptr) {
+    EnsureRootInitialized(
+        this, self, WellKnownClasses::java_lang_ref_FinalizerReference_add->GetDeclaringClass());
+    if (self->IsExceptionPending()) { self->ClearException(); }
+  }
+  fprintf(stderr, "[CL] RunEarlyRootClinits: done\n"); fflush(stderr);
 }
 
 void ClassLinker::RunRootClinits(Thread* self) {
   StackHandleScope<1u> hs(self);
   Handle<mirror::ObjectArray<mirror::Class>> class_roots = hs.NewHandle(GetClassRoots());
+
+  // Pre-initialize dependency classes BEFORE the root class loop.
+  // Root classes like Proxy and VarHandle trigger clinit chains that depend on
+  // Enum, LinkedHashMap, etc. being already initialized. Without pre-init,
+  // VarHandle.<clinit> -> EnumSet.of() -> Enum.getSharedConstants() finds
+  // sharedConstantsCache==null because Enum.<clinit> hasn't completed yet
+  // (circular dependency through AtomicInteger/AtomicLong -> VarHandle -> Enum).
+  {
+    // Debug: check if Field.getBoolean is registered
+    {
+      ObjPtr<mirror::Class> fieldClass = FindSystemClass(self, "Ljava/lang/reflect/Field;");
+      if (fieldClass != nullptr) {
+        for (ArtMethod& m : fieldClass->GetDeclaredVirtualMethods(image_pointer_size_)) {
+          if (strcmp(m.GetName(), "getBoolean") == 0) {
+            fprintf(stderr, "[CL] Field.getBoolean found: native=%d entry=%p flags=0x%x\n",
+                    m.IsNative(), m.GetEntryPointFromJni(), m.GetAccessFlags());
+            break;
+          }
+        }
+      } else {
+        fprintf(stderr, "[CL] Field class not found\n");
+        if (self->IsExceptionPending()) self->ClearException();
+      }
+    }
+
+    const char* pre_init_classes[] = {
+      // Tier 1: Basic data structures (no native deps)
+      "Ljava/util/HashMap;",
+      "Ljava/util/LinkedHashMap;",
+      "Ljava/util/AbstractMap;",
+      "Ljava/util/AbstractSet;",
+      "Ljava/util/AbstractList;",
+      "Ljava/util/AbstractCollection;",
+      "Ljava/util/ArrayList;",
+      "Ljava/util/Arrays;",
+      "Ljava/util/Objects;",
+      "Ljava/lang/StringBuilder;",
+      "Ljava/lang/AbstractStringBuilder;",
+      // Tier 2: Enum + EnumSet (needed by VarHandle clinit)
+      "Llibcore/util/BasicLruCache;",
+      "Ljava/lang/Enum;",
+      "Ljava/lang/Math;",
+      "Ljava/lang/StrictMath;",
+      "Ljava/util/EnumSet;",
+      "Ljava/util/RegularEnumSet;",
+      "Ljava/util/Collections;",
+      // Tier 3: VarHandle and MethodHandles infrastructure
+      // Note: VarHandle clinit depends on AccessType/AccessMode enums, but those
+      // enums must NOT be initialized before VarHandle since they may reference VarHandle.
+      "Ljava/lang/invoke/VarHandle;",
+      "Ljava/lang/invoke/VarHandle$AccessType;",
+      "Ljava/lang/invoke/VarHandle$AccessMode;",
+      "Ljava/lang/invoke/MethodHandles;",
+      "Ljava/lang/invoke/MethodHandles$Lookup;",
+      "Ljava/lang/invoke/MethodType;",
+      // Tier 4: Atomic classes (need FieldVarHandle which needs Field natives)
+      // These may fail but attempt them to see what happens
+      "Ljava/lang/invoke/FieldVarHandle;",
+      "Ljava/util/concurrent/atomic/AtomicInteger;",
+      "Ljava/util/concurrent/atomic/AtomicLong;",
+      "Ljava/lang/ThreadLocal;",
+      // Tier 5: Classes whose clinit depends on ThreadLocal/AtomicLong
+      "Ljava/lang/reflect/Proxy;",
+      // Tier 6: Boxing classes and their caches (needed by image writer intrinsic objects)
+      "Ljava/lang/Boolean;",
+      "Ljava/lang/Byte;",
+      "Ljava/lang/Byte$ByteCache;",
+      "Ljava/lang/Short;",
+      "Ljava/lang/Short$ShortCache;",
+      "Ljava/lang/Character;",
+      "Ljava/lang/Character$CharacterCache;",
+      "Ljava/lang/Integer;",
+      "Ljava/lang/Integer$IntegerCache;",
+      "Ljava/lang/Long;",
+      "Ljava/lang/Long$LongCache;",
+      "Ljava/lang/Float;",
+      "Ljava/lang/Double;",
+      // Tier 7: Other commonly-needed classes
+      "Ljava/lang/Daemons;",
+      "Ljdk/internal/math/FloatingDecimal;",
+      "Ldalvik/system/VMRuntime;",
+    };
+    for (const char* desc : pre_init_classes) {
+      ObjPtr<mirror::Class> klass = FindSystemClass(self, desc);
+      if (klass != nullptr) {
+        StackHandleScope<1> hs2(self);
+        Handle<mirror::Class> h(hs2.NewHandle(klass));
+        if (!EnsureInitialized(self, h, /*can_init_fields=*/ true, /*can_init_parents=*/ true)) {
+          LOG(WARNING) << "Pre-init failed for " << desc << ": " << self->GetException()->Dump();
+          self->ClearException();
+        } else {
+          VLOG(startup) << "Pre-initialized " << desc;
+        }
+      } else {
+        self->ClearException();
+        LOG(WARNING) << "Pre-init: class not found: " << desc;
+      }
+    }
+  }
+
   for (size_t i = 0; i < static_cast<size_t>(ClassRoot::kMax); ++i) {
     EnsureRootInitialized(this, self, GetClassRoot(ClassRoot(i), class_roots.Get()));
   }

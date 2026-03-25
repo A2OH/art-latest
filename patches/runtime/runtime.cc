@@ -1017,6 +1017,32 @@ std::string Runtime::GetCompilerExecutable() const {
 }
 
 void Runtime::RunRootClinits(Thread* self) {
+  // In dex2oat, Runtime::Start() is never called, so:
+  // 1. RegisterRuntimeNativeMethods is never invoked (null JNI entry points)
+  // 2. started_ is never set to true (interpreter uses unstarted runtime for native calls)
+  // We fix both here before running root clinits.
+  static bool natives_registered = false;
+  if (!natives_registered) {
+    natives_registered = true;
+    fprintf(stderr, "[RT] RunRootClinits: calling RegisterRuntimeNativeMethods\n"); fflush(stderr);
+    RegisterRuntimeNativeMethods(self->GetJniEnv());
+    fprintf(stderr, "[RT] RunRootClinits: RegisterRuntimeNativeMethods done\n"); fflush(stderr);
+    if (self->IsExceptionPending()) self->ClearException();
+
+    // Mark runtime as started so the interpreter uses normal JNI entry points
+    // instead of the restricted UnstartedRuntime::Jni() handler.
+    if (!started_) {
+      fprintf(stderr, "[RT] RunRootClinits: setting started_=true for JNI dispatch\n"); fflush(stderr);
+      started_ = true;
+    }
+
+    // Call WellKnownClasses::LateInit to populate boxing cache field pointers
+    // (java_lang_Byte_ByteCache_cache, etc.) needed by image_writer.
+    fprintf(stderr, "[RT] RunRootClinits: calling WellKnownClasses::LateInit\n"); fflush(stderr);
+    WellKnownClasses::LateInit(self->GetJniEnv());
+    fprintf(stderr, "[RT] RunRootClinits: WellKnownClasses::LateInit done\n"); fflush(stderr);
+    if (self->IsExceptionPending()) self->ClearException();
+  }
   class_linker_->RunRootClinits(self);
 
   GcRoot<mirror::Throwable>* exceptions[] = {
@@ -1034,6 +1060,7 @@ void Runtime::RunRootClinits(Thread* self) {
 }
 
 bool Runtime::Start() {
+  fprintf(stderr, "[RT] Runtime::Start() ENTERED\n"); fflush(stderr);
   VLOG(startup) << "Runtime::Start entering";
 
   CHECK(!no_sig_chain_) << "A started runtime should have sig chain enabled";
@@ -1056,6 +1083,22 @@ bool Runtime::Start() {
   // Before running any clinit, set up the native methods provided by the runtime itself.
   RegisterRuntimeNativeMethods(self->GetJniEnv());
   fprintf(stderr, "[RT] RegisterRuntimeNativeMethods done\n"); fflush(stderr);
+
+  // Debug: check Field.getBoolean JNI entry point right after registration
+  {
+    ScopedObjectAccess soa(self);
+    ObjPtr<mirror::Class> fieldCls = class_linker_->FindSystemClass(self, "Ljava/lang/reflect/Field;");
+    if (fieldCls != nullptr) {
+      for (ArtMethod& m : fieldCls->GetDeclaredVirtualMethods(class_linker_->GetImagePointerSize())) {
+        if (strcmp(m.GetName(), "getBoolean") == 0) {
+          fprintf(stderr, "[RT] POST-REG Field.getBoolean: native=%d entry=%p\n",
+                  m.IsNative(), m.GetEntryPointFromJni());
+          break;
+        }
+      }
+    }
+    if (self->IsExceptionPending()) self->ClearException();
+  }
 
   // For standalone boot image builds, RunEarlyRootClinits may crash on missing
   // JNI natives (VarHandle, ThreadGroup, etc.). Skip it.
