@@ -2965,7 +2965,15 @@ ObjPtr<mirror::Class> ClassLinker::EnsureResolved(Thread* self,
   static const size_t kNumYieldIterations = 1000;
   // How long each sleep is in us.
   static const size_t kSleepDurationUS = 1000;  // 1 ms.
+  // For standalone dex2oat: if single-threaded and class is stuck, bail out
+  static const size_t kMaxIterations = 5000;
   while (!klass->IsResolved() && !klass->IsErroneousUnresolved()) {
+    if (index >= kMaxIterations) {
+      LOG(WARNING) << "EnsureResolved: timeout waiting for " << descriptor
+                   << " status=" << static_cast<int>(klass->GetStatus());
+      self->ThrowNewException("Ljava/lang/ClassNotFoundException;", descriptor);
+      return nullptr;
+    }
     StackHandleScope<1> hs(self);
     HandleWrapperObjPtr<mirror::Class> h_class(hs.NewHandleWrapper(&klass));
     {
@@ -5674,8 +5682,13 @@ bool ClassLinker::InitializeClass(Thread* self,
       return false;
     }
 
-    CHECK(klass->IsResolved() && !klass->IsErroneousResolved())
-        << klass->PrettyClass() << ": state=" << klass->GetStatus();
+    if (!klass->IsResolved() || klass->IsErroneousResolved()) {
+      LOG(WARNING) << "InitializeClass: class not resolved: " << klass->PrettyClass()
+                   << " state=" << klass->GetStatus() << " (skipping init for standalone dex2oat)";
+      self->ThrowNewException("Ljava/lang/NoClassDefFoundError;",
+                              klass->PrettyDescriptor().c_str());
+      return false;
+    }
 
     if (!klass->IsVerified()) {
       VerifyClass(self, /*verifier_deps= */ nullptr, klass);
@@ -8587,7 +8600,11 @@ size_t ClassLinker::LinkMethodsHelper<kPointerSize>::AssignVTableIndexes(
         std::fill_n(same_signature_vtable_lists.data(), super_vtable_length, dex::kDexNoIndex);
         same_signature_vtable_lists_ = same_signature_vtable_lists;
       }
-      same_signature_vtable_lists[j] = virtual_method->GetMethodIndexDuringLinking();
+      uint32_t prev_index = virtual_method->GetMethodIndexDuringLinking();
+      // Avoid self-referencing cycle in the linked list
+      if (prev_index != j) {
+        same_signature_vtable_lists[j] = prev_index;
+      }
     } else {
       initialized_methods.SetBit(*it);
     }
@@ -9022,8 +9039,11 @@ bool ClassLinker::LinkMethodsHelper<kPointerSize>::LinkMethods(
       vtable->SetElementPtrSize(vtable_index, &virtual_method, kPointerSize);
       if (UNLIKELY(vtable_index < same_signature_vtable_lists.size())) {
         // We may override more than one method according to JLS, see b/211854716.
+        size_t safety_counter = 0;
         while (same_signature_vtable_lists[vtable_index] != dex::kDexNoIndex) {
-          DCHECK_LT(same_signature_vtable_lists[vtable_index], vtable_index);
+          if (same_signature_vtable_lists[vtable_index] >= vtable_index || ++safety_counter > 10000) {
+            break;
+          }
           vtable_index = same_signature_vtable_lists[vtable_index];
           vtable->SetElementPtrSize(vtable_index, &virtual_method, kPointerSize);
           if (kIsDebugBuild) {

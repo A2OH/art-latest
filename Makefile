@@ -61,7 +61,7 @@ CXXFLAGS = -std=c++2a -O2 -w -mcx16 -fPIC -DNDEBUG \
   -DART_STACK_OVERFLOW_GAP_x86=8192 \
   -DART_STACK_OVERFLOW_GAP_x86_64=8192 \
   -DART_STACK_OVERFLOW_GAP_riscv64=8192 \
-  -DUSE_D8_DESUGAR -DART_USE_READ_BARRIER=1 -DART_READ_BARRIER_TYPE_IS_BAKER=1 \
+  -DUSE_D8_DESUGAR \
   -DART_USE_CXX_INTERPRETER
 
 BUILDDIR = build
@@ -203,9 +203,28 @@ RUNTIME_EXCLUDE = %backtrace_helper.cc \
   %monitor_android.cc \
   %metrics/statsd.cc \
   %well_known_classes.cc \
-  %runtime_intrinsics.cc
+  %runtime_intrinsics.cc \
+  %runtime/class_linker.cc \
+  %runtime/thread.cc \
+  %interpreter/unstarted_runtime.cc
 RUNTIME_SRCS = $(filter-out $(RUNTIME_EXCLUDE),$(RUNTIME_SRCS_ALL))
 RUNTIME_OBJS = $(patsubst $(ART)/%.cc,$(BUILDDIR)/%.o,$(RUNTIME_SRCS))
+
+# Patched class_linker.cc (tolerant CheckSystemClass, non-fatal EnsureRootInitialized)
+CL_PATCH_SRC = patches/runtime/class_linker.cc
+CL_PATCH_OBJ = $(BUILDDIR)/runtime/class_linker.o
+$(CL_PATCH_OBJ): $(CL_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@ 2>&1 && echo "OK: class_linker.cc (patched)" || { echo "FAIL: class_linker.cc (patched)"; rm -f $@; }
+RUNTIME_OBJS += $(CL_PATCH_OBJ)
+
+# Patched thread.cc (skip EnsureInitialized during AOT, prevent deadlock)
+THREAD_PATCH_SRC = patches/runtime/thread.cc
+THREAD_PATCH_OBJ = $(BUILDDIR)/runtime/thread.o
+$(THREAD_PATCH_OBJ): $(THREAD_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@ 2>&1 && echo "OK: thread.cc (patched)" || { echo "FAIL: thread.cc (patched)"; rm -f $@; }
+RUNTIME_OBJS += $(THREAD_PATCH_OBJ)
 
 # Patched well_known_classes.cc (tolerant of missing classes/methods for standalone dex2oat)
 WKC_PATCH_SRC = patches/runtime/well_known_classes.cc
@@ -230,6 +249,14 @@ $(NTERP_PATCH_OBJ): $(NTERP_PATCH_SRC)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -I$(ART)/runtime/interpreter/mterp -I$(ART)/runtime/interpreter -c $< -o $@ 2>&1 && echo "OK: nterp.cc (patched)" || { echo "FAIL: nterp.cc (patched)"; rm -f $@; }
 RUNTIME_OBJS += $(NTERP_PATCH_OBJ)
+
+# Patched unstarted_runtime.cc (non-fatal native method calls during AOT)
+UNSTARTED_PATCH_SRC = patches/runtime/interpreter/unstarted_runtime.cc
+UNSTARTED_PATCH_OBJ = $(BUILDDIR)/runtime/interpreter/unstarted_runtime.o
+$(UNSTARTED_PATCH_OBJ): $(UNSTARTED_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -I$(ART)/runtime/interpreter -c $< -o $@ 2>&1 && echo "OK: unstarted_runtime.cc (patched)" || { echo "FAIL: unstarted_runtime.cc (patched)"; rm -f $@; }
+RUNTIME_OBJS += $(UNSTARTED_PATCH_OBJ)
 
 # ============ libelffile ============
 # In A15, xz_utils.cc is included (was excluded in A11)
