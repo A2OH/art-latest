@@ -4700,7 +4700,8 @@ bool Thread::ProtectStack(bool fatal_on_error) {
       LOG(ERROR) << "Unable to create protected region in stack for implicit overflow check. "
           "Reason: "
           << strerror(errno) << " size:  " << GetStackOverflowProtectedSize();
-      exit(1);
+      // Don't exit -- allow dex2oat to continue without stack protection.
+      // The mprotect can fail in WSL2/container environments with limited vm.max_map_count.
     }
     return false;
   }

@@ -139,7 +139,7 @@ COMPILER_OBJS = $(patsubst $(ART)/%.cc,$(BUILDDIR)/%.o,$(COMPILER_SRCS))
 # ============ dex2oat ============
 # Note: In A15, more files moved into dex2oat (aot_class_linker, transaction,
 # compiled_method, interpreter_switch_impl1, sdk_checker, swap_space)
-DEX2OAT_SRCS = $(filter-out %_test.cc %_fuzzer.cc,$(wildcard \
+DEX2OAT_SRCS_ALL = $(filter-out %_test.cc %_fuzzer.cc,$(wildcard \
   $(ART)/dex2oat/*.cc \
   $(ART)/dex2oat/dex/*.cc \
   $(ART)/dex2oat/driver/*.cc \
@@ -151,7 +151,26 @@ DEX2OAT_SRCS = $(filter-out %_test.cc %_fuzzer.cc,$(wildcard \
   $(ART)/dex2oat/linker/x86/*.cc \
   $(ART)/dex2oat/linker/x86_64/*.cc \
   $(ART)/dex2oat/utils/*.cc))
+# Exclude files that have patched versions
+DEX2OAT_EXCLUDE = %dex2oat/driver/compiler_driver.cc %dex2oat/linker/image_writer.cc
+DEX2OAT_SRCS = $(filter-out $(DEX2OAT_EXCLUDE),$(DEX2OAT_SRCS_ALL))
 DEX2OAT_OBJS = $(patsubst $(ART)/%.cc,$(BUILDDIR)/%.o,$(DEX2OAT_SRCS))
+
+# Patched compiler_driver.cc (skip InitializeClasses, skip erroneous class compilation)
+CD_PATCH_SRC = patches/dex2oat/driver/compiler_driver.cc
+CD_PATCH_OBJ = $(BUILDDIR)/dex2oat/driver/compiler_driver.o
+$(CD_PATCH_OBJ): $(CD_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -I$(ART)/dex2oat/driver -c $< -o $@ 2>&1 && echo "OK: compiler_driver.cc (patched)" || { echo "FAIL: compiler_driver.cc (patched)"; rm -f $@; }
+DEX2OAT_OBJS += $(CD_PATCH_OBJ)
+
+# Patched image_writer.cc (tolerant of missing native relocations in standalone builds)
+IW_PATCH_SRC = patches/dex2oat/linker/image_writer.cc
+IW_PATCH_OBJ = $(BUILDDIR)/dex2oat/linker/image_writer.o
+$(IW_PATCH_OBJ): $(IW_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -I$(ART)/dex2oat/linker -c $< -o $@ 2>&1 && echo "OK: image_writer.cc (patched)" || { echo "FAIL: image_writer.cc (patched)"; rm -f $@; }
+DEX2OAT_OBJS += $(IW_PATCH_OBJ)
 
 # ============ runtime ============
 # A15 moved many files into runtime/oat/, runtime/metrics/, runtime/javaheapprof/
