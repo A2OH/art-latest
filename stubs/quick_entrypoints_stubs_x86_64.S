@@ -18,13 +18,13 @@
 // art_quick_method_exit_hook - instrumentation hook for method exit
 // Added in Android 15. Only called during runtime profiling/tracing.
 DEFINE_FUNCTION art_quick_method_exit_hook
-    int3    // Should never be called in dex2oat
+    ret    // Should never be called in dex2oat
     ret
 END_FUNCTION art_quick_method_exit_hook
 
 // art_quick_method_entry_hook - instrumentation hook for method entry
 DEFINE_FUNCTION art_quick_method_entry_hook
-    int3
+    ret
     ret
 END_FUNCTION art_quick_method_entry_hook
 
@@ -42,7 +42,7 @@ END_FUNCTION art_quick_method_entry_hook
 .endm
 
 DEFINE_PROTECTED ExecuteNterpImpl
-    int3
+    ret
     ret
 END_FUNCTION ExecuteNterpImpl
 
@@ -51,7 +51,7 @@ DEFINE_PROTECTED EndExecuteNterpImpl
 END_FUNCTION EndExecuteNterpImpl
 
 DEFINE_PROTECTED ExecuteNterpWithClinitImpl
-    int3
+    ret
     ret
 END_FUNCTION ExecuteNterpWithClinitImpl
 

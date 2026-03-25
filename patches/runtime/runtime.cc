@@ -2208,6 +2208,16 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
     dlopen(plugin_name, RTLD_NOW | RTLD_LOCAL);
   }
 
+  // DEBUG: Check entrypoints
+  {
+    auto* self = Thread::Current();
+    if (self) {
+      fprintf(stderr, "DEBUG: Thread self=%p, entrypoints at +0x1a0\n", (void*)self);
+      // Read the raw value at the JNI trampoline offset (0x330 from Thread start)
+      void** raw = reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(self) + 0x330);
+      fprintf(stderr, "DEBUG: Thread+0x330 (pQuickGenericJniTrampoline) = %p\n", *raw);
+    }
+  }
   VLOG(startup) << "Runtime::Init exiting";
 
   return true;
