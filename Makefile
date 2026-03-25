@@ -201,9 +201,35 @@ RUNTIME_EXCLUDE = %backtrace_helper.cc \
   %arch/riscv64/fault_handler_riscv64.cc \
   %arch/arm/quick_entrypoints_cc_arm.cc \
   %monitor_android.cc \
-  %metrics/statsd.cc
+  %metrics/statsd.cc \
+  %well_known_classes.cc \
+  %runtime_intrinsics.cc
 RUNTIME_SRCS = $(filter-out $(RUNTIME_EXCLUDE),$(RUNTIME_SRCS_ALL))
 RUNTIME_OBJS = $(patsubst $(ART)/%.cc,$(BUILDDIR)/%.o,$(RUNTIME_SRCS))
+
+# Patched well_known_classes.cc (tolerant of missing classes/methods for standalone dex2oat)
+WKC_PATCH_SRC = patches/runtime/well_known_classes.cc
+WKC_PATCH_OBJ = $(BUILDDIR)/runtime/well_known_classes.o
+$(WKC_PATCH_OBJ): $(WKC_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@ 2>&1 && echo "OK: well_known_classes.cc (patched)" || { echo "FAIL: well_known_classes.cc (patched)"; rm -f $@; }
+RUNTIME_OBJS += $(WKC_PATCH_OBJ)
+
+# Patched runtime_intrinsics.cc (tolerant of missing intrinsic classes)
+RTI_PATCH_SRC = patches/runtime/runtime_intrinsics.cc
+RTI_PATCH_OBJ = $(BUILDDIR)/runtime/runtime_intrinsics.o
+$(RTI_PATCH_OBJ): $(RTI_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@ 2>&1 && echo "OK: runtime_intrinsics.cc (patched)" || { echo "FAIL: runtime_intrinsics.cc (patched)"; rm -f $@; }
+RUNTIME_OBJS += $(RTI_PATCH_OBJ)
+
+# Patched nterp.cc (CheckNterpAsmConstants stubbed, nterp helpers for field/method resolution)
+NTERP_PATCH_SRC = patches/runtime/interpreter/mterp/nterp.cc
+NTERP_PATCH_OBJ = $(BUILDDIR)/runtime/interpreter/mterp/nterp.o
+$(NTERP_PATCH_OBJ): $(NTERP_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -I$(ART)/runtime/interpreter/mterp -I$(ART)/runtime/interpreter -c $< -o $@ 2>&1 && echo "OK: nterp.cc (patched)" || { echo "FAIL: nterp.cc (patched)"; rm -f $@; }
+RUNTIME_OBJS += $(NTERP_PATCH_OBJ)
 
 # ============ libelffile ============
 # In A15, xz_utils.cc is included (was excluded in A11)

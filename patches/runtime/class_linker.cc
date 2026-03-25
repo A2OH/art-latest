@@ -657,6 +657,31 @@ void ClassLinker::CheckSystemClass(Thread* self, Handle<mirror::Class> c1, const
   if (c1.Get() != c2) {
     LOG(WARNING) << "CheckSystemClass: Class mismatch for " << descriptor
                  << " (continuing for standalone dex2oat)";
+    // Diagnostic: dump both class objects to find what differs
+    LOG(WARNING) << "  c1 (pre-allocated) ptr=" << static_cast<void*>(c1.Get())
+                 << " objectSize=" << c1->GetObjectSize()
+                 << " classSize=" << c1->GetClassSize()
+                 << " status=" << static_cast<int>(c1->GetStatus())
+                 << " numVTable=" << (c1->GetVTableDuringLinking() != nullptr ?
+                    c1->GetVTableDuringLinking()->GetLength() : -1)
+                 << " numMethods=" << c1->NumMethods()
+                 << " numSFields=" << c1->NumStaticFields()
+                 << " numIFields=" << c1->NumInstanceFields();
+    LOG(WARNING) << "  c2 (from DEX)      ptr=" << static_cast<void*>(c2.Ptr())
+                 << " objectSize=" << c2->GetObjectSize()
+                 << " classSize=" << c2->GetClassSize()
+                 << " status=" << static_cast<int>(c2->GetStatus())
+                 << " numVTable=" << (c2->GetVTableDuringLinking() != nullptr ?
+                    c2->GetVTableDuringLinking()->GetLength() : -1)
+                 << " numMethods=" << c2->NumMethods()
+                 << " numSFields=" << c2->NumStaticFields()
+                 << " numIFields=" << c2->NumInstanceFields();
+    // If the mismatch is for String, try to use c2 instead
+    if (strcmp(descriptor, "Ljava/lang/String;") == 0) {
+      LOG(WARNING) << "  String mismatch: pre-allocated ClassSize="
+                   << mirror::String::ClassSize(image_pointer_size_)
+                   << " actual c2 classSize=" << c2->GetClassSize();
+    }
   }
 }
 
@@ -1163,8 +1188,11 @@ static void EnsureRootInitialized(ClassLinker* class_linker,
     Handle<mirror::Class> h_class(hs.NewHandle(klass));
     if (!class_linker->EnsureInitialized(
              self, h_class, /*can_init_fields=*/ true, /*can_init_parents=*/ true)) {
-      LOG(FATAL) << "Exception when initializing " << h_class->PrettyClass()
+      // For standalone dex2oat without full Android system, class init may fail
+      // due to missing JNI natives. Log warning and clear exception to continue.
+      LOG(WARNING) << "Exception when initializing " << h_class->PrettyClass()
           << ": " << self->GetException()->Dump();
+      self->ClearException();
     }
   }
 }
@@ -1183,8 +1211,10 @@ void ClassLinker::RunEarlyRootClinits(Thread* self) {
   // (Indirectly by constructing a `ObjectStreamField` which uses a `StringBuilder`
   // and, when resizing, initializes the `System` class for `System.arraycopy()`
   // and `System.<clinit> creates a finalizable object.)
-  EnsureRootInitialized(
-      this, self, WellKnownClasses::java_lang_ref_FinalizerReference_add->GetDeclaringClass());
+  if (WellKnownClasses::java_lang_ref_FinalizerReference_add != nullptr) {
+    EnsureRootInitialized(
+        this, self, WellKnownClasses::java_lang_ref_FinalizerReference_add->GetDeclaringClass());
+  }
 }
 
 void ClassLinker::RunRootClinits(Thread* self) {
@@ -1245,7 +1275,9 @@ void ClassLinker::RunRootClinits(Thread* self) {
       WellKnownClasses::org_apache_harmony_dalvik_ddmc_DdmServer_dispatch,
   };
   for (ArtMethod* method : methods_of_classes_to_initialize) {
-    EnsureRootInitialized(this, self, method->GetDeclaringClass());
+    if (method != nullptr) {
+      EnsureRootInitialized(this, self, method->GetDeclaringClass());
+    }
   }
   ArtField* fields_of_classes_to_initialize[] = {
       // Ensure classes used by class loaders are initialized (avoid check at runtime).
@@ -1265,7 +1297,9 @@ void ClassLinker::RunRootClinits(Thread* self) {
       WellKnownClasses::java_lang_Short_ShortCache_cache,
   };
   for (ArtField* field : fields_of_classes_to_initialize) {
-    EnsureRootInitialized(this, self, field->GetDeclaringClass());
+    if (field != nullptr) {
+      EnsureRootInitialized(this, self, field->GetDeclaringClass());
+    }
   }
 }
 

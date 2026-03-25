@@ -1,6 +1,5 @@
 // Stub assembly entry points for Android 15 ART symbols not in Android 11's
-// quick_entrypoints_x86_64.S. These are needed to satisfy link-time references
-// but dex2oat doesn't call them at runtime (it's an AOT compiler, not a VM).
+// quick_entrypoints_x86_64.S. These are needed to satisfy link-time references.
 
 #if defined(__x86_64__)
 
@@ -29,10 +28,11 @@ DEFINE_FUNCTION art_quick_method_entry_hook
     ret
 END_FUNCTION art_quick_method_entry_hook
 
-// art_quick_compile_optimized, art_quick_osr_stub, art_invoke_obsolete_method_stub
-// are already provided by A11's quick_entrypoints_x86_64.S
+// Nterp interpreter stubs - these are the assembly entry points referenced by nterp.cc.
+// dex2oat never actually executes nterp (CanRuntimeUseNterp returns false for AOT compiler),
+// but nterp.cc references these symbols for GetNterpEntryPoint/NterpImpl/NterpWithClinitImpl.
+// We provide minimal stubs so the size computation doesn't crash.
 
-// Nterp trampolines (protected visibility, used by interpreter)
 .macro DEFINE_PROTECTED name
     .type \name, @function
     .protected \name
@@ -41,20 +41,34 @@ END_FUNCTION art_quick_method_entry_hook
 \name:
 .endm
 
-DEFINE_PROTECTED NterpGetMethod
+DEFINE_PROTECTED ExecuteNterpImpl
     int3
     ret
-END_FUNCTION NterpGetMethod
+END_FUNCTION ExecuteNterpImpl
 
-DEFINE_PROTECTED NterpGetStaticField
-    int3
-    ret
-END_FUNCTION NterpGetStaticField
+DEFINE_PROTECTED EndExecuteNterpImpl
+    nop
+END_FUNCTION EndExecuteNterpImpl
 
-DEFINE_PROTECTED NterpGetInstanceFieldOffset
+DEFINE_PROTECTED ExecuteNterpWithClinitImpl
     int3
     ret
-END_FUNCTION NterpGetInstanceFieldOffset
+END_FUNCTION ExecuteNterpWithClinitImpl
+
+DEFINE_PROTECTED EndExecuteNterpWithClinitImpl
+    nop
+END_FUNCTION EndExecuteNterpWithClinitImpl
+
+// artNterpAsmInstructionStart/End - used by CheckNterpAsmConstants to compute
+// interpreter handler table size. We make them equal so the size is 0,
+// which will be ignored since nterp is disabled for AOT.
+DEFINE_PROTECTED artNterpAsmInstructionStart
+    nop
+END_FUNCTION artNterpAsmInstructionStart
+
+DEFINE_PROTECTED artNterpAsmInstructionEnd
+    nop
+END_FUNCTION artNterpAsmInstructionEnd
 
 #endif // __x86_64__
 
