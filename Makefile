@@ -348,6 +348,7 @@ link: all ziparchive sigchain asm-x86_64 sve-stub fmtlib tinyxml2
 	@mkdir -p $(BUILDDIR)/bin
 	$(HOSTLD) -o $(BUILDDIR)/bin/dex2oat \
 	    -rdynamic -Wl,--unresolved-symbols=ignore-all -Wl,--allow-multiple-definition \
+	  $$(find $(BUILDDIR)/dex2oat -name '*.o') \
 	  $$(find $(BUILDDIR)/compiler -name '*.o') \
 	  $$(find $(BUILDDIR)/runtime -name '*.o') \
 	  $$(find $(BUILDDIR)/libdexfile -name '*.o') \
