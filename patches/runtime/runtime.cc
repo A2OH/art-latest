@@ -2012,12 +2012,19 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
         intern_table_,
         runtime_options.GetOrDefault(Opt::FastClassNotFoundException));
   }
+  bool boot_image_usable = false;
   if (GetHeap()->HasBootImageSpace()) {
     bool result = class_linker_->InitFromBootImage(&error_msg);
     if (!result) {
-      LOG(ERROR) << "Could not initialize from image: " << error_msg;
-      return false;
+      LOG(WARNING) << "Could not initialize from image: " << error_msg;
+      LOG(WARNING) << "Falling back to imageless mode (boot image has stale references)";
+      error_msg.clear();
+      // Fall through to imageless init below.
+    } else {
+      boot_image_usable = true;
     }
+  }
+  if (boot_image_usable) {
     if (kIsDebugBuild) {
       for (auto image_space : GetHeap()->GetBootImageSpaces()) {
         image_space->VerifyImageAllocations();

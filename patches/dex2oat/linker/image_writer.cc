@@ -24,6 +24,7 @@
 #include <charconv>
 #include <memory>
 #include <numeric>
+#include <type_traits>
 #include <vector>
 
 #include "android-base/strings.h"
@@ -3414,6 +3415,19 @@ class ImageWriter::NativeLocationVisitor {
       // Replace with a safe fallback to prevent corrupt pointers in the image.
       if (!image_writer_->IsInBootImage(ptr) &&
           !image_writer_->NativeRelocationAssigned(ptr)) {
+        // For array pointers (methods_, sfields_, ifields_), the ImtUnimplementedMethod
+        // fallback is wrong -- it would make a single ArtMethod look like a
+        // LengthPrefixedArray, causing out-of-bounds iteration and SIGSEGV.
+        // Null out the pointer and also zero out the dest memory so offset fields
+        // (virtual_methods_offset_, copied_methods_offset_) are consistent.
+        constexpr bool kIsMethodArray =
+            std::is_same<T, LengthPrefixedArray<ArtMethod>>::value;
+        constexpr bool kIsFieldArray =
+            std::is_same<T, LengthPrefixedArray<ArtField>>::value;
+        if (kIsMethodArray || kIsFieldArray) {
+          *dest_addr = nullptr;
+          return nullptr;
+        }
         T* fallback = reinterpret_cast<T*>(
             Runtime::Current()->GetImtUnimplementedMethod());
         image_writer_->CopyAndFixupPointer(dest_addr, fallback);
@@ -3432,6 +3446,13 @@ class ImageWriter::NativeLocationVisitor {
 
 void ImageWriter::FixupClass(mirror::Class* orig, mirror::Class* copy) {
   orig->FixupNativePointers(copy, target_ptr_size_, NativeLocationVisitor(this));
+  // If NativeLocationVisitor nulled out the methods_ pointer (because the method array
+  // had no native relocation), zero out the method offset fields to match.
+  // Otherwise GetDeclaredMethodsSlice etc. will compute a non-empty slice from a null
+  // array, causing SIGSEGV when iterating methods at runtime.
+  if (copy->GetMethodsPtr() == nullptr && orig->NumMethods() > 0) {
+    copy->SetMethodsPtrUnchecked(nullptr, 0, 0);
+  }
   FixupClassVisitor visitor(this, copy);
   ObjPtr<mirror::Object>(orig)->VisitReferences<
       /*kVisitNativeRoots=*/ false, kVerifyNone, kWithoutReadBarrier>(visitor, visitor);
@@ -3960,6 +3981,14 @@ void ImageWriter::CopyAndFixupReference(DestType* dest, ObjPtr<mirror::Object> s
   static_assert(std::is_same<DestType, mirror::CompressedReference<mirror::Object>>::value ||
                     std::is_same<DestType, mirror::HeapReference<mirror::Object>>::value,
                 "DestType must be a Compressed-/HeapReference<Object>.");
+  if (src.Ptr() != nullptr && !IsInBootImage(src.Ptr())) {
+    if (!IsImageBinSlotAssigned(src.Ptr())) {
+      // Referenced object is not in the boot image -- null out the reference
+      // to prevent stale heap pointers (from dex2oat's process) in the image.
+      dest->Assign(nullptr);
+      return;
+    }
+  }
   dest->Assign(GetImageAddress(src.Ptr()));
 }
 
