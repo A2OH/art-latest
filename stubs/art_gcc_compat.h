@@ -73,14 +73,13 @@
 #endif
 
 // Android 15 uses HIDDEN attribute extensively: namespace art HIDDEN { ... }
-// AOSP clang 11 may not have the same visibility defaults; define it if missing.
-// The real definition is in base/macros.h but we need it very early.
-#ifndef HIDDEN
-#define HIDDEN __attribute__((visibility("hidden")))
-#endif
-#ifndef ALWAYS_HIDDEN
-#define ALWAYS_HIDDEN __attribute__((visibility("hidden")))
-#endif
+// For standalone executable builds, override HIDDEN to default visibility.
+// Hidden visibility causes "hidden symbol not defined" linker errors when
+// linking compiler + runtime objects into a single dalvikvm executable.
+#undef HIDDEN
+#define HIDDEN /* default visibility for standalone build */
+#undef ALWAYS_HIDDEN
+#define ALWAYS_HIDDEN /* default visibility for standalone build */
 #ifndef EXPORT
 #define EXPORT __attribute__((visibility("default")))
 #endif

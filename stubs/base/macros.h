@@ -21,3 +21,9 @@
 #define ALWAYS_INLINE
 
 #endif  // STUB_BASE_MACROS_WRAPPER_H_
+
+// ADDED: Override hidden visibility AFTER the real macros.h defines it
+#undef HIDDEN
+#define HIDDEN /* default visibility for standalone build */
+#undef ALWAYS_HIDDEN  
+#define ALWAYS_HIDDEN /* default visibility for standalone build */

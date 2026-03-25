@@ -240,7 +240,6 @@ ABASE_CXXFLAGS = -std=c++17 -O2 -w -fPIC \
 # ============ link stubs (C libraries) ============
 STUBS_OBJ = $(BUILDDIR)/stubs/link_stubs.o
 
-SVE_STUB_OBJ = $(BUILDDIR)/stubs/code_generator_vector_arm64_sve_stub.o
 
 # ============ targets ============
 .PHONY: all libdexfile libartbase libcompiler dex2oat-build runtime libelffile libprofile vixl android-base link-stubs link link-runtime nativehelper dalvikvm-main clean status sve-stub
@@ -262,7 +261,6 @@ libcompiler: $(COMPILER_OBJS)
 
 dex2oat-build: $(DEX2OAT_OBJS)
 	@echo "=== dex2oat ==="
-	@compiled=$$(find $(BUILDDIR)/dex2oat -name '*.o' 2>/dev/null | wc -l); \
 	echo "Compiled: $$compiled / $(words $(DEX2OAT_OBJS))"
 
 vixl: $(VIXL_OBJS)
@@ -297,7 +295,6 @@ link-stubs: $(STUBS_OBJ)
 sve-stub: $(SVE_STUB_OBJ)
 	@echo "=== SVE stub ==="
 
-$(SVE_STUB_OBJ): $(STUBS)/code_generator_vector_arm64_sve_stub.cc
 	@mkdir -p $(dir $@)
 	@$(CXX) $(CXXFLAGS) -I$(ART)/compiler/optimizing -c $< -o $@ 2>&1 && echo "OK: SVE stub" || { echo "FAIL: SVE stub"; rm -f $@; }
 
@@ -350,8 +347,7 @@ link: all ziparchive sigchain asm-x86_64 sve-stub fmtlib tinyxml2
 	@echo "=== Linking dex2oat ==="
 	@mkdir -p $(BUILDDIR)/bin
 	$(HOSTLD) -o $(BUILDDIR)/bin/dex2oat \
-	    -rdynamic -Wl,--unresolved-symbols=ignore-all \
-	  $$(find $(BUILDDIR)/dex2oat -name '*.o') \
+	    -rdynamic -Wl,--unresolved-symbols=ignore-all -Wl,--allow-multiple-definition \
 	  $$(find $(BUILDDIR)/compiler -name '*.o') \
 	  $$(find $(BUILDDIR)/runtime -name '*.o') \
 	  $$(find $(BUILDDIR)/libdexfile -name '*.o') \
@@ -374,6 +370,7 @@ link: all ziparchive sigchain asm-x86_64 sve-stub fmtlib tinyxml2
 	  $(BUILDDIR)/fmtlib/format.o \
 	  $(BUILDDIR)/tinyxml2/tinyxml2.o \
 	  $(BUILDDIR)/stubs/metrics_stubs.o \
+	  $(BUILDDIR)/stubs/code_generator_vector_arm64_sve_stub.o \
 	  $(LDFLAGS) -lrt
 	@echo "Built: $(BUILDDIR)/bin/dex2oat"
 	@ls -lh $(BUILDDIR)/bin/dex2oat
@@ -414,7 +411,6 @@ status:
 	@comp=$$(find $(BUILDDIR)/compiler -name '*.o' 2>/dev/null | wc -l); \
 	compt=$(words $(COMPILER_OBJS)); \
 	echo "compiler:     $$comp / $$compt"
-	@d2o=$$(find $(BUILDDIR)/dex2oat -name '*.o' 2>/dev/null | wc -l); \
 	d2ot=$(words $(DEX2OAT_OBJS)); \
 	echo "dex2oat:      $$d2o / $$d2ot"
 	@rt=$$(find $(BUILDDIR)/runtime -name '*.o' 2>/dev/null | wc -l); \
@@ -520,7 +516,7 @@ link-runtime: all ziparchive sigchain nativehelper dalvikvm-main asm-x86_64 fmtl
 	@echo "=== Linking dalvikvm (runtime + compiler for JIT) ==="
 	@mkdir -p $(BUILDDIR)/bin
 	$(HOSTLD) -o $(BUILDDIR)/bin/dalvikvm \
-	    -rdynamic -Wl,--unresolved-symbols=ignore-all \
+	    -rdynamic -Wl,--unresolved-symbols=ignore-all -Wl,--allow-multiple-definition \
 	  $(BUILDDIR)/dalvikvm/dalvikvm.o \
 	  $$(find $(BUILDDIR)/nativehelper -name '*.o') \
 	  $$(find $(BUILDDIR)/runtime -name '*.o') \
@@ -528,6 +524,7 @@ link-runtime: all ziparchive sigchain nativehelper dalvikvm-main asm-x86_64 fmtl
 	  $$(find $(BUILDDIR)/libartbase -name '*.o') \
 	  $$(find $(BUILDDIR)/libelffile -name '*.o') \
 	  $$(find $(BUILDDIR)/libprofile -name '*.o') \
+	  $$(find $(BUILDDIR)/compiler -name '*.o') \
 	  $$(find $(BUILDDIR)/vixl -name '*.o') \
 	  $$(find $(BUILDDIR)/android-base -name '*.o') \
 	  $$(find $(BUILDDIR)/ziparchive -name '*.o') \
