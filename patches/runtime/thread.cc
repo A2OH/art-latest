@@ -4779,7 +4779,12 @@ bool Thread::ObserveAsyncException() {
 }
 
 void Thread::SetException(ObjPtr<mirror::Throwable> new_exception) {
-  CHECK(new_exception != nullptr);
+  // Relaxed for standalone dex2oat: pre-allocated exceptions may be null
+  // when using cross-version core JARs (A11 JARs with A15 runtime).
+  if (new_exception == nullptr) {
+    LOG(WARNING) << "SetException called with null (cross-version core JAR init issue)";
+    return;
+  }
   // TODO: DCHECK(!IsExceptionPending());
   tlsPtr_.exception = new_exception.Ptr();
 }

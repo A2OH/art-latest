@@ -87,12 +87,19 @@ ARTBASE_SRCS_ALL = $(filter-out %_test.cc %_fuzzer.cc,$(wildcard \
   $(ART)/libartbase/base/metrics/*.cc \
   $(ART)/libartbase/base/unix_file/*.cc \
   $(ART)/libartbase/arch/*.cc))
-# Exclude platform-specific and metrics (needs newer tinyxml2 than A11 tree has)
-# metrics_common.cc needs newer tinyxml2 than A11 provides (InsertNewChildElement)
-# Stub the metrics classes in link_stubs.cc instead
+# Exclude platform-specific files and original metrics_common.cc (needs newer tinyxml2).
+# We use a patched metrics_common.cc from patches/ with XmlFormatter methods stubbed.
 ARTBASE_EXCLUDE = %mem_map_fuchsia.cc %mem_map_windows.cc %safe_copy.cc %socket_peer_is_trusted.cc %metrics_common.cc
 ARTBASE_SRCS = $(filter-out $(ARTBASE_EXCLUDE),$(ARTBASE_SRCS_ALL))
 ARTBASE_OBJS = $(patsubst $(ART)/%.cc,$(BUILDDIR)/%.o,$(ARTBASE_SRCS))
+
+# Patched metrics_common.cc (real ArtMetrics constructor + stubbed XmlFormatter)
+METRICS_PATCH_SRC = patches/libartbase/base/metrics/metrics_common.cc
+METRICS_PATCH_OBJ = $(BUILDDIR)/libartbase/base/metrics/metrics_common.o
+$(METRICS_PATCH_OBJ): $(METRICS_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@ 2>&1 && echo "OK: metrics_common.cc (patched)" || { echo "FAIL: metrics_common.cc (patched)"; rm -f $@; }
+ARTBASE_OBJS += $(METRICS_PATCH_OBJ)
 
 # ============ compiler ============
 COMPILER_SRCS_ALL = $(filter-out %_test.cc %_fuzzer.cc,$(wildcard \
