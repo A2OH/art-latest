@@ -60,7 +60,9 @@ static bool IsMethodPublic(JNIEnv* env, jclass c, jmethodID method_id) {
 // Try to create a PathClassLoader for the classpath DEX and load a class through it.
 // Falls back to FindClass (boot class loader) if PathClassLoader creation fails.
 static jclass LoadClassFromClasspath(JNIEnv* env, const char* class_name_jni) {
-  // First try the boot class loader (works if class is on boot classpath)
+  // First try the boot class loader (works if class is on boot classpath).
+  // In standalone builds, -classpath DEXes are appended to boot classpath,
+  // so this should find both system and app classes.
   jclass klass = env->FindClass(class_name_jni);
   if (klass != nullptr) {
     return klass;

@@ -5078,9 +5078,21 @@ verifier::FailureKind ClassLinker::VerifyClass(Thread* self,
 
     // The class might already be erroneous, for example at compile time if we attempted to verify
     // this class as a parent to another.
+    // PATCHED: In standalone builds, reset erroneous classes so they can re-verify at runtime.
+    // FieldVarHandle et al. got VerifyError because superclass VarHandle was erroneous during AOT.
     if (klass->IsErroneous()) {
-      ThrowEarlierClassFailure(klass.Get());
-      return verifier::FailureKind::kHardFailure;
+      if (!Runtime::Current()->IsAotCompiler() && klass->IsErroneousResolved()) {
+        LOG(INFO) << "Resetting erroneous class for re-verification: " << klass->PrettyClass();
+        ObjPtr<mirror::ClassExt> ext = klass->GetExtData();
+        if (ext != nullptr) {
+          ext->SetErroneousStateError(nullptr);
+        }
+        mirror::Class::SetStatus(klass, ClassStatus::kResolved, self);
+        // Fall through to normal verification below
+      } else {
+        ThrowEarlierClassFailure(klass.Get());
+        return verifier::FailureKind::kHardFailure;
+      }
     }
 
     // Don't attempt to re-verify if already verified.
@@ -5774,10 +5786,26 @@ bool ClassLinker::InitializeClass(Thread* self,
     }
 
     // Was the class already found to be erroneous? Done under the lock to match the JLS.
+    // PATCHED: In standalone builds, classes may be marked erroneous in the boot image
+    // because dex2oat ran without native libs (libicu_jni, libjavacore, libopenjdk).
+    // At runtime these natives ARE registered, so reset erroneous classes and re-try init.
+    // This fixes VarHandle, MethodType, Proxy, etc. which fail during AOT but work at runtime.
     if (klass->IsErroneous()) {
-      ThrowEarlierClassFailure(klass.Get(), true, /* log= */ true);
-      VlogClassInitializationFailure(klass);
-      return false;
+      if (!runtime->IsAotCompiler() && klass->IsErroneousResolved()) {
+        LOG(INFO) << "Resetting previously-failed class for re-init: " << klass->PrettyClass();
+        // Clear the erroneous state error stored in ClassExt
+        ObjPtr<mirror::ClassExt> ext = klass->GetExtData();
+        if (ext != nullptr) {
+          ext->SetErroneousStateError(nullptr);
+        }
+        // Reset status from kErrorResolved to kVerified so InitializeClass proceeds
+        mirror::Class::SetStatus(klass, ClassStatus::kVerified, self);
+        // Fall through to normal initialization below
+      } else {
+        ThrowEarlierClassFailure(klass.Get(), true, /* log= */ true);
+        VlogClassInitializationFailure(klass);
+        return false;
+      }
     }
 
     if (!klass->IsResolved() || klass->IsErroneousResolved()) {
