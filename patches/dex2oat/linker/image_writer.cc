@@ -25,6 +25,7 @@
 #include <memory>
 #include <numeric>
 #include <type_traits>
+#include <unordered_set>
 #include <vector>
 
 #include "android-base/strings.h"
@@ -99,6 +100,10 @@ using ::art::mirror::String;
 
 namespace art {
 namespace linker {
+
+// Defined in oat_writer.cc: set of OAT code offsets for methods with zero-patched type relocations.
+// Methods at these offsets have broken compiled code (null type refs) and must use interpreter.
+extern std::unordered_set<uint32_t> g_zero_patched_code_offsets;
 
 // The actual value of `kImageClassTableMinLoadFactor` is irrelevant because image class tables
 // are never resized, but we still need to pass a reasonable value to the constructor.
@@ -660,6 +665,10 @@ bool ImageWriter::Write(int image_fd,
       }
     }
     LOG(WARNING) << "Post-fixup: scanned methods, fixed " << fixed << " invalid entry points";
+    if (!g_zero_patched_code_offsets.empty()) {
+      LOG(WARNING) << "Zero-patched methods redirected to interpreter: "
+                   << g_zero_patched_code_offsets.size() << " unique code offsets";
+    }
   }
 
   if (compiler_options_.IsAppImage()) {
@@ -3625,6 +3634,20 @@ const uint8_t* ImageWriter::GetQuickCode(ArtMethod* method, const ImageInfo& ima
     quick_code = reinterpret_cast<const uint8_t*>(quick_oat_entry_point);
   } else {
     uint32_t quick_oat_code_offset = PointerToLowMemUInt32(quick_oat_entry_point);
+    // Check if this method's compiled code was zero-patched (has null type references).
+    // Such methods would SIGSEGV at runtime, so redirect them to interpreter.
+    if (g_zero_patched_code_offsets.count(quick_oat_code_offset) != 0) {
+      static int zp_log_count = 0;
+      if (++zp_log_count <= 10) {
+        LOG(WARNING) << "Zero-patched method " << method->PrettyMethod()
+                     << " (code_offset=" << quick_oat_code_offset
+                     << ") redirected to interpreter bridge";
+      } else if (zp_log_count == 11) {
+        LOG(WARNING) << "... suppressing further zero-patch interpreter redirect messages ("
+                     << g_zero_patched_code_offsets.size() << " total)";
+      }
+      return GetOatAddress(StubType::kQuickToInterpreterBridge);
+    }
     // For multi-component boot images, oat_data_begin_ may be null for non-primary
     // components. Treat resulting invalid addresses (< 0x10000) as null.
     if (image_info.oat_data_begin_ != nullptr) {
@@ -3684,8 +3707,20 @@ void ImageWriter::CopyAndFixupMethod(ArtMethod* orig,
                                      size_t oat_index) {
   memcpy(copy, orig, ArtMethod::Size(target_ptr_size_));
 
+  // Check if the declaring class will be nulled out (not assigned to the image).
+  // If so, the method's compiled code cannot safely run (it accesses class data that won't exist),
+  // so redirect to interpreter bridge.
+  ObjPtr<mirror::Object> declaring_class_obj =
+      orig->GetDeclaringClassUnchecked<kWithoutReadBarrier>();
+  bool declaring_class_will_be_null = false;
+  if (declaring_class_obj != nullptr && !IsInBootImage(declaring_class_obj.Ptr())) {
+    if (!IsImageBinSlotAssigned(declaring_class_obj.Ptr())) {
+      declaring_class_will_be_null = true;
+    }
+  }
+
   CopyAndFixupReference(copy->GetDeclaringClassAddressWithoutBarrier(),
-                        orig->GetDeclaringClassUnchecked<kWithoutReadBarrier>());
+                        declaring_class_obj);
 
   if (!orig->IsRuntimeMethod()) {
     uint32_t access_flags = orig->GetAccessFlags();
@@ -3744,6 +3779,15 @@ void ImageWriter::CopyAndFixupMethod(ArtMethod* orig,
     // resolution trampoline. Abstract methods never have code and so we need to make sure their
     // use results in an AbstractMethodError. We use the interpreter to achieve this.
     if (UNLIKELY(!orig->IsInvokable())) {
+      quick_code = GetOatAddress(StubType::kQuickToInterpreterBridge);
+    } else if (UNLIKELY(declaring_class_will_be_null)) {
+      // Declaring class won't be in the image; compiled code would crash accessing it.
+      // Redirect to interpreter bridge.
+      static int null_class_count = 0;
+      if (++null_class_count <= 5) {
+        LOG(WARNING) << "Method with null-image declaring class redirected to interpreter: "
+                     << orig->PrettyMethod();
+      }
       quick_code = GetOatAddress(StubType::kQuickToInterpreterBridge);
     } else {
       const ImageInfo& image_info = image_infos_[oat_index];

@@ -926,6 +926,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
         if (cls) {
             JNINativeMethod methods[] = {
                 {"nativeExit", "(I)V", (void*)Runtime_nativeExit},
+                {"halt", "(I)V", (void*)Runtime_nativeExit},
                 {"nativeGc", "()V", (void*)Runtime_nativeGc},
                 {"nativeLoad", "(Ljava/lang/String;Ljava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/String;", (void*)Runtime_nativeLoad},
                 {"freeMemory", "()J", (void*)Runtime_freeMemory},

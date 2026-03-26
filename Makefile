@@ -244,7 +244,8 @@ RUNTIME_EXCLUDE = %backtrace_helper.cc \
   %runtime/runtime.cc \
   %interpreter/unstarted_runtime.cc \
   %runtime/art_method.cc \
-  %mirror/class.cc
+  %mirror/class.cc \
+  %oat/stack_map.cc
 # Exclude ALL runtime/native/*.cc -- we compile patched copies from patches/runtime/native/
 # that use tolerant_native_util.h (graceful fallback when core JARs lack some native methods)
 RUNTIME_NATIVE_ORIG = $(filter-out %_test.cc %_fuzzer.cc %_bench.cc,$(wildcard $(ART)/runtime/native/*.cc))
@@ -324,6 +325,14 @@ $(MIRRORCLASS_PATCH_OBJ): $(MIRRORCLASS_PATCH_SRC)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -iquote $(ART)/runtime/mirror -c $< -o $@ 2>&1 && echo "OK: mirror/class.cc (patched)" || { echo "FAIL: mirror/class.cc (patched)"; rm -f $@; }
 RUNTIME_OBJS += $(MIRRORCLASS_PATCH_OBJ)
+
+# Patched stack_map.cc (null-safe DecodeInlineInfoOnly/DecodeGcMasksOnly for standalone builds)
+STACKMAP_PATCH_SRC = patches/runtime/oat/stack_map.cc
+STACKMAP_PATCH_OBJ = $(BUILDDIR)/runtime/oat/stack_map.o
+$(STACKMAP_PATCH_OBJ): $(STACKMAP_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -I$(ART)/runtime/oat -c $< -o $@ 2>&1 && echo "OK: stack_map.cc (patched)" || { echo "FAIL: stack_map.cc (patched)"; rm -f $@; }
+RUNTIME_OBJS += $(STACKMAP_PATCH_OBJ)
 
 # Patched runtime/native/*.cc (tolerant JNI registration via tolerant_native_util.h)
 # These are sed-processed copies where #include "native_util.h" -> #include "tolerant_native_util.h"
@@ -447,14 +456,14 @@ asm-x86_64:
 	  -o $(BUILDDIR)/asm_x86_64/quick_entrypoints_x86_64.o 2>&1 \
 	  && echo "OK: quick_entrypoints_x86_64.S (A11)" || echo "FAIL: quick_entrypoints_x86_64.S"
 	@$(CC) -c \
-	  -I$(AOSP)/art/runtime \
-	  -I$(AOSP)/art/runtime/arch/x86_64 \
-	  -I$(AOSP)/art/runtime/arch \
+	  -I$(ART)/runtime \
+	  -I$(ART)/runtime/arch/x86_64 \
+	  -I$(ART)/runtime/arch \
 	  -I$(STUBS) \
 	  -DART_ENABLE_CODEGEN_x86_64 \
-	  $(AOSP)/art/runtime/arch/x86_64/jni_entrypoints_x86_64.S \
+	  $(ART)/runtime/arch/x86_64/jni_entrypoints_x86_64.S \
 	  -o $(BUILDDIR)/asm_x86_64/jni_entrypoints_x86_64.o 2>&1 \
-	  && echo "OK: jni_entrypoints_x86_64.S (A11)" || echo "FAIL: jni_entrypoints_x86_64.S"
+	  && echo "OK: jni_entrypoints_x86_64.S (A15)" || echo "FAIL: jni_entrypoints_x86_64.S"
 	@$(CC) -c \
 	  -I$(AOSP)/art/runtime \
 	  -I$(AOSP)/art/runtime/arch/x86_64 \

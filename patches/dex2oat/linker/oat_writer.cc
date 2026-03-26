@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <unordered_set>
 #include <vector>
 
 #include "arch/arm64/instruction_set_features_arm64.h"
@@ -78,6 +79,11 @@
 
 namespace art {
 namespace linker {
+
+// Global set of OAT code offsets for methods that had zero-patched type relocations.
+// These methods have compiled code containing null type references that would SIGSEGV at runtime.
+// image_writer.cc reads this set to redirect such methods to the interpreter bridge.
+std::unordered_set<uint32_t> g_zero_patched_code_offsets;
 
 namespace {  // anonymous namespace
 
@@ -1698,12 +1704,16 @@ class OatWriter::WriteCodeMethodVisitor : public OrderedMethodVisitor {
             case LinkerPatch::Type::kTypeRelative: {
               ObjPtr<mirror::Class> target_type = GetTargetType(patch);
               if (UNLIKELY(target_type == nullptr)) {
-                // Unresolved type: patch with zero offset (will trap to interpreter at runtime).
-                LOG(WARNING) << "Unresolved type in kTypeRelative patch, zero-patching";
+                // Unresolved type: patch with zero offset.
+                // Record this method's code offset so image_writer can redirect it
+                // to the interpreter bridge instead of executing the broken compiled code.
+                LOG(WARNING) << "Unresolved type in kTypeRelative patch, zero-patching"
+                             << " (code_offset=" << method_offsets.code_offset_ << ")";
                 writer_->relative_patcher_->PatchPcRelativeReference(&patched_code_,
                                                                      patch,
                                                                      offset_ + literal_offset,
                                                                      /* target_offset */ 0u);
+                g_zero_patched_code_offsets.insert(method_offsets.code_offset_);
               } else {
                 uint32_t target_offset = GetTargetObjectOffset(target_type);
                 writer_->relative_patcher_->PatchPcRelativeReference(&patched_code_,

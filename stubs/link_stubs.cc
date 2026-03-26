@@ -688,8 +688,17 @@ extern "C" int JNI_OnLoad_ohbridge(void* vm, void* reserved) {
 
 // Android 15 hidden symbol stubs
 
-// Alias for A15 renamed function
-extern "C" size_t artCriticalNativeFrameSize(void*);
+// A11 assembly stubs call artCriticalNativeOutArgsSize(ArtMethod* method)
+// with the native method itself. A15 renamed this to artCriticalNativeFrameSize
+// but changed the calling convention (now passes the caller method + caller_pc).
+// We implement the A11 contract: compute the x86_64 critical native stub frame size.
+// For x86_64, most critical natives have few args (all fit in registers), so the
+// frame is just: 4 xmm spills (32) + return addr (8) = 40 -> aligned to 48.
+// For safety with more args, we use 64 bytes which handles up to 2 stack args.
+extern "C" size_t artCriticalNativeFrameSize(void*, uintptr_t);
 extern "C" size_t artCriticalNativeOutArgsSize(void* method) {
-    return artCriticalNativeFrameSize(method);
+    // The A11 stub passes the native method. A15 artCriticalNativeFrameSize
+    // checks IsNative() first and handles it correctly if the method is native.
+    // Pass 0 as caller_pc since the A11 path always passes the native method itself.
+    return artCriticalNativeFrameSize(method, 0);
 }

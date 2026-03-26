@@ -540,6 +540,15 @@ static const OatFile::OatMethod FindOatMethodFor(ArtMethod* method,
   // Although we overwrite the trampoline of non-static methods, we may get here via the resolution
   // method for direct methods (or virtual methods made direct).
   ObjPtr<mirror::Class> declaring_class = method->GetDeclaringClass();
+  if (UNLIKELY(declaring_class == nullptr)) {
+    // This can happen in standalone builds where the boot image contains methods
+    // whose declaring class was not properly resolved (e.g., erroneous classes
+    // like VarHandle subclasses). Return not-found so callers fall back gracefully.
+    LOG(WARNING) << "FindOatMethodFor: null declaring class for method (dex_method_idx="
+                 << method->GetDexMethodIndex() << ")";
+    *found = false;
+    return OatFile::OatMethod::Invalid();
+  }
   size_t oat_method_index;
   if (method->IsStatic() || method->IsDirect()) {
     // Simple case where the oat method index was stashed at load time.
@@ -666,6 +675,17 @@ const OatQuickMethodHeader* ArtMethod::GetOatQuickMethodHeader(uintptr_t pc) {
       FindOatMethodFor(this, class_linker->GetImagePointerSize(), &found);
   if (!found) {
     if (!IsNative()) {
+      // In standalone builds, methods with null declaring class (erroneous classes)
+      // can reach here. Return nullptr instead of aborting.
+      if (GetDeclaringClass() == nullptr) {
+        LOG(WARNING) << "GetOatQuickMethodHeader: null declaring class, pc=0x"
+                     << std::hex << pc
+                     << ", entry_point=0x" << reinterpret_cast<uintptr_t>(existing_entry_point)
+                     << ", method_idx=" << std::dec << GetDexMethodIndex()
+                     << ", access_flags=0x" << std::hex << GetAccessFlags()
+                     << ", returning nullptr";
+        return nullptr;
+      }
       PrintFileToLog("/proc/self/maps", LogSeverity::FATAL_WITHOUT_ABORT);
       MemMap::DumpMaps(LOG_STREAM(FATAL_WITHOUT_ABORT), /* terse= */ true);
       LOG(FATAL)
