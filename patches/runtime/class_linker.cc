@@ -1296,7 +1296,8 @@ void ClassLinker::RunRootClinits(Thread* self) {
       "Ljava/lang/Float;",
       "Ljava/lang/Double;",
       // Tier 7: Other commonly-needed classes
-      "Ljava/lang/Daemons;",
+      // Skip Daemons in standalone build — triggers VarHandle→AtomicInteger cascade
+      // "Ljava/lang/Daemons;",
       "Ljdk/internal/math/FloatingDecimal;",
       "Ldalvik/system/VMRuntime;",
     };
@@ -1346,8 +1347,8 @@ void ClassLinker::RunRootClinits(Thread* self) {
       WellKnownClasses::dalvik_system_InMemoryDexClassLoader_init,
       WellKnownClasses::dalvik_system_PathClassLoader_init,
       WellKnownClasses::java_lang_BootClassLoader_init,
-      // Ensure `Daemons` class is initialized (avoid check at runtime).
-      WellKnownClasses::java_lang_Daemons_start,
+      // Skip Daemons in standalone build — triggers VarHandle→AtomicInteger cascade
+      // WellKnownClasses::java_lang_Daemons_start,
       // Ensure `Thread` and `ThreadGroup` classes are initialized (avoid check at runtime).
       WellKnownClasses::java_lang_Thread_init,
       WellKnownClasses::java_lang_ThreadGroup_add,
@@ -6048,6 +6049,29 @@ bool ClassLinker::InitializeClass(Thread* self,
     ObjectLock<mirror::Class> lock(self, klass);
 
     if (self->IsExceptionPending()) {
+      // In standalone/imageless builds, certain classes have circular init
+      // dependencies (e.g., VarHandle ↔ AccessType enums, AtomicInteger → VarHandle).
+      // Rather than crash, tolerate the failure and mark as initialized with defaults.
+      if (!Runtime::Current()->GetHeap()->HasBootImageSpace()) {
+        std::string temp;
+        const char* desc = klass->GetDescriptor(&temp);
+        if (strstr(desc, "VarHandle") != nullptr ||
+            strstr(desc, "AtomicInteger") != nullptr ||
+            strstr(desc, "AtomicLong") != nullptr ||
+            strstr(desc, "AtomicBoolean") != nullptr ||
+            strstr(desc, "AtomicReference") != nullptr ||
+            strstr(desc, "AccessMode") != nullptr ||
+            strstr(desc, "AccessType") != nullptr ||
+            strstr(desc, "Daemons") != nullptr) {
+          LOG(WARNING) << "Tolerating clinit failure for " << desc
+                       << " in standalone build (marking initialized with defaults)";
+          self->ClearException();
+          callback = MarkClassInitialized(self, klass);
+          success = true;
+          // Skip the normal error handling
+          goto clinit_done;
+        }
+      }
       WrapExceptionInInitializer(klass);
       mirror::Class::SetStatus(klass, ClassStatus::kErrorResolved, self);
       success = false;
@@ -6078,6 +6102,7 @@ bool ClassLinker::InitializeClass(Thread* self,
       }
     }
   }
+  clinit_done:
   if (callback != nullptr) {
     callback->MakeVisible(self);
   }

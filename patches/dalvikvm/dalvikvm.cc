@@ -171,12 +171,14 @@ static int InvokeMain(JNIEnv* env, char** argv) {
   std::string class_name(argv[0]);
   std::replace(class_name.begin(), class_name.end(), '.', '/');
 
+  fprintf(stderr, "[dalvikvm] Looking for class '%s'\n", class_name.c_str());
   ScopedLocalRef<jclass> klass(env, LoadClassFromClasspath(env, class_name.c_str()));
   if (klass.get() == nullptr) {
     fprintf(stderr, "Unable to locate class '%s'\n", class_name.c_str());
     env->ExceptionDescribe();
     return EXIT_FAILURE;
   }
+  fprintf(stderr, "[dalvikvm] Class found: %p\n", klass.get());
 
   jmethodID method = env->GetStaticMethodID(klass.get(), "main", "([Ljava/lang/String;)V");
   if (method == nullptr) {
@@ -184,6 +186,7 @@ static int InvokeMain(JNIEnv* env, char** argv) {
     env->ExceptionDescribe();
     return EXIT_FAILURE;
   }
+  fprintf(stderr, "[dalvikvm] main() method found: %p\n", method);
 
   // Skip IsMethodPublic check -- in standalone builds, the reflect API
   // may not be fully initialized, causing false negatives.
@@ -191,22 +194,109 @@ static int InvokeMain(JNIEnv* env, char** argv) {
   // the method exists and is static.
 
   // Invoke main().
+  fprintf(stderr, "[dalvikvm] Calling main()...\n");
+  fflush(stderr);
+  struct timespec ts_start, ts_end;
+  clock_gettime(CLOCK_MONOTONIC, &ts_start);
   env->CallStaticVoidMethod(klass.get(), method, args.get());
+  clock_gettime(CLOCK_MONOTONIC, &ts_end);
+  long elapsed_ms = (ts_end.tv_sec - ts_start.tv_sec) * 1000L +
+                    (ts_end.tv_nsec - ts_start.tv_nsec) / 1000000L;
+  fprintf(stderr, "[dalvikvm] main() returned (elapsed: %ld ms)\n", elapsed_ms);
+  fflush(stderr);
 
   // Check whether there was an uncaught exception.  In standalone builds the normal
   // uncaught-exception handler may not be wired up, so print it ourselves.
   // Use both ExceptionOccurred and ExceptionCheck for robustness.
   jthrowable exc = env->ExceptionOccurred();
   if (exc != nullptr) {
+    fprintf(stderr, "[dalvikvm] Exception occurred after main()\n");
+    // Try to get exception class name
+    jclass exc_class = env->GetObjectClass(exc);
+    if (exc_class != nullptr) {
+      jmethodID getName = env->GetMethodID(env->FindClass("java/lang/Class"), "getName", "()Ljava/lang/String;");
+      if (getName != nullptr) {
+        env->ExceptionClear(); // Clear to call methods
+        jstring name = (jstring) env->CallObjectMethod(exc_class, getName);
+        if (name != nullptr) {
+          const char* nameChars = env->GetStringUTFChars(name, nullptr);
+          if (nameChars) {
+            fprintf(stderr, "[dalvikvm] Exception class: %s\n", nameChars);
+            env->ReleaseStringUTFChars(name, nameChars);
+          }
+        }
+        // Try getMessage()
+        jmethodID getMsg = env->GetMethodID(exc_class, "getMessage", "()Ljava/lang/String;");
+        if (getMsg != nullptr) {
+          jstring msg = (jstring) env->CallObjectMethod(exc, getMsg);
+          if (msg != nullptr) {
+            const char* msgChars = env->GetStringUTFChars(msg, nullptr);
+            if (msgChars) {
+              fprintf(stderr, "[dalvikvm] Exception message: %s\n", msgChars);
+              env->ReleaseStringUTFChars(msg, msgChars);
+            }
+          }
+        }
+      }
+    }
     env->ExceptionDescribe();
     fflush(stderr);
     return EXIT_FAILURE;
   }
   if (env->ExceptionCheck()) {
+    fprintf(stderr, "[dalvikvm] ExceptionCheck true after main()\n");
     env->ExceptionDescribe();
     fflush(stderr);
     return EXIT_FAILURE;
   }
+  fprintf(stderr, "[dalvikvm] main() completed successfully\n");
+
+  // Try calling various result methods on the class
+  {
+    const char* methods_to_try[] = {"getResult", "compute", "computeFib"};
+    for (int i = 0; i < 3; i++) {
+      jmethodID mid = env->GetStaticMethodID(klass.get(), methods_to_try[i], "()I");
+      if (mid != nullptr) {
+        jint val = env->CallStaticIntMethod(klass.get(), mid);
+        fprintf(stderr, "[BENCH] %s() = %d\n", methods_to_try[i], (int)val);
+        if (env->ExceptionCheck()) {
+          env->ExceptionDescribe();
+          env->ExceptionClear();
+        }
+      } else {
+        env->ExceptionClear();
+      }
+    }
+  }
+
+  // After main() returns, try to read benchmark results from static fields
+  // This allows benchmarks to store results without needing working I/O
+  {
+    const char* bench_fields[] = {"fibResult", "methodResult", "loopResult", "allocResult", "fieldResult"};
+    const char* bench_names[] = {"FIB40", "METHOD_10M", "LOOP_100M", "ALLOC_1M", "FIELD_10M"};
+    for (int i = 0; i < 5; i++) {
+      jfieldID fid = env->GetStaticFieldID(klass.get(), bench_fields[i], "J");
+      if (fid != nullptr) {
+        jlong val = env->GetStaticLongField(klass.get(), fid);
+        if (val >= 0) {
+          fprintf(stderr, "[BENCH] %s = %lld ms\n", bench_names[i], (long long)val);
+        }
+      } else {
+        env->ExceptionClear();
+      }
+    }
+    // Also try fibAnswer
+    jfieldID fid = env->GetStaticFieldID(klass.get(), "fibAnswer", "I");
+    if (fid != nullptr) {
+      jint val = env->GetStaticIntField(klass.get(), fid);
+      if (val >= 0) {
+        fprintf(stderr, "[BENCH] fibAnswer = %d\n", (int)val);
+      }
+    } else {
+      env->ExceptionClear();
+    }
+  }
+
   return EXIT_SUCCESS;
 }
 

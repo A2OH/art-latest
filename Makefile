@@ -476,14 +476,14 @@ asm-x86_64:
 	@mkdir -p $(BUILDDIR)/asm_x86_64 $(BUILDDIR)/stubs
 	@echo "=== Assembling x86_64 entrypoints (from A11 + A15 stubs) ==="
 	@$(CC) -c \
-	  -I$(AOSP)/art/runtime \
-	  -I$(AOSP)/art/runtime/arch/x86_64 \
-	  -I$(AOSP)/art/runtime/arch \
+	  -I$(ART)/runtime \
+	  -I$(ART)/runtime/arch/x86_64 \
+	  -I$(ART)/runtime/arch \
 	  -I$(STUBS) \
 	  -DART_ENABLE_CODEGEN_x86_64 \
-	  $(AOSP)/art/runtime/arch/x86_64/quick_entrypoints_x86_64.S \
+	  $(ART)/runtime/arch/x86_64/quick_entrypoints_x86_64.S \
 	  -o $(BUILDDIR)/asm_x86_64/quick_entrypoints_x86_64.o 2>&1 \
-	  && echo "OK: quick_entrypoints_x86_64.S (A11)" || echo "FAIL: quick_entrypoints_x86_64.S"
+	  && echo "OK: quick_entrypoints_x86_64.S (A15)" || echo "FAIL: quick_entrypoints_x86_64.S"
 	@$(CC) -c \
 	  -I$(ART)/runtime \
 	  -I$(ART)/runtime/arch/x86_64 \

@@ -384,7 +384,27 @@ void ArtMethod::Invoke(Thread* self, uint32_t* args, uint32_t args_size, JValue*
   // If the runtime is not yet started or it is required by the debugger, then perform the
   // Invocation by the interpreter, explicitly forcing interpretation over JIT to prevent
   // cycling around the various JIT/Interpreter methods that handle method invocation.
-  if (UNLIKELY(!runtime->IsStarted() ||
+
+  // In imageless/standalone builds, force interpreter for methods from the app DEX
+  // (the last entry on boot classpath, which is the -classpath DEX appended by runtime.cc).
+  // Boot classpath methods use quick stubs (which silently skip execution, but avoid
+  // triggering the VarHandle/AtomicInteger circular initialization cascade).
+  // App methods MUST use the interpreter because quick stubs don't execute them.
+  bool force_interpreter_path = false;
+  if (!IsNative() && IsInvokable() && !IsProxyMethod() &&
+      !runtime->GetHeap()->HasBootImageSpace()) {
+    // Check if this method is from the app classpath DEX (last BCP entry)
+    const std::vector<const DexFile*>& bcp = runtime->GetClassLinker()->GetBootClassPath();
+    if (!bcp.empty()) {
+      const DexFile* app_dex = bcp.back();
+      const DexFile* method_dex = GetDexFile();
+      if (method_dex == app_dex) {
+        force_interpreter_path = true;
+      }
+    }
+  }
+
+  if (UNLIKELY(!runtime->IsStarted() || force_interpreter_path ||
                (self->IsForceInterpreter() && !IsNative() && !IsProxyMethod() && IsInvokable()))) {
     if (IsStatic()) {
       art::interpreter::EnterInterpreterFromInvoke(

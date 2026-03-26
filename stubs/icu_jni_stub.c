@@ -248,6 +248,21 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
         }
     }
 
+    /* Register libcore.icu.ICU methods (A15 uses this class name) */
+    {
+        jclass cls = (*env)->FindClass(env, "libcore/icu/ICU");
+        if (cls) {
+            JNINativeMethod methods[] = {
+                {"getIcuVersion", "()Ljava/lang/String;", (void*)Icu4cMetadata_getIcuVersion},
+                {"getTZDataVersion", "()Ljava/lang/String;", (void*)Icu4cMetadata_getTzdbVersion},
+                {"getCldrVersion", "()Ljava/lang/String;", (void*)Icu4cMetadata_getCldrVersion},
+                {"getUnicodeVersion", "()Ljava/lang/String;", (void*)Icu4cMetadata_getUnicodeVersion},
+            };
+            registerNativesOrSkip(env, cls, methods, sizeof(methods)/sizeof(methods[0]));
+            (*env)->DeleteLocalRef(env, cls);
+        }
+    }
+
     /* Register NativeConverter methods */
     {
         jclass cls = (*env)->FindClass(env, "com/android/icu/charset/NativeConverter");
