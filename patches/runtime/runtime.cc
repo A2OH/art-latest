@@ -1213,9 +1213,33 @@ bool Runtime::Start() {
   }
   fprintf(stderr, "[RT] kStart phase done\n"); fflush(stderr);
 
-  // Skip CreateSystemClassLoader -- it requires ThreadGroup and full class init.
-  // App classes will be loaded via boot class path instead.
-  fprintf(stderr, "[RT] Skipping CreateSystemClassLoader (standalone build)\n"); fflush(stderr);
+  // Try to create the system class loader for classpath support.
+  // This may fail in minimal standalone builds, but is needed to load app classes.
+  fprintf(stderr, "[RT] Attempting CreateSystemClassLoader...\n"); fflush(stderr);
+  {
+    ScopedObjectAccess soa(self);
+    ClassLinker* cl = GetClassLinker();
+    auto pointer_size = cl->GetImagePointerSize();
+    ObjPtr<mirror::Class> class_loader_class = GetClassRoot<mirror::ClassLoader>(cl);
+    if (class_loader_class != nullptr && class_loader_class->IsInitialized()) {
+      ArtMethod* getSystemClassLoader = class_loader_class->FindClassMethod(
+          "getSystemClassLoader", "()Ljava/lang/ClassLoader;", pointer_size);
+      if (getSystemClassLoader != nullptr && getSystemClassLoader->IsStatic()) {
+        ObjPtr<mirror::Object> result = getSystemClassLoader->InvokeStatic<'L'>(self);
+        if (result != nullptr && !self->IsExceptionPending()) {
+          system_class_loader_ = soa.Vm()->AddGlobalRef(self, result);
+          fprintf(stderr, "[RT] CreateSystemClassLoader: SUCCESS (%p)\n", system_class_loader_); fflush(stderr);
+        } else {
+          if (self->IsExceptionPending()) self->ClearException();
+          fprintf(stderr, "[RT] CreateSystemClassLoader: InvokeStatic returned null or exception\n"); fflush(stderr);
+        }
+      } else {
+        fprintf(stderr, "[RT] CreateSystemClassLoader: getSystemClassLoader method not found\n"); fflush(stderr);
+      }
+    } else {
+      fprintf(stderr, "[RT] CreateSystemClassLoader: ClassLoader class not ready\n"); fflush(stderr);
+    }
+  }
 
   // Skip InitNonZygoteOrPostFork in standalone builds -- it starts SignalCatcher thread
   // which crashes when ThreadGroup is not initialized

@@ -245,7 +245,9 @@ RUNTIME_EXCLUDE = %backtrace_helper.cc \
   %interpreter/unstarted_runtime.cc \
   %runtime/art_method.cc \
   %mirror/class.cc \
-  %oat/stack_map.cc
+  %oat/stack_map.cc \
+  %oat/image.cc \
+  %quick/quick_throw_entrypoints.cc
 # Exclude ALL runtime/native/*.cc -- we compile patched copies from patches/runtime/native/
 # that use tolerant_native_util.h (graceful fallback when core JARs lack some native methods)
 RUNTIME_NATIVE_ORIG = $(filter-out %_test.cc %_fuzzer.cc %_bench.cc,$(wildcard $(ART)/runtime/native/*.cc))
@@ -333,6 +335,24 @@ $(STACKMAP_PATCH_OBJ): $(STACKMAP_PATCH_SRC)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -I$(ART)/runtime/oat -c $< -o $@ 2>&1 && echo "OK: stack_map.cc (patched)" || { echo "FAIL: stack_map.cc (patched)"; rm -f $@; }
 RUNTIME_OBJS += $(STACKMAP_PATCH_OBJ)
+
+# Patched image.cc (version 085 to match prebuilt boot images from A11 dex2oat)
+IMAGE_PATCH_SRC = patches/runtime/oat/image.cc
+IMAGE_PATCH_OBJ = $(BUILDDIR)/runtime/oat/image.o
+$(IMAGE_PATCH_OBJ): $(IMAGE_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -I$(ART)/runtime/oat -c $< -o $@ 2>&1 && echo "OK: image.cc (patched v085)" || { echo "FAIL: image.cc (patched)"; rm -f $@; }
+RUNTIME_OBJS += $(IMAGE_PATCH_OBJ)
+
+# Patched quick_throw_entrypoints.cc (A11-compatible: never-return throw functions)
+# A15 throw entrypoints return Context* for the assembly caller to do long jump.
+# A11 assembly expects them to never return. This patch does the long jump internally.
+QTHROW_PATCH_SRC = patches/runtime/entrypoints/quick/quick_throw_entrypoints.cc
+QTHROW_PATCH_OBJ = $(BUILDDIR)/runtime/entrypoints/quick/quick_throw_entrypoints.o
+$(QTHROW_PATCH_OBJ): $(QTHROW_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -I$(ART)/runtime/entrypoints -I$(ART)/runtime/entrypoints/quick -c $< -o $@ 2>&1 && echo "OK: quick_throw_entrypoints.cc (A11-compat)" || { echo "FAIL: quick_throw_entrypoints.cc"; rm -f $@; }
+RUNTIME_OBJS += $(QTHROW_PATCH_OBJ)
 
 # Patched runtime/native/*.cc (tolerant JNI registration via tolerant_native_util.h)
 # These are sed-processed copies where #include "native_util.h" -> #include "tolerant_native_util.h"

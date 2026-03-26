@@ -57,6 +57,102 @@ static bool IsMethodPublic(JNIEnv* env, jclass c, jmethodID method_id) {
   return true;
 }
 
+// Try to create a PathClassLoader for the classpath DEX and load a class through it.
+// Falls back to FindClass (boot class loader) if PathClassLoader creation fails.
+static jclass LoadClassFromClasspath(JNIEnv* env, const char* class_name_jni) {
+  // First try the boot class loader (works if class is on boot classpath)
+  jclass klass = env->FindClass(class_name_jni);
+  if (klass != nullptr) {
+    return klass;
+  }
+  env->ExceptionClear();
+
+  // Try to create a PathClassLoader for the -classpath DEX.
+  // dalvik.system.PathClassLoader(String dexPath, ClassLoader parent)
+  jclass pcl_class = env->FindClass("dalvik/system/PathClassLoader");
+  if (pcl_class == nullptr) {
+    env->ExceptionClear();
+    fprintf(stderr, "PathClassLoader class not found, cannot load user classes\n");
+    return nullptr;
+  }
+
+  jmethodID pcl_init = env->GetMethodID(pcl_class, "<init>",
+      "(Ljava/lang/String;Ljava/lang/ClassLoader;)V");
+  if (pcl_init == nullptr) {
+    env->ExceptionClear();
+    fprintf(stderr, "PathClassLoader constructor not found\n");
+    return nullptr;
+  }
+
+  // Get the classpath from the runtime options
+  // The classpath is stored in the runtime's class_path_ member.
+  // We can get it from the system property or we need to pass it in.
+  // For now, use the environment: the -classpath arg was stored by the VM.
+  const char* cp = getenv("CLASSPATH");
+  // If CLASSPATH env isn't set, try to get it from RuntimeOptions
+  // Actually, the Runtime stores classpath internally. Let's use Thread context.
+
+  // Use Class.forName(name, true, classLoader) approach via the boot classpath.
+  // The classpath is passed as a JVM option, so the runtime should know about it.
+  // Let's try using the DexPathList approach.
+
+  // Get the classpath from Java's system properties
+  jclass system_class = env->FindClass("java/lang/System");
+  if (system_class == nullptr) {
+    env->ExceptionClear();
+    return nullptr;
+  }
+  jmethodID get_prop = env->GetStaticMethodID(system_class, "getProperty",
+      "(Ljava/lang/String;)Ljava/lang/String;");
+  if (get_prop == nullptr) {
+    env->ExceptionClear();
+    return nullptr;
+  }
+  ScopedLocalRef<jstring> cp_key(env, env->NewStringUTF("java.class.path"));
+  ScopedLocalRef<jstring> cp_val(env,
+      (jstring) env->CallStaticObjectMethod(system_class, get_prop, cp_key.get()));
+  if (cp_val.get() == nullptr) {
+    env->ExceptionClear();
+    fprintf(stderr, "java.class.path property not set\n");
+    return nullptr;
+  }
+
+  // Create PathClassLoader(classpath, null)
+  ScopedLocalRef<jobject> class_loader(env,
+      env->NewObject(pcl_class, pcl_init, cp_val.get(), nullptr));
+  if (class_loader.get() == nullptr) {
+    env->ExceptionClear();
+    fprintf(stderr, "Failed to create PathClassLoader\n");
+    return nullptr;
+  }
+
+  fprintf(stderr, "Created PathClassLoader for classpath\n");
+
+  // Use Class.forName(name, true, classLoader)
+  jclass class_class = env->FindClass("java/lang/Class");
+  if (class_class == nullptr) { env->ExceptionClear(); return nullptr; }
+  jmethodID for_name = env->GetStaticMethodID(class_class, "forName",
+      "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;");
+  if (for_name == nullptr) { env->ExceptionClear(); return nullptr; }
+
+  // Convert JNI name (com/example/Foo) back to Java name (com.example.Foo)
+  std::string java_name(class_name_jni);
+  std::replace(java_name.begin(), java_name.end(), '/', '.');
+
+  ScopedLocalRef<jstring> name_str(env, env->NewStringUTF(java_name.c_str()));
+  klass = (jclass) env->CallStaticObjectMethod(class_class, for_name,
+      name_str.get(), JNI_TRUE, class_loader.get());
+  if (klass == nullptr || env->ExceptionCheck()) {
+    env->ExceptionDescribe();
+    env->ExceptionClear();
+    fprintf(stderr, "Class.forName('%s') via PathClassLoader failed\n", java_name.c_str());
+    return nullptr;
+  }
+
+  fprintf(stderr, "Loaded class '%s' via PathClassLoader\n", java_name.c_str());
+  return klass;
+}
+
 static int InvokeMain(JNIEnv* env, char** argv) {
   // We want to call main() with a String array with our arguments in
   // it.  Create an array and populate it.  Note argv[0] is not
@@ -73,7 +169,7 @@ static int InvokeMain(JNIEnv* env, char** argv) {
   std::string class_name(argv[0]);
   std::replace(class_name.begin(), class_name.end(), '.', '/');
 
-  ScopedLocalRef<jclass> klass(env, env->FindClass(class_name.c_str()));
+  ScopedLocalRef<jclass> klass(env, LoadClassFromClasspath(env, class_name.c_str()));
   if (klass.get() == nullptr) {
     fprintf(stderr, "Unable to locate class '%s'\n", class_name.c_str());
     env->ExceptionDescribe();
