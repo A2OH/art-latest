@@ -687,3 +687,9 @@ extern "C" int JNI_OnLoad_ohbridge(void* vm, void* reserved) {
 }
 
 // Android 15 hidden symbol stubs
+
+// Alias for A15 renamed function
+extern "C" size_t artCriticalNativeFrameSize(void*);
+extern "C" size_t artCriticalNativeOutArgsSize(void* method) {
+    return artCriticalNativeFrameSize(method);
+}
