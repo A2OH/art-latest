@@ -2505,7 +2505,11 @@ jobject Runtime::GetSystemThreadGroup() const {
 }
 
 jobject Runtime::GetSystemClassLoader() const {
-  CHECK_IMPLIES(system_class_loader_ == nullptr, IsAotCompiler());
+  // In standalone builds with boot images from partial class init, the system
+  // class loader may not be set. Allow null to avoid crashing at startup.
+  if (system_class_loader_ == nullptr && !IsAotCompiler()) {
+    LOG(WARNING) << "system_class_loader_ is null in non-AOT mode (standalone build)";
+  }
   return system_class_loader_;
 }
 

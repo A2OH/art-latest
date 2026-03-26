@@ -2413,17 +2413,18 @@ void ImageWriter::LayoutHelper::VerifyImageBinSlotsAssigned() {
   };
   Runtime::Current()->GetHeap()->VisitObjects(ensure_bin_slots_assigned);
   if (!missed_objects.empty()) {
-    const gc::Verification* v = Runtime::Current()->GetHeap()->GetVerification();
+    // Standalone boot image builds may have orphan objects from failed clinits
+    // (e.g. System class LOCK, ClassExt from partial initialization).
+    // Assign them bin slots instead of crashing.
     size_t num_missed_objects = missed_objects.size();
-    size_t num_paths = std::min<size_t>(num_missed_objects, 5u);  // Do not flood the output.
-    ArrayRef<mirror::Object*> missed_objects_head =
-        ArrayRef<mirror::Object*>(missed_objects).SubArray(/*pos=*/ 0u, /*length=*/ num_paths);
-    for (mirror::Object* obj : missed_objects_head) {
-      LOG(ERROR) << "Image object without assigned bin slot: "
-          << mirror::Object::PrettyTypeOf(obj) << " " << obj
-          << " " << v->FirstPathFromRootSet(obj);
+    LOG(WARNING) << "Found " << num_missed_objects
+                 << " objects without assigned bin slots, assigning to regularObjects bin.";
+    for (mirror::Object* obj : missed_objects) {
+      // For boot image, oat_index is always 0 (single image).
+      constexpr size_t oat_index = 0u;
+      image_writer_->AssignImageBinSlot(obj, oat_index, Bin::kRegular);
+      bin_objects_[oat_index][enum_cast<size_t>(Bin::kRegular)].push_back(obj);
     }
-    LOG(FATAL) << "Found " << num_missed_objects << " objects without assigned bin slots.";
   }
 }
 

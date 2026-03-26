@@ -1273,23 +1273,14 @@ void ClassLinker::RunRootClinits(Thread* self) {
       "Ljava/util/EnumSet;",
       "Ljava/util/RegularEnumSet;",
       "Ljava/util/Collections;",
-      // Tier 3: VarHandle and MethodHandles infrastructure
-      // Note: VarHandle clinit depends on AccessType/AccessMode enums, but those
-      // enums must NOT be initialized before VarHandle since they may reference VarHandle.
-      "Ljava/lang/invoke/VarHandle;",
-      "Ljava/lang/invoke/VarHandle$AccessType;",
-      "Ljava/lang/invoke/VarHandle$AccessMode;",
-      "Ljava/lang/invoke/MethodHandles;",
-      "Ljava/lang/invoke/MethodHandles$Lookup;",
-      "Ljava/lang/invoke/MethodType;",
-      // Tier 4: Atomic classes (need FieldVarHandle which needs Field natives)
-      // These may fail but attempt them to see what happens
-      "Ljava/lang/invoke/FieldVarHandle;",
-      "Ljava/util/concurrent/atomic/AtomicInteger;",
-      "Ljava/util/concurrent/atomic/AtomicLong;",
-      "Ljava/lang/ThreadLocal;",
-      // Tier 5: Classes whose clinit depends on ThreadLocal/AtomicLong
-      "Ljava/lang/reflect/Proxy;",
+      // Tier 3: VarHandle family SKIPPED - circular enum init (AccessMode <-> VarHandle).
+      // VarHandle clinit calls AccessMode.values(), but AccessMode init triggers VarHandle
+      // resolution as its enclosing class. These remain uninitialized in the boot image
+      // and will be initialized at runtime instead.
+      // SKIP: VarHandle, VarHandle$AccessType, VarHandle$AccessMode
+      // SKIP: MethodHandles, MethodHandles$Lookup, MethodType (depend on VarHandle)
+      // SKIP: FieldVarHandle, AtomicInteger, AtomicLong (depend on VarHandle)
+      // SKIP: ThreadLocal, Proxy (depend on AtomicLong)
       // Tier 6: Boxing classes and their caches (needed by image writer intrinsic objects)
       "Ljava/lang/Boolean;",
       "Ljava/lang/Byte;",

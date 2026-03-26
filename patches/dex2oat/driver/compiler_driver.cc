@@ -908,9 +908,10 @@ void CompilerDriver::PreCompile(jobject class_loader,
       if (kIsDebugBuild) {
         EnsureVerifiedOrVerifyAtRuntime(class_loader, dex_files);
       }
-      // Skip class initialization for standalone boot image builds.
-      // Class initializers crash the interpreter when core library dependencies
-      // (VarHandle, Daemons, etc.) fail to load, causing SIGSEGV in vtable lookup.
+      // InitializeClasses is skipped for standalone boot image builds.
+      // RunRootClinits already initializes critical root classes with exception handling.
+      // InitializeClasses would trigger cascading failures from VarHandle circular deps
+      // and cause SIGSEGV in the interpreter when virtual calls hit null objects.
       // Classes will be initialized at runtime instead.
       LOG(WARNING) << "Skipping InitializeClasses for standalone boot image build";
       VLOG(compiler) << "InitializeClasses (skipped): " << GetMemoryUsageString(false);

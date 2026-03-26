@@ -132,9 +132,17 @@ COMPILER_SRCS_ALL = $(filter-out %_test.cc %_fuzzer.cc,$(wildcard \
   $(ART)/compiler/utils/riscv64/*.cc))
 # Exclude SVE vector codegen -- requires newer VIXL with full SVE MacroAssembler support.
 # The SVE codegen is optional; non-SVE ARM64 codegen is the default path.
-COMPILER_EXCLUDE = %code_generator_vector_arm64_sve.cc
+COMPILER_EXCLUDE = %code_generator_vector_arm64_sve.cc %reference_type_propagation.cc
 COMPILER_SRCS = $(filter-out $(COMPILER_EXCLUDE),$(COMPILER_SRCS_ALL))
 COMPILER_OBJS = $(patsubst $(ART)/%.cc,$(BUILDDIR)/%.o,$(COMPILER_SRCS))
+
+# Patched reference_type_propagation.cc (null-safe GetCommonSuperClass call)
+RTP_PATCH_SRC = patches/compiler/optimizing/reference_type_propagation.cc
+RTP_PATCH_OBJ = $(BUILDDIR)/compiler/optimizing/reference_type_propagation.o
+$(RTP_PATCH_OBJ): $(RTP_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -iquote $(ART)/compiler/optimizing -c $< -o $@ 2>&1 && echo "OK: reference_type_propagation.cc (patched)" || { echo "FAIL: reference_type_propagation.cc (patched)"; rm -f $@; }
+COMPILER_OBJS += $(RTP_PATCH_OBJ)
 
 # ============ dex2oat ============
 # Note: In A15, more files moved into dex2oat (aot_class_linker, transaction,
@@ -227,7 +235,8 @@ RUNTIME_EXCLUDE = %backtrace_helper.cc \
   %runtime/thread.cc \
   %runtime/runtime.cc \
   %interpreter/unstarted_runtime.cc \
-  %runtime/art_method.cc
+  %runtime/art_method.cc \
+  %mirror/class.cc
 # Exclude ALL runtime/native/*.cc -- we compile patched copies from patches/runtime/native/
 # that use tolerant_native_util.h (graceful fallback when core JARs lack some native methods)
 RUNTIME_NATIVE_ORIG = $(filter-out %_test.cc %_fuzzer.cc %_bench.cc,$(wildcard $(ART)/runtime/native/*.cc))
@@ -297,6 +306,16 @@ $(UNSTARTED_PATCH_OBJ): $(UNSTARTED_PATCH_SRC)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -I$(ART)/runtime/interpreter -c $< -o $@ 2>&1 && echo "OK: unstarted_runtime.cc (patched)" || { echo "FAIL: unstarted_runtime.cc (patched)"; rm -f $@; }
 RUNTIME_OBJS += $(UNSTARTED_PATCH_OBJ)
+
+# Patched class.cc (null-safe GetCommonSuperClass for standalone builds with erroneous classes)
+# Note: class.cc needs -I for mirror/ but must NOT have runtime/ as -isystem (name collision
+# with mirror/string.h vs C++ <string.h>). Use -I instead of -isystem for runtime/.
+MIRRORCLASS_PATCH_SRC = patches/runtime/mirror/class.cc
+MIRRORCLASS_PATCH_OBJ = $(BUILDDIR)/runtime/mirror/class.o
+$(MIRRORCLASS_PATCH_OBJ): $(MIRRORCLASS_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -iquote $(ART)/runtime/mirror -c $< -o $@ 2>&1 && echo "OK: mirror/class.cc (patched)" || { echo "FAIL: mirror/class.cc (patched)"; rm -f $@; }
+RUNTIME_OBJS += $(MIRRORCLASS_PATCH_OBJ)
 
 # Patched runtime/native/*.cc (tolerant JNI registration via tolerant_native_util.h)
 # These are sed-processed copies where #include "native_util.h" -> #include "tolerant_native_util.h"
