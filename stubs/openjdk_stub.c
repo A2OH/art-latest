@@ -566,6 +566,32 @@ static void Runtime_runFinalization0(JNIEnv* env, jclass clazz) {
     /* no-op stub */
 }
 
+/* ==================== java.lang.Float / Double natives ==================== */
+
+static jint Float_floatToRawIntBits(JNIEnv* env, jclass clazz, jfloat f) {
+    union { jfloat f; jint i; } u;
+    u.f = f;
+    return u.i;
+}
+
+static jfloat Float_intBitsToFloat(JNIEnv* env, jclass clazz, jint i) {
+    union { jfloat f; jint i; } u;
+    u.i = i;
+    return u.f;
+}
+
+static jlong Double_doubleToRawLongBits(JNIEnv* env, jclass clazz, jdouble d) {
+    union { jdouble d; jlong l; } u;
+    u.d = d;
+    return u.l;
+}
+
+static jdouble Double_longBitsToDouble(JNIEnv* env, jclass clazz, jlong l) {
+    union { jdouble d; jlong l; } u;
+    u.l = l;
+    return u.d;
+}
+
 /* ==================== JNI_OnLoad ==================== */
 #include <jni.h>
 #include <stdio.h>
@@ -1047,6 +1073,30 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
                 {"abs","(D)D",(void*)Math_abs_d},{"max","(DD)D",(void*)Math_max_d},
                 {"toDegrees","(D)D",(void*)Math_toDegrees},
                 {"random","()D",(void*)Math_random},
+            };
+            registerNativesOrSkip(env, cls, methods, sizeof(methods)/sizeof(methods[0]));
+            (*env)->DeleteLocalRef(env, cls);
+        }
+    }
+    /* java.lang.Float */
+    {
+        jclass cls = (*env)->FindClass(env, "java/lang/Float");
+        if (cls) {
+            JNINativeMethod methods[] = {
+                {"floatToRawIntBits", "(F)I", (void*)Float_floatToRawIntBits},
+                {"intBitsToFloat", "(I)F", (void*)Float_intBitsToFloat},
+            };
+            registerNativesOrSkip(env, cls, methods, sizeof(methods)/sizeof(methods[0]));
+            (*env)->DeleteLocalRef(env, cls);
+        }
+    }
+    /* java.lang.Double */
+    {
+        jclass cls = (*env)->FindClass(env, "java/lang/Double");
+        if (cls) {
+            JNINativeMethod methods[] = {
+                {"doubleToRawLongBits", "(D)J", (void*)Double_doubleToRawLongBits},
+                {"longBitsToDouble", "(J)D", (void*)Double_longBitsToDouble},
             };
             registerNativesOrSkip(env, cls, methods, sizeof(methods)/sizeof(methods[0]));
             (*env)->DeleteLocalRef(env, cls);

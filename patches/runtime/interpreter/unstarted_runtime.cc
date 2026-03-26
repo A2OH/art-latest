@@ -215,13 +215,13 @@ static std::function<hiddenapi::AccessContext()> GetHiddenapiAccessContextFuncti
 }
 
 template<typename T>
-static ALWAYS_INLINE bool ShouldDenyAccessToMember(T* member, ShadowFrame* frame)
+static ALWAYS_INLINE bool ShouldDenyAccessToMember(
+    [[maybe_unused]] T* member, [[maybe_unused]] ShadowFrame* frame)
     REQUIRES_SHARED(Locks::mutator_lock_) {
-  // All uses in this file are from reflection
-  constexpr hiddenapi::AccessMethod kAccessMethod = hiddenapi::AccessMethod::kReflection;
-  return hiddenapi::ShouldDenyAccessToMember(member,
-                                             GetHiddenapiAccessContextFunction(frame),
-                                             kAccessMethod);
+  // PATCHED: Always allow access in standalone build.
+  // Boot classpath classes (AtomicInteger, ThreadLocal, etc.) need to reflect
+  // on their own private fields via VarHandle/findVarHandle.
+  return false;
 }
 
 void UnstartedRuntime::UnstartedClassForNameCommon(Thread* self,

@@ -154,6 +154,11 @@
 #define THREAD_TOP_QUICK_FRAME_OFFSET 0xa8
 #define THREAD_USE_MTERP_OFFSET 0x50
 
+// JNI stack tag mask: kTaggedJniSpMask = 0x3, toggled = ~0x3
+#define TAGGED_JNI_SP_MASK 0x3
+#define TAGGED_JNI_SP_MASK_TOGGLED32 0xfffffffc
+#define TAGGED_JNI_SP_MASK_TOGGLED64 0xfffffffffffffffc
+
 // A15 callee-save frame constants for x86_64
 #define CALLEE_SAVE_EVERYTHING_NUM_CORE_SPILLS 16
 #define CALLEE_SAVE_EVERYTHING_NUM_FP_SPILLS 16

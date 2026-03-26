@@ -66,12 +66,14 @@ static std::function<hiddenapi::AccessContext()> GetHiddenapiAccessContextFuncti
 
 // Returns true if the first non-ClassClass caller up the stack should not be
 // allowed access to `member`.
+// PATCHED: Always allow access in standalone build (no hidden API enforcement).
+// The boot classpath classes (AtomicInteger, ThreadLocal, etc.) need to reflect
+// on their own private fields (e.g., AtomicInteger.value via VarHandle/findVarHandle).
 template<typename T>
-ALWAYS_INLINE static bool ShouldDenyAccessToMember(T* member, Thread* self)
+ALWAYS_INLINE static bool ShouldDenyAccessToMember(T* member, [[maybe_unused]] Thread* self)
     REQUIRES_SHARED(Locks::mutator_lock_) {
-  return hiddenapi::ShouldDenyAccessToMember(member,
-                                             GetHiddenapiAccessContextFunction(self),
-                                             hiddenapi::AccessMethod::kReflection);
+  (void)member;
+  return false;
 }
 
 ALWAYS_INLINE static inline ObjPtr<mirror::Class> DecodeClass(
@@ -384,6 +386,34 @@ static jobject Class_getDeclaredField(JNIEnv* env, jobject javaThis, jstring nam
       hs.NewHandle(GetDeclaredField(soa.Self(), h_klass.Get(), h_string.Get()));
   if (result == nullptr || ShouldDenyAccessToMember(result->GetArtField(), soa.Self())) {
     std::string name_str = h_string->ToModifiedUtf8();
+    // DEBUG: log field lookup failures for diagnosis
+    {
+      std::string class_desc = h_klass->PrettyDescriptor();
+      fprintf(stderr, "[DEBUG] getDeclaredField(%s, \"%s\") -> %s\n",
+              class_desc.c_str(), name_str.c_str(),
+              result == nullptr ? "NOT FOUND" : "DENIED");
+      // Dump available fields
+      auto* ifields = h_klass->GetIFieldsPtr();
+      if (ifields != nullptr) {
+        fprintf(stderr, "[DEBUG]   ifields (%zu):", ifields->size());
+        for (size_t i = 0; i < ifields->size(); i++) {
+          fprintf(stderr, " %s", ifields->At(i).GetName());
+        }
+        fprintf(stderr, "\n");
+      } else {
+        fprintf(stderr, "[DEBUG]   ifields: NULL\n");
+      }
+      auto* sfields = h_klass->GetSFieldsPtr();
+      if (sfields != nullptr) {
+        fprintf(stderr, "[DEBUG]   sfields (%zu):", sfields->size());
+        for (size_t i = 0; i < sfields->size(); i++) {
+          fprintf(stderr, " %s", sfields->At(i).GetName());
+        }
+        fprintf(stderr, "\n");
+      } else {
+        fprintf(stderr, "[DEBUG]   sfields: NULL\n");
+      }
+    }
     if (name_str == "value" && h_klass->IsStringClass()) {
       // We log the error for this specific case, as the user might just swallow the exception.
       // This helps diagnose crashes when applications rely on the String#value field being
