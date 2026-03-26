@@ -2524,6 +2524,10 @@ jobject Runtime::GetSystemClassLoader() const {
   } while (false)
 
 void Runtime::RegisterRuntimeNativeMethods(JNIEnv* env) {
+  // Register Throwable FIRST: other registrations may fail and create exceptions,
+  // which call nativeFillInStackTrace. With speed-compiled boot images, this native
+  // method must already be registered before any exception can be thrown.
+  TRY_REGISTER(register_java_lang_Throwable);
   TRY_REGISTER(register_dalvik_system_DexFile);
   TRY_REGISTER(register_dalvik_system_BaseDexClassLoader);
   TRY_REGISTER(register_dalvik_system_VMDebug);
@@ -2548,7 +2552,7 @@ void Runtime::RegisterRuntimeNativeMethods(JNIEnv* env) {
   TRY_REGISTER(register_java_lang_StringFactory);
   TRY_REGISTER(register_java_lang_System);
   TRY_REGISTER(register_java_lang_Thread);
-  TRY_REGISTER(register_java_lang_Throwable);
+  // register_java_lang_Throwable already registered above
   TRY_REGISTER(register_java_lang_VMClassLoader);
   TRY_REGISTER(register_java_util_concurrent_atomic_AtomicLong);
   TRY_REGISTER(register_jdk_internal_misc_Unsafe);

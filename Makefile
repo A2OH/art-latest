@@ -160,7 +160,7 @@ DEX2OAT_SRCS_ALL = $(filter-out %_test.cc %_fuzzer.cc,$(wildcard \
   $(ART)/dex2oat/linker/x86_64/*.cc \
   $(ART)/dex2oat/utils/*.cc))
 # Exclude files that have patched versions
-DEX2OAT_EXCLUDE = %dex2oat/driver/compiler_driver.cc %dex2oat/linker/image_writer.cc
+DEX2OAT_EXCLUDE = %dex2oat/driver/compiler_driver.cc %dex2oat/linker/image_writer.cc %dex2oat/linker/oat_writer.cc
 DEX2OAT_SRCS = $(filter-out $(DEX2OAT_EXCLUDE),$(DEX2OAT_SRCS_ALL))
 DEX2OAT_OBJS = $(patsubst $(ART)/%.cc,$(BUILDDIR)/%.o,$(DEX2OAT_SRCS))
 
@@ -179,6 +179,14 @@ $(IW_PATCH_OBJ): $(IW_PATCH_SRC)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -I$(ART)/dex2oat/linker -c $< -o $@ 2>&1 && echo "OK: image_writer.cc (patched)" || { echo "FAIL: image_writer.cc (patched)"; rm -f $@; }
 DEX2OAT_OBJS += $(IW_PATCH_OBJ)
+
+# Patched oat_writer.cc (null-safe GetTargetType for unresolved types in speed filter)
+OW_PATCH_SRC = patches/dex2oat/linker/oat_writer.cc
+OW_PATCH_OBJ = $(BUILDDIR)/dex2oat/linker/oat_writer.o
+$(OW_PATCH_OBJ): $(OW_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -I$(ART)/dex2oat/linker -c $< -o $@ 2>&1 && echo "OK: oat_writer.cc (patched)" || { echo "FAIL: oat_writer.cc (patched)"; rm -f $@; }
+DEX2OAT_OBJS += $(OW_PATCH_OBJ)
 
 # ============ runtime ============
 # A15 moved many files into runtime/oat/, runtime/metrics/, runtime/javaheapprof/
