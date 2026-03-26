@@ -3831,6 +3831,30 @@ void ImageWriter::CopyAndFixupMethod(ArtMethod* orig,
       copy->SetEntryPointFromQuickCompiledCodePtrSize(quick_code, target_ptr_size_);
     }
   }
+
+  // Belt-and-suspenders: directly check if this method's compiled code offset is in
+  // the zero-patched set.  GetQuickCode() already checks this, but some code paths
+  // (e.g. boot JNI stub replacement, clinit-check resolution stubs) can overwrite the
+  // entry point AFTER GetQuickCode returns.  This final check catches all of them.
+  if (!orig->IsRuntimeMethod() && !g_zero_patched_code_offsets.empty()) {
+    const void* orig_ep = orig->GetEntryPointFromQuickCompiledCodePtrSize(target_ptr_size_);
+    uint32_t orig_code_offset = PointerToLowMemUInt32(orig_ep);
+    if (g_zero_patched_code_offsets.count(orig_code_offset) != 0) {
+      const uint8_t* interp = GetOatAddress(StubType::kQuickToInterpreterBridge);
+      const void* current_ep = copy->GetEntryPointFromQuickCompiledCodePtrSize(target_ptr_size_);
+      if (current_ep != reinterpret_cast<const void*>(interp)) {
+        static int zp_fixup_count = 0;
+        if (++zp_fixup_count <= 10) {
+          LOG(WARNING) << "CopyAndFixupMethod: zero-patched method "
+                       << orig->PrettyMethod()
+                       << " (code_offset=" << orig_code_offset
+                       << ") entry point was NOT interpreter bridge, forcing override";
+        }
+        copy->SetEntryPointFromQuickCompiledCodePtrSize(interp, target_ptr_size_);
+      }
+    }
+  }
+
   // Ensure all non-runtime methods have a valid entry point after fixup.
   // Some methods may retain stale entry points from memcpy (e.g., uninitialized
   // methods with small OAT offsets that resolve to near-null addresses).

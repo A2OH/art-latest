@@ -95,10 +95,21 @@ static int InvokeMain(JNIEnv* env, char** argv) {
   // Invoke main().
   env->CallStaticVoidMethod(klass.get(), method, args.get());
 
-  // Check whether there was an uncaught exception. We don't log any uncaught exception here;
-  // detaching this thread will do that for us, but it will clear the exception (and invalidate
-  // our JNIEnv), so we need to check here.
-  return env->ExceptionCheck() ? EXIT_FAILURE : EXIT_SUCCESS;
+  // Check whether there was an uncaught exception.  In standalone builds the normal
+  // uncaught-exception handler may not be wired up, so print it ourselves.
+  // Use both ExceptionOccurred and ExceptionCheck for robustness.
+  jthrowable exc = env->ExceptionOccurred();
+  if (exc != nullptr) {
+    env->ExceptionDescribe();
+    fflush(stderr);
+    return EXIT_FAILURE;
+  }
+  if (env->ExceptionCheck()) {
+    env->ExceptionDescribe();
+    fflush(stderr);
+    return EXIT_FAILURE;
+  }
+  return EXIT_SUCCESS;
 }
 
 // Parse arguments.  Most of it just gets passed through to the runtime.
@@ -189,6 +200,9 @@ static int dalvikvm(int argc, char** argv) {
 
   // In standalone builds, VM shutdown (DestroyJavaVM) crashes because thread groups
   // and daemon threads aren't fully initialized. Just exit directly.
+  // Flush stderr so ExceptionDescribe output is not lost by _exit().
+  fflush(stderr);
+  fflush(stdout);
   _exit(rc);
 }
 

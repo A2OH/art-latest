@@ -926,7 +926,6 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
         if (cls) {
             JNINativeMethod methods[] = {
                 {"nativeExit", "(I)V", (void*)Runtime_nativeExit},
-                {"halt", "(I)V", (void*)Runtime_nativeExit},
                 {"nativeGc", "()V", (void*)Runtime_nativeGc},
                 {"nativeLoad", "(Ljava/lang/String;Ljava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/String;", (void*)Runtime_nativeLoad},
                 {"freeMemory", "()J", (void*)Runtime_freeMemory},
@@ -936,6 +935,21 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
             };
             registerNativesOrSkip(env, cls, methods, sizeof(methods)/sizeof(methods[0]));
             (*env)->DeleteLocalRef(env, cls);
+        }
+    }
+
+    /* java.lang.Shutdown -- halt0 is the native that Runtime.halt() ultimately calls
+       in some JDK/ART versions.  Register it defensively. */
+    {
+        jclass cls = (*env)->FindClass(env, "java/lang/Shutdown");
+        if (cls) {
+            JNINativeMethod methods[] = {
+                {"halt0", "(I)V", (void*)Runtime_nativeExit},
+            };
+            registerNativesOrSkip(env, cls, methods, sizeof(methods)/sizeof(methods[0]));
+            (*env)->DeleteLocalRef(env, cls);
+        } else {
+            (*env)->ExceptionClear(env); /* class may not exist in this DEX set */
         }
     }
 
