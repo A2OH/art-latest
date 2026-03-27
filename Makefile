@@ -2,10 +2,13 @@ ART = /home/dspfac/aosp-art-15
 AOSP = /home/dspfac/aosp-android-11
 STUBS = /home/dspfac/art-latest/stubs
 
-# Use AOSP clang 11 + libc++ (matches AOSP build environment)
-# This avoids GCC 13 issues: cmpxchg16b asm, constexpr, iterator types
-CXX = $(AOSP)/prebuilts/clang/host/linux-x86/clang-r383902b1/bin/clang++
-CC  = $(AOSP)/prebuilts/clang/host/linux-x86/clang-r383902b1/bin/clang
+# Use clang-15 (conda) + clang-11's libc++ headers (ABI compatible)
+# clang-11 crashes on large A15 C++20 files; clang-15 handles them fine
+CXX = /home/dspfac/miniconda3/bin/clang++
+CC  = /home/dspfac/miniconda3/bin/clang
+CXX_OLD = $(AOSP)/prebuilts/clang/host/linux-x86/clang-r383902b1/bin/clang++
+CC_ASM  = $(AOSP)/prebuilts/clang/host/linux-x86/clang-r383902b1/bin/clang
+HOSTLD  = $(CXX_OLD) -stdlib=libc++
 LIBCXX = $(AOSP)/prebuilts/clang/host/linux-x86/clang-r383902b1/include/c++/v1
 
 # Android 15 ART uses C++20 features (starts_with, ends_with, <=>)
@@ -66,8 +69,8 @@ CXXFLAGS = -std=c++2a -O2 -w -mcx16 -fPIC -DNDEBUG \
 
 BUILDDIR = build
 
-# For linking: use same clang + libc++ to match compilation ABI
-HOSTLD = $(CXX) -stdlib=libc++
+# For linking: use clang-11's linker (compatible with libc++ runtime)
+# HOSTLD defined above near CXX_OLD
 CLANG_LIB = $(AOSP)/prebuilts/clang/host/linux-x86/clang-r383902b1/lib64
 SYSROOT = $(AOSP)/prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8/sysroot
 LDFLAGS = -L$(CLANG_LIB) -Wl,-rpath,$(CLANG_LIB) \
@@ -475,7 +478,7 @@ sve-stub: $(SVE_STUB_OBJ)
 asm-x86_64:
 	@mkdir -p $(BUILDDIR)/asm_x86_64 $(BUILDDIR)/stubs
 	@echo "=== Assembling x86_64 entrypoints (from A11 + A15 stubs) ==="
-	@$(CC) -c \
+	@$(CC_ASM) -c \
 	  -I$(AOSP)/art/runtime \
 	  -I$(AOSP)/art/runtime/arch/x86_64 \
 	  -I$(AOSP)/art/runtime/arch \
@@ -484,7 +487,7 @@ asm-x86_64:
 	  $(AOSP)/art/runtime/arch/x86_64/quick_entrypoints_x86_64.S \
 	  -o $(BUILDDIR)/asm_x86_64/quick_entrypoints_x86_64.o 2>&1 \
 	  && echo "OK: quick_entrypoints_x86_64.S (A11)" || echo "FAIL: quick_entrypoints_x86_64.S"
-	@$(CC) -c \
+	@$(CC_ASM) -c \
 	  -I$(ART)/runtime \
 	  -I$(ART)/runtime/arch/x86_64 \
 	  -I$(ART)/runtime/arch \
@@ -493,13 +496,13 @@ asm-x86_64:
 	  $(ART)/runtime/arch/x86_64/jni_entrypoints_x86_64.S \
 	  -o $(BUILDDIR)/asm_x86_64/jni_entrypoints_x86_64.o 2>&1 \
 	  && echo "OK: jni_entrypoints_x86_64.S (A15)" || echo "FAIL: jni_entrypoints_x86_64.S"
-	@$(CC) -c \
+	@$(CC_ASM) -c \
 	  -I$(AOSP)/art/runtime \
 	  -I$(AOSP)/art/runtime/arch/x86_64 \
 	  $(AOSP)/art/runtime/arch/x86_64/memcmp16_x86_64.S \
 	  -o $(BUILDDIR)/asm_x86_64/memcmp16_x86_64.o 2>&1 \
 	  && echo "OK: memcmp16_x86_64.S (A11)" || echo "FAIL: memcmp16_x86_64.S"
-	@$(CC) -c $(STUBS)/quick_entrypoints_stubs_x86_64.S \
+	@$(CC_ASM) -c $(STUBS)/quick_entrypoints_stubs_x86_64.S \
 	  -o $(BUILDDIR)/stubs/quick_entrypoints_stubs_x86_64.o 2>&1 \
 	  && echo "OK: quick_entrypoints_stubs_x86_64.S (A15 stubs)" || echo "FAIL: quick_entrypoints_stubs_x86_64.S"
 
