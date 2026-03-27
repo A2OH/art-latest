@@ -1320,7 +1320,15 @@ void ClassLinker::RunRootClinits(Thread* self) {
   }
 
   for (size_t i = 0; i < static_cast<size_t>(ClassRoot::kMax); ++i) {
-    EnsureRootInitialized(this, self, GetClassRoot(ClassRoot(i), class_roots.Get()));
+    ClassRoot cr = ClassRoot(i);
+    // Skip VarHandle family — their clinit has circular enum dependency
+    // that makes them erroneous, corrupting the boot image.
+    if (cr == ClassRoot::kJavaLangInvokeVarHandle ||
+        cr == ClassRoot::kJavaLangInvokeFieldVarHandle ||
+        cr == ClassRoot::kJavaLangInvokeStaticFieldVarHandle) {
+      continue;
+    }
+    EnsureRootInitialized(this, self, GetClassRoot(cr, class_roots.Get()));
   }
 
   // Make sure certain well-known classes are initialized. Note that well-known
@@ -1359,9 +1367,9 @@ void ClassLinker::RunRootClinits(Thread* self) {
       WellKnownClasses::java_lang_reflect_InvocationTargetException_init,
       // Ensure `Parameter` class is initialized (avoid check at runtime).
       WellKnownClasses::java_lang_reflect_Parameter_init,
-      // Ensure `MethodHandles` and `MethodType` classes are initialized (avoid check at runtime).
-      WellKnownClasses::java_lang_invoke_MethodHandles_lookup,
-      WellKnownClasses::java_lang_invoke_MethodType_makeImpl,
+      // Skip MethodHandles/MethodType — triggers VarHandle cascade
+      // WellKnownClasses::java_lang_invoke_MethodHandles_lookup,
+      // WellKnownClasses::java_lang_invoke_MethodType_makeImpl,
       // Ensure `DirectByteBuffer` class is initialized (avoid check at runtime).
       WellKnownClasses::java_nio_DirectByteBuffer_init,
       // Ensure `FloatingDecimal` class is initialized (avoid check at runtime).

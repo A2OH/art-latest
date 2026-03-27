@@ -721,3 +721,4 @@ link-runtime: all ziparchive sigchain nativehelper dalvikvm-main asm-x86_64 fmtl
 
 clean:
 	rm -rf $(BUILDDIR)
+

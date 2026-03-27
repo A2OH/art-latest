@@ -14,10 +14,12 @@
  * limitations under the License.
  */
 
+#include <execinfo.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ucontext.h>
 #include <algorithm>
 #include <memory>
 
@@ -304,6 +306,27 @@ static int InvokeMain(JNIEnv* env, char** argv) {
 // The JNI spec defines a handful of standard arguments.
 static int dalvikvm(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
+
+  // Install a crash handler to get backtrace before ART's handler
+  {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = [](int sig, siginfo_t* info, void* ctx) {
+      ucontext_t* uc = (ucontext_t*)ctx;
+      fprintf(stderr, "\n[dalvikvm] CRASH: signal=%d addr=%p rip=0x%llx\n",
+              sig, info->si_addr,
+              (unsigned long long)uc->uc_mcontext.gregs[REG_RIP]);
+      fflush(stderr);
+      // Call backtrace
+      void* bt[20];
+      int n = backtrace(bt, 20);
+      backtrace_symbols_fd(bt, n, 2);
+      _exit(128 + sig);
+    };
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, nullptr);
+    sigaction(SIGABRT, &sa, nullptr);
+  }
 
   // Skip over argv[0].
   argv++;
