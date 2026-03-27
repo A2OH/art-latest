@@ -241,6 +241,7 @@ RUNTIME_EXCLUDE = %backtrace_helper.cc \
   %monitor_android.cc \
   %metrics/statsd.cc \
   %well_known_classes.cc \
+  %gc/space/image_space.cc \
   %runtime_intrinsics.cc \
   %runtime/class_linker.cc \
   %runtime/thread.cc \
@@ -347,6 +348,15 @@ $(STACKMAP_PATCH_OBJ): $(STACKMAP_PATCH_SRC)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -I$(ART)/runtime/oat -c $< -o $@ 2>&1 && echo "OK: stack_map.cc (patched)" || { echo "FAIL: stack_map.cc (patched)"; rm -f $@; }
 RUNTIME_OBJS += $(STACKMAP_PATCH_OBJ)
+
+# Patched image_space.cc (tolerant relocator for erroneous class refs)
+IMGSPACE_PATCH_SRC = patches/runtime/gc/space/image_space.cc
+IMGSPACE_PATCH_OBJ = $(BUILDDIR)/runtime/gc/space/image_space.o
+
+$(IMGSPACE_PATCH_OBJ): $(IMGSPACE_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -iquote $(ART)/runtime/gc/space -c $< -o $@ 2>&1 && echo "OK: image_space.cc (patched)" || { echo "FAIL: image_space.cc (patched)"; rm -f $@; }
+RUNTIME_OBJS += $(IMGSPACE_PATCH_OBJ)
 
 # Patched image.cc (version 085 to match prebuilt boot images from A11 dex2oat)
 IMAGE_PATCH_SRC = patches/runtime/oat/image.cc

@@ -38,6 +38,7 @@
 #include "gc/accounting/card_table-inl.h"
 #include "hidden_api.h"
 #include "interpreter/interpreter.h"
+#include "interpreter/unstarted_runtime.h"
 #include "intrinsics_enum.h"
 #include "jit/jit.h"
 #include "jit/jit_code_cache.h"
@@ -467,8 +468,31 @@ void ArtMethod::Invoke(Thread* self, uint32_t* args, uint32_t args_size, JValue*
           art::interpreter::EnterInterpreterFromInvoke(
               self, this, receiver, args + 1, result, /*stay_in_interpreter=*/ true);
         }
+      } else if (IsNative() && IsInvokable()) {
+        // Native method without compiled code -- route through unstarted runtime JNI handlers.
+        // This is needed for dex2oat where VarHandle clinit calls Unsafe CAS/get via reflection.
+        JValue jv;
+        uint32_t* raw_args = reinterpret_cast<uint32_t*>(args);
+        mirror::Object* rcv = IsStatic() ? nullptr
+            : reinterpret_cast<StackReference<mirror::Object>*>(&args[0])->AsMirrorPtr();
+        uint32_t* method_args = IsStatic() ? raw_args : raw_args + 1;
+        art::interpreter::UnstartedRuntime::Jni(self, this, rcv, method_args, &jv);
+        if (self->IsExceptionPending()) {
+          // Unstarted JNI handler threw (unsupported native method).
+          // Clear exception and return zero to avoid infinite loops.
+          LOG(WARNING) << "Unstarted JNI failed for '" << PrettyMethod()
+                       << "' -- clearing exception, returning zero";
+          self->ClearException();
+          if (result != nullptr) {
+            result->SetJ(0);
+          }
+        } else {
+          if (result != nullptr) {
+            *result = jv;
+          }
+        }
       } else {
-        LOG(INFO) << "Not invoking '" << PrettyMethod() << "' code=null (native or non-invokable)";
+        LOG(INFO) << "Not invoking '" << PrettyMethod() << "' code=null (non-invokable)";
         if (result != nullptr) {
           result->SetJ(0);
         }

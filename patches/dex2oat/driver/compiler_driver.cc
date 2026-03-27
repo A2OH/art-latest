@@ -1359,7 +1359,11 @@ class ClinitImageUpdate {
                   [[maybe_unused]] bool is_static) const REQUIRES_SHARED(Locks::mutator_lock_) {
     mirror::Object* ref = object->GetFieldObject<mirror::Object>(field_offset);
     if (ref != nullptr) {
-      VisitClinitClassesObject(ref);
+      // Validate ref before visiting (tolerate corrupt refs from erroneous classes).
+      gc::Heap* heap = Runtime::Current()->GetHeap();
+      if (heap->IsValidObjectAddress(ref)) {
+        VisitClinitClassesObject(ref);
+      }
     }
   }
 
@@ -1438,16 +1442,34 @@ class ClinitImageUpdate {
       return;
     }
 
+    // Validate object pointer before accessing it (tolerate erroneous/corrupt refs
+    // from VarHandle, AtomicInteger, and similar classes with failed clinit).
+    gc::Heap* heap = Runtime::Current()->GetHeap();
+    if (!heap->IsValidObjectAddress(object)) {
+      return;
+    }
+
+    // Validate the object's class pointer before any method call that dereferences it.
+    // IsClass(), IsDexCache(), VisitReferences() all dereference GetClass() which
+    // may be a corrupt pointer for erroneous/uninitialized objects.
+    mirror::Class* obj_class = object->GetClass();
+    if (obj_class == nullptr || !heap->IsValidObjectAddress(obj_class)) {
+      return;
+    }
+
     // Mark it.
     marked_objects_.insert(object);
 
     if (object->IsClass()) {
       // Add to the TODO list since MaybeAddToImageClasses may cause thread suspension. Thread
       // suspensionb is not safe to do in VisitObjects or VisitReferences.
-      to_insert_.push_back(hs_.NewHandle(object->AsClass()));
+      ObjPtr<mirror::Class> as_class = object->AsClass();
+      if (as_class != nullptr && !as_class->IsErroneous()) {
+        to_insert_.push_back(hs_.NewHandle(as_class));
+      }
     } else {
       // Else visit the object's class.
-      VisitClinitClassesObject(object->GetClass());
+      VisitClinitClassesObject(obj_class);
     }
 
     // If it is not a DexCache, visit all references.
