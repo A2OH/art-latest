@@ -386,20 +386,18 @@ void ArtMethod::Invoke(Thread* self, uint32_t* args, uint32_t args_size, JValue*
   // Invocation by the interpreter, explicitly forcing interpretation over JIT to prevent
   // cycling around the various JIT/Interpreter methods that handle method invocation.
 
-  // In imageless/standalone builds, force interpreter for methods from the app DEX
-  // (the last entry on boot classpath, which is the -classpath DEX appended by runtime.cc).
-  // Boot classpath methods use quick stubs (which silently skip execution, but avoid
-  // triggering the VarHandle/AtomicInteger circular initialization cascade).
-  // App methods MUST use the interpreter because quick stubs don't execute them.
+  // Force interpreter in two cases:
+  // 1. AOT compiler (dex2oat): Nterp stubs don't execute, so class init needs interpreter.
+  //    For native methods, route through UnstartedRuntime::Jni which has Unsafe handlers.
+  // 2. Imageless runtime (dalvikvm without boot image): app methods need interpreter
   bool force_interpreter_path = false;
-  if (!IsNative() && IsInvokable() && !IsProxyMethod() &&
-      !runtime->GetHeap()->HasBootImageSpace()) {
-    // Check if this method is from the app classpath DEX (last BCP entry)
-    const std::vector<const DexFile*>& bcp = runtime->GetClassLinker()->GetBootClassPath();
-    if (!bcp.empty()) {
-      const DexFile* app_dex = bcp.back();
-      const DexFile* method_dex = GetDexFile();
-      if (method_dex == app_dex) {
+  if (!IsNative() && IsInvokable() && !IsProxyMethod()) {
+    if (runtime->IsAotCompiler()) {
+      // dex2oat: force interpreter for class initialization
+      force_interpreter_path = true;
+    } else if (!runtime->GetHeap()->HasBootImageSpace()) {
+      const std::vector<const DexFile*>& bcp = runtime->GetClassLinker()->GetBootClassPath();
+      if (!bcp.empty() && GetDexFile() == bcp.back()) {
         force_interpreter_path = true;
       }
     }

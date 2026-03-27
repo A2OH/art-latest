@@ -1840,6 +1840,7 @@ void UnstartedRuntime::UnstartedMethodInvoke(
       java_args_obj == nullptr ? nullptr : env->AddLocalReference<jobject>(java_args_obj));
 
   PointerSize pointer_size = Runtime::Current()->GetClassLinker()->GetImagePointerSize();
+
   ScopedLocalRef<jobject> result_jobj(env,
       (pointer_size == PointerSize::k64)
           ? InvokeMethod<PointerSize::k64>(soa,
@@ -2445,6 +2446,73 @@ void UnstartedRuntime::Invoke(Thread* self, const CodeItemDataAccessor& accessor
 // Hand select a number of methods to be run in a not yet started runtime without using JNI.
 void UnstartedRuntime::Jni(Thread* self, ArtMethod* method, mirror::Object* receiver,
                            uint32_t* args, JValue* result) {
+  // Handle Unsafe.getUnsafe() — returns the singleton Unsafe instance
+  // Needed for AtomicInteger/Long/Boolean clinit during AOT
+  const char* method_name = method->GetName();
+  const char* declaring_class = method->GetDeclaringClassDescriptor();
+
+    LOG(WARNING) << "[UNSAFE-JNI] method=" << method_name << " class=" << declaring_class;
+  if (strcmp(method_name, "getUnsafe") == 0 &&
+      (strcmp(declaring_class, "Ljdk/internal/misc/Unsafe;") == 0 ||
+       strcmp(declaring_class, "Lsun/misc/Unsafe;") == 0)) {
+    // Find the theUnsafe static field and return it
+    ObjPtr<mirror::Class> unsafe_class = method->GetDeclaringClass();
+    ArtField* the_unsafe_field = nullptr;
+    for (ArtField& field : unsafe_class->GetSFields()) {
+      if (strcmp(field.GetName(), "theUnsafe") == 0 || strcmp(field.GetName(), "THE_ONE") == 0) {
+        the_unsafe_field = &field;
+        break;
+      }
+    }
+    if (the_unsafe_field != nullptr) {
+      ObjPtr<mirror::Object> unsafe_instance = the_unsafe_field->GetObject(unsafe_class);
+      if (unsafe_instance == nullptr) {
+        // Create the singleton Unsafe instance
+        StackHandleScope<1> hs(self);
+        Handle<mirror::Class> h_class(hs.NewHandle(unsafe_class));
+        Runtime::Current()->GetClassLinker()->EnsureInitialized(
+            self, h_class, /*can_init_fields=*/ true, /*can_init_parents=*/ true);
+        unsafe_instance = the_unsafe_field->GetObject(h_class.Get());
+      }
+      result->SetL(unsafe_instance);
+      return;
+    }
+    // Fallback: create a new Unsafe instance
+    result->SetL(unsafe_class->AllocObject(self));
+    return;
+  }
+
+  // Handle Unsafe.objectFieldOffset(Class, String) — returns field offset
+  if (strcmp(method_name, "objectFieldOffset") == 0 &&
+      (strcmp(declaring_class, "Ljdk/internal/misc/Unsafe;") == 0 ||
+       strcmp(declaring_class, "Lsun/misc/Unsafe;") == 0)) {
+    // Check if this is the (Class, String) variant (2 args after receiver)
+    // args layout: [receiver, class_ref, string_ref]
+    ObjPtr<mirror::Object> arg1 = reinterpret_cast<StackReference<mirror::Object>*>(&args[1])->AsMirrorPtr();
+    ObjPtr<mirror::Object> arg2 = reinterpret_cast<StackReference<mirror::Object>*>(&args[2])->AsMirrorPtr();
+    if (arg1 != nullptr && arg2 != nullptr && arg1->IsClass() && arg2->GetClass()->IsStringClass()) {
+      ObjPtr<mirror::Class> target_class = arg1->AsClass();
+      ObjPtr<mirror::String> field_name = arg2->AsString();
+      std::string name_str = field_name->ToModifiedUtf8();
+      // Find the field by name
+      for (ArtField& field : target_class->GetIFields()) {
+        if (strcmp(field.GetName(), name_str.c_str()) == 0) {
+          result->SetJ(field.GetOffset().Uint32Value());
+          return;
+        }
+      }
+      for (ArtField& field : target_class->GetSFields()) {
+        if (strcmp(field.GetName(), name_str.c_str()) == 0) {
+          result->SetJ(field.GetOffset().Uint32Value());
+          return;
+        }
+      }
+      LOG(WARNING) << "objectFieldOffset: field '" << name_str << "' not found in "
+                   << target_class->PrettyClass();
+    }
+    // Fall through to normal handling for (Field) variant
+  }
+
   const auto& iter = jni_handlers_.find(method);
   if (iter != jni_handlers_.end()) {
     // Clear out the result in case it's not zeroed out.
