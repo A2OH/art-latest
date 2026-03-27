@@ -35,19 +35,7 @@ namespace art HIDDEN {
 namespace interpreter {
 
 bool IsNterpSupported() {
-  switch (kRuntimeISA) {
-    case InstructionSet::kArm:
-    case InstructionSet::kThumb2:
-    case InstructionSet::kArm64:
-      return kReserveMarkingRegister && !kUseTableLookupReadBarrier;
-    case InstructionSet::kRiscv64:
-      return true;
-    case InstructionSet::kX86:
-    case InstructionSet::kX86_64:
-      return !kUseTableLookupReadBarrier;
-    default:
-      return false;
-  }
+  return false; // Disabled: ExecuteNterpImpl is a stub
 }
 
 bool CanRuntimeUseNterp() REQUIRES_SHARED(Locks::mutator_lock_) {

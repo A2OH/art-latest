@@ -1295,11 +1295,11 @@ void ClassLinker::RunRootClinits(Thread* self) {
       "Ljava/lang/Long$LongCache;",
       "Ljava/lang/Float;",
       "Ljava/lang/Double;",
-      // Tier 7: Other commonly-needed classes
-      // Skip Daemons in standalone build — triggers VarHandle→AtomicInteger cascade
-      // "Ljava/lang/Daemons;",
-      "Ljdk/internal/math/FloatingDecimal;",
-      "Ldalvik/system/VMRuntime;",
+      // Tier 7: Skip VarHandle-dependent classes in standalone builds
+      // Daemons: ReferenceQueueDaemon has AtomicInteger field
+      // FloatingDecimal: uses ThreadLocal which needs AtomicLong→VarHandle
+      // VMRuntime: has AtomicInteger field (allocationCount)
+      // These init lazily when first used instead.
     };
     for (const char* desc : pre_init_classes) {
       ObjPtr<mirror::Class> klass = FindSystemClass(self, desc);
