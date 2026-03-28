@@ -1841,6 +1841,19 @@ void UnstartedRuntime::UnstartedMethodInvoke(
 
   PointerSize pointer_size = Runtime::Current()->GetClassLinker()->GetImagePointerSize();
 
+  // Log Method.invoke calls during AOT for debugging enum initialization
+  if (Runtime::Current()->IsAotCompiler() && java_method_obj != nullptr) {
+    static int mi_log = 0;
+    if (mi_log++ < 10) {
+      ObjPtr<mirror::Method> meth = ObjPtr<mirror::Method>::DownCast(java_method_obj);
+      ArtMethod* art_meth = meth->GetArtMethod();
+      if (art_meth != nullptr) {
+        LOG(WARNING) << "[MethodInvoke] " << art_meth->PrettyMethod()
+                     << " exc_pending=" << self->IsExceptionPending();
+      }
+    }
+  }
+
   ScopedLocalRef<jobject> result_jobj(env,
       (pointer_size == PointerSize::k64)
           ? InvokeMethod<PointerSize::k64>(soa,
@@ -2514,18 +2527,93 @@ void UnstartedRuntime::Jni(Thread* self, ArtMethod* method, mirror::Object* rece
     // Fall through to normal handling for (Field) variant
   }
 
-  // Override getStackClass2 BEFORE handler table lookup.
-  // Return java.lang.Object (a trusted, always-initialized boot class)
-  // so MethodHandles.lookup() creates a Lookup with full access for AOT.
+  // Override critical native methods BEFORE handler table lookup.
+
+  // Method.invoke — essential for enum values() reflection during VarHandle clinit
+  if (strcmp(method_name, "invoke") == 0 &&
+      strcmp(declaring_class, "Ljava/lang/reflect/Method;") == 0) {
+    // Delegate to the existing InvokeMethod implementation
+    ObjPtr<mirror::Object> recv_obj = reinterpret_cast<StackReference<mirror::Object>*>(&args[0])->AsMirrorPtr();
+    ObjPtr<mirror::Object> args_obj = reinterpret_cast<StackReference<mirror::Object>*>(&args[1])->AsMirrorPtr();
+    JNIEnvExt* env = self->GetJniEnv();
+    ScopedObjectAccessUnchecked soa(self);
+    ScopedLocalRef<jobject> java_method(env, env->AddLocalReference<jobject>(receiver));
+    ScopedLocalRef<jobject> java_receiver(env, recv_obj != nullptr ? env->AddLocalReference<jobject>(recv_obj) : nullptr);
+    ScopedLocalRef<jobject> java_args(env, args_obj != nullptr ? env->AddLocalReference<jobject>(args_obj) : nullptr);
+    PointerSize ps = Runtime::Current()->GetClassLinker()->GetImagePointerSize();
+    ScopedLocalRef<jobject> res(env,
+        (ps == PointerSize::k64)
+            ? InvokeMethod<PointerSize::k64>(soa, java_method.get(), java_receiver.get(), java_args.get())
+            : InvokeMethod<PointerSize::k32>(soa, java_method.get(), java_receiver.get(), java_args.get()));
+    result->SetL(self->DecodeJObject(res.get()));
+    if (self->IsExceptionPending()) {
+      self->ClearException();
+      result->SetL(nullptr);
+    }
+    return;
+  }
+  // The handler table's ArtMethod* pointers don't match the call-site pointers
+  // due to different class resolution contexts during Reinitialize().
+
+  // Field.getBoolean — needed by findVarHandle for field access checks
+  if (strcmp(method_name, "getBoolean") == 0 &&
+      strcmp(declaring_class, "Ljava/lang/reflect/Field;") == 0) {
+    // Field.getBoolean(Object) — get boolean field value
+    // receiver = Field, args[0] = target object
+    if (receiver != nullptr) {
+      ObjPtr<mirror::Field> field_obj = ObjPtr<mirror::Field>::DownCast(ObjPtr<mirror::Object>(receiver));
+      ArtField* art_field = field_obj->GetArtField();
+      ObjPtr<mirror::Object> target = reinterpret_cast<StackReference<mirror::Object>*>(&args[0])->AsMirrorPtr();
+      if (art_field != nullptr) {
+        result->SetZ(art_field->GetBoolean(target));
+        return;
+      }
+    }
+    result->SetZ(false);
+    return;
+  }
+
+  // Class.getDeclaredMethodInternal — essential for enum values() reflection
+  if (strcmp(method_name, "getDeclaredMethodInternal") == 0 &&
+      strcmp(declaring_class, "Ljava/lang/Class;") == 0) {
+    // Reuse the existing invoke_handlers logic via direct call
+    ObjPtr<mirror::Class> klass = receiver->AsClass();
+    ObjPtr<mirror::String> name_str = reinterpret_cast<StackReference<mirror::Object>*>(&args[0])->AsMirrorPtr()->AsString();
+    ObjPtr<mirror::ObjectArray<mirror::Class>> arg_types =
+        ObjPtr<mirror::ObjectArray<mirror::Class>>::DownCast(
+            reinterpret_cast<StackReference<mirror::Object>*>(&args[1])->AsMirrorPtr());
+    PointerSize ps = Runtime::Current()->GetClassLinker()->GetImagePointerSize();
+    auto fn = []() { return hiddenapi::AccessContext(/* use boot class loader */ nullptr); };
+    ObjPtr<mirror::Method> meth = (ps == PointerSize::k64)
+        ? mirror::Class::GetDeclaredMethodInternal<PointerSize::k64>(self, klass, name_str, arg_types, fn)
+        : mirror::Class::GetDeclaredMethodInternal<PointerSize::k32>(self, klass, name_str, arg_types, fn);
+    result->SetL(meth);
+    return;
+  }
+
+  // Override getStackClass2 — walk shadow frames to find the real caller.
+  // This ensures MethodHandles.lookup() creates a Lookup with the correct
+  // caller class (e.g., AtomicLong) so it can access private fields.
   if (Runtime::Current()->IsAotCompiler() &&
       strcmp(method_name, "getStackClass2") == 0 &&
       strcmp(declaring_class, "Ldalvik/system/VMStack;") == 0) {
-    ClassLinker* cl = Runtime::Current()->GetClassLinker();
-    // Use a non-java.* class to bypass Lookup's java.* package restriction
-    ObjPtr<mirror::Class> c = cl->FindSystemClass(self, "Ldalvik/system/VMRuntime;");
-    if (c == nullptr) c = cl->FindSystemClass(self, "Ljava/lang/Object;");
+    ObjPtr<mirror::Class> caller = nullptr;
+    int depth = 0;
+    for (const ManagedStack* current = self->GetManagedStack(); current != nullptr; current = current->GetLink()) {
+      for (ShadowFrame* sf = current->GetTopShadowFrame(); sf != nullptr; sf = sf->GetLink()) {
+        ArtMethod* m = sf->GetMethod();
+        if (m != nullptr && !m->IsRuntimeMethod()) {
+          depth++;
+          if (depth >= 3) {
+            caller = m->GetDeclaringClass();
+            goto found_caller;
+          }
+        }
+      }
+    }
+    found_caller:
     if (self->IsExceptionPending()) self->ClearException();
-    result->SetL(c);
+    result->SetL(caller);
     return;
   }
 
@@ -2626,7 +2714,11 @@ void UnstartedRuntime::Jni(Thread* self, ArtMethod* method, mirror::Object* rece
           found_by_name = true;
         }
       } else if (strcmp(mn, "getInnerClassFlags") == 0 && strcmp(dc, "Ljava/lang/Class;") == 0) {
-        result->SetI(0);
+        // Class.getInnerClassFlags(int defaultValue) — return default for non-inner,
+        // or the inner class flags for inner classes.
+        // args[0] = defaultValue (the access flags passed in)
+        // For simplicity during AOT, return the default value (preserves enum flag)
+        result->SetI(static_cast<int32_t>(args[0]));
         found_by_name = true;
       } else if (strcmp(mn, "getModifiers") == 0 && strcmp(dc, "Ljava/lang/Class;") == 0) {
         // Class.getModifiers() — return access flags from the ART class object
