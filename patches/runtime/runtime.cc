@@ -82,6 +82,7 @@
 #include "fault_handler.h"
 #include "gc/accounting/card_table-inl.h"
 #include "gc/heap.h"
+#include "interpreter/unstarted_runtime.h"
 #include "gc/scoped_gc_critical_section.h"
 #include "gc/space/image_space.h"
 #include "gc/space/space-inl.h"
@@ -1029,10 +1030,17 @@ void Runtime::RunRootClinits(Thread* self) {
     fprintf(stderr, "[RT] RunRootClinits: RegisterRuntimeNativeMethods done\n"); fflush(stderr);
     if (self->IsExceptionPending()) self->ClearException();
 
-    // Mark runtime as started so the interpreter uses normal JNI entry points
-    // instead of the restricted UnstartedRuntime::Jni() handler.
+    // Initialize UnstartedRuntime handler tables BEFORE setting started_=true.
+    // This ensures the handler tables are populated when PerformCall routes
+    // through UnstartedRuntime during class initialization.
+    // Reinitialize UnstartedRuntime (may have been initialized during early boot)
+    fprintf(stderr, "[RT] RunRootClinits: reinitializing UnstartedRuntime\n"); fflush(stderr);
+    interpreter::UnstartedRuntime::Reinitialize();
+
+    // Now set started_ so normal JNI dispatch works for registered natives.
+    // The PerformCall IsAotCompiler() check still routes through UnstartedRuntime.
     if (!started_) {
-      fprintf(stderr, "[RT] RunRootClinits: setting started_=true for JNI dispatch\n"); fflush(stderr);
+      fprintf(stderr, "[RT] RunRootClinits: setting started_=true\n"); fflush(stderr);
       started_ = true;
     }
 

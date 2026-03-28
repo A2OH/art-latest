@@ -91,15 +91,22 @@ inline void PerformCall(Thread* self,
     return;
   }
 
-  // In AOT compiler, route non-native methods through UnstartedRuntime
-  // (native methods go through their registered JNI implementations)
+  // In AOT compiler, route ALL methods through UnstartedRuntime.
+  // This ensures class init uses the interpreter (non-native) and
+  // UnstartedRuntime::Jni handlers (native) which support Unsafe etc.
   if (UNLIKELY(Runtime::Current()->IsAotCompiler())) {
     ArtMethod* callee = callee_frame->GetMethod();
-    if (!callee->IsNative()) {
+    if (callee->IsNative()) {
+      interpreter::UnstartedRuntime::Jni(
+          self, callee,
+          callee->IsStatic() ? nullptr
+              : callee_frame->GetVRegReference(first_dest_reg),
+          callee_frame->GetVRegArgs(first_dest_reg + (callee->IsStatic() ? 0 : 1)),
+          result);
+    } else {
       interpreter::UnstartedRuntime::Invoke(self, accessor, callee_frame, result, first_dest_reg);
-      return;
     }
-    // Native methods: fall through to normal dispatch (uses JNI)
+    return;
   }
 
   if (!EnsureInitialized(self, callee_frame)) {
