@@ -1212,8 +1212,21 @@ bool Runtime::Start() {
   Thread::FinishStartup();
   fprintf(stderr, "[RT] Thread::FinishStartup done\n"); fflush(stderr);
 
-  // Skip JIT for standalone builds
-  fprintf(stderr, "[RT] Skipping JIT creation for standalone build\n"); fflush(stderr);
+  // Create JIT if requested
+  if (jit_options_->UseJitCompilation() || jit_options_->GetSaveProfilingInfo()) {
+    std::string error_msg;
+    if (!IsZygote()) {
+      fprintf(stderr, "[RT] Creating JIT...\n"); fflush(stderr);
+      CreateJit();
+      if (jit_ != nullptr) {
+        fprintf(stderr, "[RT] JIT created successfully\n"); fflush(stderr);
+      } else {
+        fprintf(stderr, "[RT] JIT creation failed (non-fatal)\n"); fflush(stderr);
+      }
+    }
+  } else {
+    fprintf(stderr, "[RT] JIT not requested\n"); fflush(stderr);
+  }
 
   // Send the start phase event. We have to wait till here as this is when the main thread peer
   // has just been generated, important root clinits have been run and JNI is completely functional.
