@@ -424,7 +424,7 @@ ASM_OBJS = $(ASM_QUICK) $(ASM_JNI) $(ASM_MEMCMP) $(ASM_STUBS)
 ASM_INCLUDES = -I$(STUBS) \
   -I$(ART11)/runtime \
   -I$(ART11)/runtime/arch \
-  -I$(ART11)/runtime/arch/arm64 \
+  -I$(ART)/runtime/arch/arm64 -I$(ART)/runtime \
   -I$(ART11)/runtime/interpreter \
   -I$(ART)/runtime \
   -I$(ART)/runtime/arch \
@@ -490,12 +490,12 @@ asm: $(ASM_OBJS)
 	@ls -lh $(ASM_OBJS) 2>/dev/null
 
 # A11 quick_entrypoints_arm64.S (compatible calling convention with A15 runtime)
-$(ASM_QUICK): $(ART11)/runtime/arch/arm64/quick_entrypoints_arm64.S
+$(ASM_QUICK): $(ART)/runtime/arch/arm64/quick_entrypoints_arm64.S
 	@mkdir -p $(ASM_DIR)
 	@$(CC) $(TARGET_FLAGS) \
 	  -c -x assembler-with-cpp \
 	  $(ASM_INCLUDES) \
-	  $< -o $@ 2>&1 && echo "OK: quick_entrypoints_arm64.S (A11)" || { echo "FAIL: quick_entrypoints_arm64.S"; rm -f $@; }
+	  $< -o $@ 2>&1 && echo "OK: quick_entrypoints_arm64.S (A15)" || { echo "FAIL: quick_entrypoints_arm64.S"; rm -f $@; }
 
 # A11 jni_entrypoints_arm64.S (A15 version uses CFI macros not supported by OHOS clang)
 $(ASM_JNI): $(ART11)/runtime/arch/arm64/jni_entrypoints_arm64.S
