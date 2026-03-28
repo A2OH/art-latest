@@ -2535,6 +2535,10 @@ void UnstartedRuntime::Jni(Thread* self, ArtMethod* method, mirror::Object* rece
     if (receiver != nullptr) {
       ObjPtr<mirror::Field> field_obj = ObjPtr<mirror::Field>::DownCast(ObjPtr<mirror::Object>(receiver));
       ArtField* art_field = field_obj->GetArtField();
+      if (art_field == nullptr) {
+        LOG(ERROR) << "[ARTFIELD] getArtField returned NULL, artFieldIndex="
+                   << field_obj->GetArtFieldIndex();
+      }
       result->SetJ(reinterpret_cast<int64_t>(art_field));
     } else {
       result->SetJ(0);
