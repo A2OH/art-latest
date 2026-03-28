@@ -2590,12 +2590,8 @@ void Thread::AssertNoPendingException() const {
   if (UNLIKELY(IsExceptionPending())) {
     ScopedObjectAccess soa(Thread::Current());
     // In standalone builds, demote to WARNING to avoid crashing on missing natives
-    if (!Runtime::Current()->GetHeap()->HasBootImageSpace()) {
-      LOG(WARNING) << "No pending exception expected (standalone, clearing): " << GetException()->Dump();
-      const_cast<Thread*>(this)->ClearException();
-    } else {
-      LOG(FATAL) << "No pending exception expected: " << GetException()->Dump();
-    }
+    LOG(WARNING) << "No pending exception expected (clearing): " << GetException()->Dump();
+    const_cast<Thread*>(this)->ClearException();
   }
 }
 

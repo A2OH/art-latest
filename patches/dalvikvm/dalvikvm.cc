@@ -405,6 +405,9 @@ static int dalvikvm(int argc, char** argv) {
     return EXIT_FAILURE;
   }
 
+  // Clear any pending exceptions from runtime init
+  if (env->ExceptionCheck()) env->ExceptionClear();
+
   // Make sure they provided a class name. We do this after
   // JNI_CreateJavaVM so that things like "-help" have the opportunity
   // to emit a usage statement.

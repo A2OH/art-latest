@@ -1,6 +1,25 @@
 #include <jni.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
+
+static void registerNativesOrSkip(JNIEnv* env, jclass clazz,
+    const JNINativeMethod* methods, int nMethods) {
+    jint result = (*env)->RegisterNatives(env, clazz, methods, nMethods);
+    if (result != 0) {
+        (*env)->ExceptionClear(env);
+        /* Try one at a time */
+        int registered = 0;
+        for (int i = 0; i < nMethods; i++) {
+            if ((*env)->RegisterNatives(env, clazz, &methods[i], 1) == 0) {
+                registered++;
+            } else {
+                (*env)->ExceptionClear(env);
+            }
+        }
+        fprintf(stderr, "[icu] Registered %d/%d methods\n", registered, nMethods);
+    }
+}
 
 /* Stub implementations for com.android.icu.util.Icu4cMetadata native methods */
 

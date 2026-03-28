@@ -1,29 +1,30 @@
 /*
- * OHBridge JNI stub — subprocess display list mode.
- * Writes Canvas ops to mmap'd shared memory (version=1 pixel buffer).
- * Entry point: JNI_OnLoad (renamed to JNI_OnLoad_ohbridge via -D)
+ * OHBridge JNI stub — stdout pipe display list mode.
+ * Writes Canvas ops to local buffer, flushes as [4-byte LE size][ops] to pipe.
+ * Host reads from process.inputStream → replays on SurfaceView.
+ *
+ * On init, saves stdout fd for binary pipe and redirects stdout→stderr
+ * so Java System.out and stray printf don't corrupt the binary stream.
  */
 #include <jni.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <fcntl.h>
-#include <sys/mman.h>
 #include <unistd.h>
 
-#define SHM_HDR 128
 #define DLIST_MAX (512*1024)
-#define SHM_TOTAL (SHM_HDR + DLIST_MAX + 64)
 
-static unsigned char* shm = NULL;
-static int shm_pos = 0, shm_seq = 0;
+static unsigned char dlist_buf[DLIST_MAX];
+static int dlist_pos = 0;
+static int pipe_fd = -1;   /* saved stdout fd for binary pipe */
+static const int DLIST_MAGIC = 0x444C5354; /* "DLST" */
 static JavaVM* g_vm = NULL;
 
-static void emit1(unsigned char v) { if(shm && shm_pos<DLIST_MAX-64) shm[SHM_HDR+shm_pos++]=v; }
-static void emit4(const void* v) { if(shm && shm_pos+4<=DLIST_MAX-64){memcpy(shm+SHM_HDR+shm_pos,v,4);shm_pos+=4;} }
+static void emit1(unsigned char v) { if(dlist_pos<DLIST_MAX-64) dlist_buf[dlist_pos++]=v; }
+static void emit4(const void* v) { if(dlist_pos+4<=DLIST_MAX-64){memcpy(dlist_buf+dlist_pos,v,4);dlist_pos+=4;} }
 static void emitf(float v) { emit4(&v); }
 static void emiti(int v) { emit4(&v); }
-static void emit2(short v) { if(shm && shm_pos+2<=DLIST_MAX-64){memcpy(shm+SHM_HDR+shm_pos,&v,2);shm_pos+=2;} }
+static void emit2(short v) { if(dlist_pos+2<=DLIST_MAX-64){memcpy(dlist_buf+dlist_pos,&v,2);dlist_pos+=2;} }
 
 enum { OP_COLOR=1,OP_RECT=2,OP_TEXT=3,OP_LINE=4,OP_SAVE=5,OP_RESTORE=6,OP_TRANSLATE=7,OP_CLIP=8,OP_RRECT=9,OP_CIRCLE=10 };
 
@@ -33,40 +34,32 @@ static float h_fontsz[MAX_H];
 static int h_next = 1;
 static int idx(long h) { return (int)(h & 0xFF); }
 
-static void shm_init() {
-    const char* p = getenv("WESTLAKE_SHM");
-    if(!p||!p[0]) p="/data/local/tmp/westlake/westlake_shm";
-    int fd = open(p, O_RDWR);
-    if(fd<0){printf("[OHBridge] shm open FAIL\n");return;}
-    if(lseek(fd,0,SEEK_END)<SHM_TOTAL) ftruncate(fd,SHM_TOTAL);
-    shm = mmap(NULL,SHM_TOTAL,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
-    close(fd);
-    if(shm==MAP_FAILED){shm=NULL;return;}
-    *(int*)(shm+0)=0x574C4B46; *(int*)(shm+4)=2;
-    *(int*)(shm+8)=480; *(int*)(shm+12)=800;
-    msync(shm,SHM_HDR,MS_SYNC);
-    printf("[OHBridge] shm_init OK (mmap display list)\n"); fflush(stdout);
-}
-
-JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
-    g_vm = vm;
-    printf("[OHBridge] JNI_OnLoad (display list stub)\n"); fflush(stdout);
-    return JNI_VERSION_1_6;
+/* Write all bytes to fd, handling partial writes */
+static void write_all(int fd, const void* buf, int len) {
+    const unsigned char* p = (const unsigned char*)buf;
+    while (len > 0) {
+        int n = write(fd, p, len);
+        if (n <= 0) break;
+        p += n;
+        len -= n;
+    }
 }
 
 /* === JNI exports (Java_com_ohos_shim_bridge_OHBridge_*) === */
 #define JF(name) Java_com_ohos_shim_bridge_OHBridge_##name
 
-JNIEXPORT jint JNICALL JF(arkuiInit)(JNIEnv* e, jclass c) { shm_init(); return 0; }
+JNIEXPORT jint JNICALL JF(arkuiInit)(JNIEnv* e, jclass c) {
+    fprintf(stderr, "[OHBridge] pipe mode arkuiInit (pipe_fd=%d)\n", pipe_fd);
+    return 0;
+}
 JNIEXPORT jlong JNICALL JF(surfaceCreate)(JNIEnv* e, jclass c, jlong u, jint w, jint h) { return 1; }
-JNIEXPORT jlong JNICALL JF(surfaceGetCanvas)(JNIEnv* e, jclass c, jlong s) { shm_pos=0; return 1; }
+JNIEXPORT jlong JNICALL JF(surfaceGetCanvas)(JNIEnv* e, jclass c, jlong s) { dlist_pos=0; return 1; }
 JNIEXPORT jint JNICALL JF(surfaceFlush)(JNIEnv* e, jclass c, jlong s) {
-    if(!shm) return -1;
-    shm_seq++;
-    *(int*)(shm+20)=shm_pos;
-    __sync_synchronize();
-    *(int*)(shm+16)=shm_seq;
-    msync(shm,SHM_HDR+shm_pos,MS_SYNC);
+    if(pipe_fd<0) return -1;
+    int size = dlist_pos;
+    write_all(pipe_fd, &DLIST_MAGIC, 4);
+    write_all(pipe_fd, &size, 4);
+    write_all(pipe_fd, dlist_buf, size);
     return 0;
 }
 JNIEXPORT void JNICALL JF(surfaceDestroy)(JNIEnv* e, jclass c, jlong s) {}
@@ -91,10 +84,10 @@ JNIEXPORT void JNICALL JF(canvasDrawText)(JNIEnv* e, jclass c, jlong cn, jstring
     if(!text) return;
     const char* u = (*e)->GetStringUTFChars(e,text,0);
     int len = u ? strlen(u) : 0;
-    if(len>0 && shm_pos+19+len<DLIST_MAX-64) {
+    if(len>0 && dlist_pos+19+len<DLIST_MAX-64) {
         emit1(OP_TEXT); emitf(x); emitf(y); emitf(h_fontsz[idx(font)]);
         emiti(h_colors[idx(pen>0?pen:brush)]); emit2((short)len);
-        memcpy(shm+SHM_HDR+shm_pos,u,len); shm_pos+=len;
+        memcpy(dlist_buf+dlist_pos,u,len); dlist_pos+=len;
     }
     if(u) (*e)->ReleaseStringUTFChars(e,text,u);
 }
@@ -157,3 +150,105 @@ JNIEXPORT void JNICALL JF(pathQuadTo)(JNIEnv* e, jclass c, jlong p, jfloat x1, j
 JNIEXPORT void JNICALL JF(pathCubicTo)(JNIEnv* e, jclass c, jlong p, jfloat x1, jfloat y1, jfloat x2, jfloat y2, jfloat x3, jfloat y3) {}
 JNIEXPORT void JNICALL JF(pathAddRect)(JNIEnv* e, jclass c, jlong p, jfloat l, jfloat t, jfloat r, jfloat b, jint dir) {}
 JNIEXPORT void JNICALL JF(pathAddCircle)(JNIEnv* e, jclass c, jlong p, jfloat cx, jfloat cy, jfloat r, jint dir) {}
+
+/* === Logging & device info stubs === */
+JNIEXPORT void JNICALL JF(logDebug)(JNIEnv* e, jclass c, jstring tag, jstring msg) {
+    if(!tag||!msg) return;
+    const char* t=(*e)->GetStringUTFChars(e,tag,0);
+    const char* m=(*e)->GetStringUTFChars(e,msg,0);
+    fprintf(stderr,"D/%s: %s\n",t?t:"?",m?m:"");
+    if(t)(*e)->ReleaseStringUTFChars(e,tag,t);
+    if(m)(*e)->ReleaseStringUTFChars(e,msg,m);
+}
+JNIEXPORT void JNICALL JF(logInfo)(JNIEnv* e, jclass c, jstring tag, jstring msg) {
+    if(!tag||!msg) return;
+    const char* t=(*e)->GetStringUTFChars(e,tag,0);
+    const char* m=(*e)->GetStringUTFChars(e,msg,0);
+    fprintf(stderr,"I/%s: %s\n",t?t:"?",m?m:"");
+    if(t)(*e)->ReleaseStringUTFChars(e,tag,t);
+    if(m)(*e)->ReleaseStringUTFChars(e,msg,m);
+}
+JNIEXPORT void JNICALL JF(logError)(JNIEnv* e, jclass c, jstring tag, jstring msg) {
+    if(!tag||!msg) return;
+    const char* t=(*e)->GetStringUTFChars(e,tag,0);
+    const char* m=(*e)->GetStringUTFChars(e,msg,0);
+    fprintf(stderr,"E/%s: %s\n",t?t:"?",m?m:"");
+    if(t)(*e)->ReleaseStringUTFChars(e,tag,t);
+    if(m)(*e)->ReleaseStringUTFChars(e,msg,m);
+}
+JNIEXPORT jstring JNICALL JF(getDeviceBrand)(JNIEnv* e, jclass c) { return (*e)->NewStringUTF(e,"Westlake"); }
+JNIEXPORT jstring JNICALL JF(getDeviceModel)(JNIEnv* e, jclass c) { return (*e)->NewStringUTF(e,"VM"); }
+JNIEXPORT jstring JNICALL JF(getOSVersion)(JNIEnv* e, jclass c) { return (*e)->NewStringUTF(e,"11"); }
+JNIEXPORT jint JNICALL JF(getSDKVersion)(JNIEnv* e, jclass c) { return 30; }
+
+/* === Registration table === */
+static JNINativeMethod methods[] = {
+    {"arkuiInit","()I",(void*)JF(arkuiInit)},
+    {"logDebug","(Ljava/lang/String;Ljava/lang/String;)V",(void*)JF(logDebug)},
+    {"logInfo","(Ljava/lang/String;Ljava/lang/String;)V",(void*)JF(logInfo)},
+    {"logError","(Ljava/lang/String;Ljava/lang/String;)V",(void*)JF(logError)},
+    {"getDeviceBrand","()Ljava/lang/String;",(void*)JF(getDeviceBrand)},
+    {"getDeviceModel","()Ljava/lang/String;",(void*)JF(getDeviceModel)},
+    {"getOSVersion","()Ljava/lang/String;",(void*)JF(getOSVersion)},
+    {"getSDKVersion","()I",(void*)JF(getSDKVersion)},
+    {"surfaceCreate","(JII)J",(void*)JF(surfaceCreate)},
+    {"surfaceGetCanvas","(J)J",(void*)JF(surfaceGetCanvas)},
+    {"surfaceFlush","(J)I",(void*)JF(surfaceFlush)},
+    {"surfaceDestroy","(J)V",(void*)JF(surfaceDestroy)},
+    {"surfaceResize","(JII)V",(void*)JF(surfaceResize)},
+    {"canvasCreate","(J)J",(void*)JF(canvasCreate)},{"canvasDestroy","(J)V",(void*)JF(canvasDestroy)},
+    {"canvasDrawColor","(JI)V",(void*)JF(canvasDrawColor)},
+    {"canvasDrawRect","(JFFFFJJ)V",(void*)JF(canvasDrawRect)},
+    {"canvasDrawRoundRect","(JFFFFFFJJ)V",(void*)JF(canvasDrawRoundRect)},
+    {"canvasDrawCircle","(JFFFJJ)V",(void*)JF(canvasDrawCircle)},
+    {"canvasDrawLine","(JFFFFJ)V",(void*)JF(canvasDrawLine)},
+    {"canvasDrawText","(JLjava/lang/String;FFJJJ)V",(void*)JF(canvasDrawText)},
+    {"canvasSave","(J)V",(void*)JF(canvasSave)},{"canvasRestore","(J)V",(void*)JF(canvasRestore)},
+    {"canvasTranslate","(JFF)V",(void*)JF(canvasTranslate)},{"canvasScale","(JFF)V",(void*)JF(canvasScale)},
+    {"canvasClipRect","(JFFFF)V",(void*)JF(canvasClipRect)},
+    {"canvasDrawPath","(JJJJ)V",(void*)JF(canvasDrawPath)},
+    {"canvasDrawBitmap","(JJFF)V",(void*)JF(canvasDrawBitmap)},
+    {"canvasConcat","(J[F)V",(void*)JF(canvasConcat)},
+    {"canvasRotate","(JFFF)V",(void*)JF(canvasRotate)},
+    {"canvasClipPath","(JJ)V",(void*)JF(canvasClipPath)},
+    {"canvasDrawArc","(JFFFFFFZJJ)V",(void*)JF(canvasDrawArc)},
+    {"canvasDrawOval","(JFFFFJJ)V",(void*)JF(canvasDrawOval)},
+    {"penCreate","()J",(void*)JF(penCreate)},{"penSetColor","(JI)V",(void*)JF(penSetColor)},
+    {"penSetWidth","(JF)V",(void*)JF(penSetWidth)},{"penSetAntiAlias","(JZ)V",(void*)JF(penSetAntiAlias)},
+    {"penSetCap","(JI)V",(void*)JF(penSetCap)},{"penSetJoin","(JI)V",(void*)JF(penSetJoin)},
+    {"penDestroy","(J)V",(void*)JF(penDestroy)},
+    {"brushCreate","()J",(void*)JF(brushCreate)},{"brushSetColor","(JI)V",(void*)JF(brushSetColor)},
+    {"brushDestroy","(J)V",(void*)JF(brushDestroy)},{"brushSetAntiAlias","(JZ)V",(void*)JF(brushSetAntiAlias)},
+    {"fontCreate","()J",(void*)JF(fontCreate)},{"fontSetSize","(JF)V",(void*)JF(fontSetSize)},
+    {"fontMeasureText","(JLjava/lang/String;)F",(void*)JF(fontMeasureText)},
+    {"fontDestroy","(J)V",(void*)JF(fontDestroy)},{"fontGetMetrics","(J)[F",(void*)JF(fontGetMetrics)},
+    {"bitmapCreate","(III)J",(void*)JF(bitmapCreate)},{"bitmapDestroy","(J)V",(void*)JF(bitmapDestroy)},
+    {"bitmapGetWidth","(J)I",(void*)JF(bitmapGetWidth)},{"bitmapGetHeight","(J)I",(void*)JF(bitmapGetHeight)},
+    {"bitmapSetPixel","(JIII)V",(void*)JF(bitmapSetPixel)},{"bitmapGetPixel","(JII)I",(void*)JF(bitmapGetPixel)},
+    {"pathCreate","()J",(void*)JF(pathCreate)},{"pathDestroy","(J)V",(void*)JF(pathDestroy)},
+    {"pathMoveTo","(JFF)V",(void*)JF(pathMoveTo)},{"pathLineTo","(JFF)V",(void*)JF(pathLineTo)},
+    {"pathClose","(J)V",(void*)JF(pathClose)},{"pathReset","(J)V",(void*)JF(pathReset)},
+    {"pathQuadTo","(JFFFF)V",(void*)JF(pathQuadTo)},{"pathCubicTo","(JFFFFFF)V",(void*)JF(pathCubicTo)},
+    {"pathAddRect","(JFFFFI)V",(void*)JF(pathAddRect)},{"pathAddCircle","(JFFFI)V",(void*)JF(pathAddCircle)},
+};
+
+JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
+    g_vm = vm;
+    /* Save stdout for binary pipe ASAP, redirect stdout→stderr */
+    if (pipe_fd < 0) {
+        pipe_fd = dup(STDOUT_FILENO);
+        dup2(STDERR_FILENO, STDOUT_FILENO);
+    }
+    JNIEnv* env;
+    if ((*vm)->GetEnv(vm, (void**)&env, JNI_VERSION_1_6) != JNI_OK) return JNI_VERSION_1_6;
+    jclass cls = (*env)->FindClass(env, "com/ohos/shim/bridge/OHBridge");
+    int ok = 0, count = sizeof(methods)/sizeof(methods[0]);
+    if (cls) {
+        for (int i = 0; i < count; i++) {
+            if ((*env)->RegisterNatives(env, cls, &methods[i], 1) == 0) ok++;
+            else (*env)->ExceptionClear(env);
+        }
+    } else { (*env)->ExceptionClear(env); }
+    fprintf(stderr, "[OHBridge] JNI_OnLoad (pipe stub) %d/%d registered, pipe_fd=%d\n", ok, count, pipe_fd);
+    return JNI_VERSION_1_6;
+}

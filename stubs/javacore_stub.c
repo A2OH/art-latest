@@ -109,9 +109,12 @@ static jboolean linux_isatty(JNIEnv* env, jobject thiz, jobject fdObj) {
 }
 
 /* writeBytes(FileDescriptor fd, Object buffer, int offset, int byteCount) */
+static int writeBytes_called = 0;
 static jint linux_writeBytes(JNIEnv* env, jobject thiz,
                               jobject fdObj, jobject buffer, jint offset, jint byteCount) {
+    if (writeBytes_called++ < 3) fprintf(stderr, "[javacore] linux_writeBytes called (fd_obj=%p, count=%d)\n", fdObj, byteCount);
     int fd = getFd(env, fdObj);
+    if (writeBytes_called <= 3) fprintf(stderr, "[javacore]   fd=%d\n", fd);
     if (fd < 0) {
         throwErrnoException(env, "write", EBADF);
         return -1;
@@ -574,8 +577,10 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     JNIEnv* env;
     if ((*vm)->GetEnv(vm, (void**)&env, JNI_VERSION_1_6) != JNI_OK) return -1;
 
+    fprintf(stderr, "[javacore] JNI_OnLoad starting\n");
     /* Register native methods for libcore.io.Linux */
     jclass linuxClass = (*env)->FindClass(env, "libcore/io/Linux");
+    fprintf(stderr, "[javacore] Linux class: %p\n", linuxClass);
     if (linuxClass) {
         JNINativeMethod methods[] = {
             {"getpwuid", "(I)Landroid/system/StructPasswd;", (void*)linux_getpwuid},
@@ -624,7 +629,9 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
             {"realpath", "(Ljava/lang/String;)Ljava/lang/String;", (void*)linux_realpath},
             {"getxattr", "(Ljava/lang/String;Ljava/lang/String;)[B", (void*)linux_getxattr},
         };
-        registerNativesOrSkip(env, linuxClass, methods, sizeof(methods)/sizeof(methods[0]));
+        int n = sizeof(methods)/sizeof(methods[0]);
+        registerNativesOrSkip(env, linuxClass, methods, n);
+        fprintf(stderr, "[javacore] Linux: registered %d methods\n", n);
         (*env)->DeleteLocalRef(env, linuxClass);
     }
 

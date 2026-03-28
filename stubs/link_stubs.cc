@@ -8,6 +8,7 @@
 #include <cstring>
 #include <stdarg.h>
 #include <dlfcn.h>
+#include <jni.h>
 
 extern "C" {
 
@@ -170,6 +171,27 @@ void* OpenNativeLibrary(void* env, int target_sdk, const char* path, void* class
     if (needs_native_bridge) *needs_native_bridge = false;
     if (error_msg) *error_msg = NULL;
     void* handle = dlopen(path, RTLD_NOW);
+    if (!handle) {
+        // Try LD_LIBRARY_PATH directories
+        const char* lib_path = getenv("LD_LIBRARY_PATH");
+        if (lib_path && path) {
+            char full[1024];
+            const char* p = lib_path;
+            while (*p) {
+                const char* end = strchr(p, ':');
+                size_t len = end ? (size_t)(end - p) : strlen(p);
+                if (len > 0 && len + strlen(path) + 2 < sizeof(full)) {
+                    memcpy(full, p, len);
+                    full[len] = '/';
+                    strcpy(full + len + 1, path);
+                    handle = dlopen(full, RTLD_NOW);
+                    if (handle) break;
+                }
+                if (!end) break;
+                p = end + 1;
+            }
+        }
+    }
     if (!handle && error_msg) {
         const char* err = dlerror();
         if (err) *error_msg = strdup(err);
