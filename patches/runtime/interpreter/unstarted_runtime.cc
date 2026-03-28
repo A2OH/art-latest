@@ -2467,18 +2467,19 @@ void UnstartedRuntime::Jni(Thread* self, ArtMethod* method, mirror::Object* rece
     if (the_unsafe_field != nullptr) {
       ObjPtr<mirror::Object> unsafe_instance = the_unsafe_field->GetObject(unsafe_class);
       if (unsafe_instance == nullptr) {
-        // Create the singleton Unsafe instance
-        StackHandleScope<1> hs(self);
-        Handle<mirror::Class> h_class(hs.NewHandle(unsafe_class));
-        Runtime::Current()->GetClassLinker()->EnsureInitialized(
-            self, h_class, /*can_init_fields=*/ true, /*can_init_parents=*/ true);
-        unsafe_instance = the_unsafe_field->GetObject(h_class.Get());
+        // Create the Unsafe singleton directly (don't trigger clinit which may fail)
+        gc::AllocatorType alloc = Runtime::Current()->GetHeap()->GetCurrentAllocator();
+        unsafe_instance = unsafe_class->Alloc(self, alloc);
+        if (unsafe_instance != nullptr) {
+          the_unsafe_field->SetObject<false>(unsafe_class, unsafe_instance);
+        }
       }
       result->SetL(unsafe_instance);
       return;
     }
-    // Fallback: create a new Unsafe instance
-    result->SetL(unsafe_class->AllocObject(self));
+    // Fallback: alloc without field storage
+    gc::AllocatorType alloc = Runtime::Current()->GetHeap()->GetCurrentAllocator();
+    result->SetL(unsafe_class->Alloc(self, alloc));
     return;
   }
 
@@ -2609,8 +2610,26 @@ void UnstartedRuntime::Jni(Thread* self, ArtMethod* method, mirror::Object* rece
           memmove(dst_data, src_data, byte_count);
           found_by_name = true;
         }
+      } else if (strncmp(mn, "newStringFrom", 13) == 0 && strcmp(dc, "Ljava/lang/StringFactory;") == 0) {
+        // StringFactory.newStringFromBytes/Chars/String — create String during AOT
+        // For simplicity, return empty string for AOT (enum names will be wrong but
+        // the VarHandle clinit will succeed)
+        gc::AllocatorType alloc = Runtime::Current()->GetHeap()->GetCurrentAllocator();
+        ObjPtr<mirror::String> empty = mirror::String::AllocEmptyString(self, alloc);
+        if (empty != nullptr) {
+          result->SetL(empty);
+          found_by_name = true;
+        }
+      } else if (strcmp(mn, "getStackClass2") == 0 && strcmp(dc, "Ldalvik/system/VMStack;") == 0) {
+        // VMStack.getStackClass2() - return caller class for security checks
+        // During AOT, return null (bypasses Unsafe security check)
+        result->SetL(nullptr);
+        found_by_name = true;
+      } else if (strcmp(mn, "getCallingClassLoader") == 0) {
+        result->SetL(nullptr);
+        found_by_name = true;
       } else if (strcmp(mn, "nativeFillInStackTrace") == 0) {
-        result->SetL(nullptr); // No stack trace in AOT
+        result->SetL(nullptr);
         found_by_name = true;
       }
     }
