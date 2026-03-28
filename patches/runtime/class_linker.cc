@@ -1252,6 +1252,16 @@ void ClassLinker::RunRootClinits(Thread* self) {
       }
     }
 
+    // On standalone builds without boot image, skip aggressive pre-init
+    // on ARM64 where the interpreter hangs on complex clinits.
+    // On x86_64 (dex2oat), these run successfully.
+#if defined(__aarch64__)
+    if (!Runtime::Current()->IsAotCompiler()) {
+      fprintf(stderr, "[CL] Skipping pre-init + root init (ARM64 standalone)\n"); fflush(stderr);
+      goto skip_all_init;
+    }
+#endif
+
     const char* pre_init_classes[] = {
       // Tier 1: Basic data structures (no native deps)
       "Ljava/util/HashMap;",
@@ -1417,6 +1427,9 @@ void ClassLinker::RunRootClinits(Thread* self) {
   } else {
     fprintf(stderr, "[CL] Skipping root/methods/fields init (boot image loaded)\n"); fflush(stderr);
   }
+#if defined(__aarch64__)
+  skip_all_init: ;
+#endif
 }
 
 ALWAYS_INLINE
