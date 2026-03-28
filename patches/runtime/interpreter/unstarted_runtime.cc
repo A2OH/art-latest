@@ -2515,23 +2515,51 @@ void UnstartedRuntime::Jni(Thread* self, ArtMethod* method, mirror::Object* rece
 
   const auto& iter = jni_handlers_.find(method);
   if (iter != jni_handlers_.end()) {
-    // Clear out the result in case it's not zeroed out.
     result->SetL(nullptr);
     (*iter->second)(self, method, receiver, args, result);
   } else {
-    Runtime* runtime = Runtime::Current();
-    if (runtime->IsActiveTransaction()) {
-      runtime->GetClassLinker()->AbortTransactionF(
-          self,
-          "Attempt to invoke native method in non-started runtime: %s",
-          ArtMethod::PrettyMethod(method).c_str());
-    } else {
-      // For standalone dex2oat, native methods are expected to be missing.
-      // Instead of crashing, throw an exception so class init fails gracefully.
-      LOG(WARNING) << "Calling native method " << ArtMethod::PrettyMethod(method)
-                   << " in an unstarted non-transactional runtime (non-fatal)";
-      self->ThrowNewException("Ljava/lang/UnsatisfiedLinkError;",
-                              ArtMethod::PrettyMethod(method).c_str());
+    // Pointer lookup failed. Try name+descriptor fallback for AOT compiler.
+    bool found_by_name = false;
+    if (tables_initialized_) {
+      const char* target_name = method->GetName();
+      const char* target_class = method->GetDeclaringClassDescriptor();
+      static int fallback_log = 0;
+      if (fallback_log++ < 3) {
+        LOG(WARNING) << "[JNI-FALLBACK] Looking for " << target_class << "." << target_name
+                     << " in table with " << jni_handlers_.size() << " entries";
+        for (const auto& e : jni_handlers_) {
+          const char* ename = e.first->GetName();
+          const char* eclass = e.first->GetDeclaringClassDescriptor();
+          if (strcmp(ename, target_name) == 0) {
+            LOG(WARNING) << "[JNI-TABLE-MATCH] name match: " << eclass << "." << ename
+                         << " vs target " << target_class << "." << target_name
+                         << " class_match=" << (strcmp(eclass, target_class) == 0);
+          }
+        }
+      }
+      for (const auto& entry : jni_handlers_) {
+        if (strcmp(entry.first->GetName(), target_name) == 0 &&
+            strcmp(entry.first->GetDeclaringClassDescriptor(), target_class) == 0) {
+          result->SetL(nullptr);
+          (*entry.second)(self, method, receiver, args, result);
+          found_by_name = true;
+          break;
+        }
+      }
+    }
+    if (!found_by_name) {
+      Runtime* runtime = Runtime::Current();
+      if (runtime->IsActiveTransaction()) {
+        runtime->GetClassLinker()->AbortTransactionF(
+            self,
+            "Attempt to invoke native method in non-started runtime: %s",
+            ArtMethod::PrettyMethod(method).c_str());
+      } else {
+        LOG(WARNING) << "Calling native method " << ArtMethod::PrettyMethod(method)
+                     << " in an unstarted non-transactional runtime (non-fatal)";
+        self->ThrowNewException("Ljava/lang/UnsatisfiedLinkError;",
+                                ArtMethod::PrettyMethod(method).c_str());
+      }
     }
   }
 }
