@@ -753,3 +753,84 @@ $(BUILDDIR)/android-base/%.o: $(AOSP)/system/core/base/%.cpp
 
 clean:
 	rm -rf $(BUILDDIR)
+
+# ============ link-dex2oat (ARM64 native dex2oat for on-device boot image creation) ============
+
+# ============ dex2oat sources ============
+DEX2OAT_SRCS_ALL = $(filter-out %_test.cc %_fuzzer.cc,$(wildcard \
+  $(ART)/dex2oat/*.cc \
+  $(ART)/dex2oat/dex/*.cc \
+  $(ART)/dex2oat/driver/*.cc \
+  $(ART)/dex2oat/interpreter/*.cc \
+  $(ART)/dex2oat/linker/*.cc \
+  $(ART)/dex2oat/linker/arm/*.cc \
+  $(ART)/dex2oat/linker/arm64/*.cc \
+  $(ART)/dex2oat/linker/riscv64/*.cc \
+  $(ART)/dex2oat/linker/x86/*.cc \
+  $(ART)/dex2oat/linker/x86_64/*.cc \
+))
+DEX2OAT_EXCLUDE = %dex2oat/driver/compiler_driver.cc %dex2oat/linker/image_writer.cc %dex2oat/linker/oat_writer.cc
+DEX2OAT_SRCS = $(filter-out $(DEX2OAT_EXCLUDE),$(DEX2OAT_SRCS_ALL))
+DEX2OAT_OBJS = $(patsubst $(ART)/%.cc,$(BUILDDIR)/%.o,$(DEX2OAT_SRCS))
+
+# Patched dex2oat files
+CD_PATCH_OBJ = $(BUILDDIR)/dex2oat/driver/compiler_driver.o
+IW_PATCH_OBJ = $(BUILDDIR)/dex2oat/linker/image_writer.o
+OW_PATCH_OBJ = $(BUILDDIR)/dex2oat/linker/oat_writer.o
+
+$(CD_PATCH_OBJ): patches/dex2oat/driver/compiler_driver.cc
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -I$(ART)/dex2oat/driver -c $< -o $@ 2>&1 && echo "OK: compiler_driver.cc" || { echo "FAIL"; rm -f $@; }
+
+$(IW_PATCH_OBJ): patches/dex2oat/linker/image_writer.cc
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -I$(ART)/dex2oat/linker -c $< -o $@ 2>&1 && echo "OK: image_writer.cc" || { echo "FAIL"; rm -f $@; }
+
+$(OW_PATCH_OBJ): patches/dex2oat/linker/oat_writer.cc
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -I$(ART)/dex2oat/linker -c $< -o $@ 2>&1 && echo "OK: oat_writer.cc" || { echo "FAIL"; rm -f $@; }
+
+dex2oat-build: $(DEX2OAT_OBJS) $(CD_PATCH_OBJ) $(IW_PATCH_OBJ) $(OW_PATCH_OBJ)
+	@echo "dex2oat objects: $$(echo $(DEX2OAT_OBJS) $(CD_PATCH_OBJ) $(IW_PATCH_OBJ) $(OW_PATCH_OBJ) | wc -w)"
+link-dex2oat: all dex2oat-build ziparchive sigchain nativehelper fault-handler-stubs template-instantiations jni-stubs asm sve-stub metrics-stubs fmtlib tinyxml2
+	@echo "=== Linking dex2oat (ARM64, static) ==="
+	@mkdir -p $(BUILDDIR)/bin
+	$(CXX) -o $(BUILDDIR)/bin/dex2oat \
+	  $(TARGET_FLAGS) -static \
+	  -stdlib=libc++ \
+	  -fuse-ld=lld \
+	  -Wl,--unresolved-symbols=ignore-in-object-files \
+	  -Wl,--allow-multiple-definition \
+	  $$(find $(BUILDDIR)/dex2oat -name '*.o') \
+	  $$(find $(BUILDDIR)/nativehelper -name '*.o') \
+	  $$(find $(BUILDDIR)/compiler -name '*.o') \
+	  $$(find $(BUILDDIR)/runtime -name '*.o') \
+	  $$(find $(BUILDDIR)/libdexfile -name '*.o') \
+	  $$(find $(BUILDDIR)/libartbase -name '*.o') \
+	  $$(find $(BUILDDIR)/libelffile -name '*.o') \
+	  $$(find $(BUILDDIR)/libprofile -name '*.o') \
+	  $$(find $(BUILDDIR)/vixl -name '*.o') \
+	  $$(find $(BUILDDIR)/android-base -name '*.o') \
+	  $$(find $(BUILDDIR)/ziparchive -name '*.o') \
+	  $(BUILDDIR)/sigchain/sigchain.o \
+	  $(ASM_DIR)/quick_entrypoints_arm64.o \
+	  $(ASM_DIR)/jni_entrypoints_arm64.o \
+	  $(ASM_DIR)/memcmp16_arm64.o \
+	  $(BUILDDIR)/stubs/quick_entrypoints_stubs_arm64.o \
+	  $(BUILDDIR)/stubs/link_stubs_arm64.o \
+	  $(BUILDDIR)/stubs/fault_handler_stubs.o \
+	  $(BUILDDIR)/stubs/template_instantiations.o \
+	  $(BUILDDIR)/stubs/metrics_stubs.o \
+	  $(BUILDDIR)/stubs/code_generator_vector_arm64_sve_stub.o \
+	  $(BUILDDIR)/fmtlib/format.o \
+	  $(BUILDDIR)/tinyxml2/tinyxml2.o \
+	  $(BUILDDIR)/jni_stubs/icu_jni_stub.o \
+	  $(BUILDDIR)/jni_stubs/javacore_stub.o \
+	  $(BUILDDIR)/jni_stubs/openjdk_stub.o \
+	  $(BUILDDIR)/jni_stubs/ohbridge_stub.o \
+	  $(OHOS_SYSROOT)/usr/lib/libc++.a \
+	  $(OHOS_SYSROOT)/usr/lib/libc++abi.a \
+	  $(OHOS_SYSROOT)/usr/lib/libz.a \
+	  -lpthread -ldl -lm -lrt
+	@ls -la $(BUILDDIR)/bin/dex2oat
+	@file $(BUILDDIR)/bin/dex2oat
