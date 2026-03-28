@@ -2626,8 +2626,14 @@ void UnstartedRuntime::Jni(Thread* self, ArtMethod* method, mirror::Object* rece
           found_by_name = true;
         }
       } else if (strcmp(mn, "getInnerClassFlags") == 0 && strcmp(dc, "Ljava/lang/Class;") == 0) {
-        result->SetI(0); // Return 0 flags
+        result->SetI(0);
         found_by_name = true;
+      } else if (strcmp(mn, "getModifiers") == 0 && strcmp(dc, "Ljava/lang/Class;") == 0) {
+        // Class.getModifiers() — return access flags from the ART class object
+        if (receiver != nullptr) {
+          result->SetI(receiver->AsClass()->GetAccessFlags());
+          found_by_name = true;
+        }
       } else if (strcmp(mn, "arraycopy") == 0 && strcmp(dc, "Ljava/lang/System;") == 0) {
         // System.arraycopy(Object src, int srcPos, Object dst, int dstPos, int length)
         ObjPtr<mirror::Object> src = reinterpret_cast<StackReference<mirror::Object>*>(&args[0])->AsMirrorPtr();
