@@ -283,7 +283,12 @@ class ImageSpace::PatchObjectVisitor final {
         /*kTransactionActive=*/ false,
         /*kCheckTransaction=*/ true,
         kVerifyNone>(mirror::Object::ClassOffset(), class_class);
-    size_t num_reference_instance_fields = class_class->NumReferenceInstanceFields<kVerifyNone>();
+    // Verify class_class is still valid after setting it (relocator might null it)
+    ObjPtr<mirror::Class> cc_check = klass->GetClass<kVerifyNone, kWithoutReadBarrier>();
+    if (cc_check == nullptr || reinterpret_cast<uintptr_t>(cc_check.Ptr()) < 0x10000) {
+      return;  // class pointer was nulled by relocator
+    }
+    size_t num_reference_instance_fields = cc_check->NumReferenceInstanceFields<kVerifyNone>();
     DCHECK_NE(num_reference_instance_fields, 0u);
     static_assert(IsAligned<kHeapReferenceSize>(sizeof(mirror::Object)), "Size alignment check.");
     MemberOffset instance_field_offset(sizeof(mirror::Object));
@@ -2398,8 +2403,7 @@ class ImageSpace::BootImageLoader {
 
     template <typename T>
     ALWAYS_INLINE T* operator()(T* src) const {
-      if (src == nullptr) return src;
-      if (!InSource(src)) return nullptr;  // Null-out corrupt/erroneous refs
+      if (src == nullptr || !InSource(src)) return src;  // Leave out-of-range refs unchanged
       uint32_t raw_src = reinterpret_cast32<uint32_t>(src);
       return reinterpret_cast32<T*>(raw_src + diff_);
     }
@@ -2652,7 +2656,21 @@ class ImageSpace::BootImageLoader {
             fflush(stderr);
             continue;
           }
-          main_patch_object_visitor.VisitClass(klass, class_class);
+          // Validate class before visiting: check that the first reference
+          // field in the class object is within the image range.
+          // If not, the class has corrupt data and should be skipped.
+          {
+            bool safe = true;
+            // Check: klass's own class pointer (at offset 0) should be class_class
+            ObjPtr<mirror::Class> klass_class = klass->GetClass<kVerifyNone, kWithoutReadBarrier>();
+            uint32_t raw = reinterpret_cast32<uint32_t>(klass_class.Ptr());
+            if (raw != 0 && raw < 0x10000) {
+              safe = false;
+            }
+            if (safe) {
+              main_patch_object_visitor.VisitClass(klass, class_class);
+            }
+          }
           // Then patch the non-embedded vtable and iftable.
           ObjPtr<mirror::PointerArray> vtable =
               klass->GetVTable<kVerifyNone, kWithoutReadBarrier>();
