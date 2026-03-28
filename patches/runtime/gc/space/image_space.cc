@@ -2636,8 +2636,7 @@ class ImageSpace::BootImageLoader {
         }
       }
 
-      // Patch the class table and classes, so that we can traverse class hierarchy to
-      // determine the types of other objects when we visit them later.
+      // Patch the class table and classes.
       if (image_header.GetClassTableSection().Size() != 0u) {
         uint8_t* data = space->Begin() + image_header.GetClassTableSection().Offset();
         size_t read_count;
@@ -2662,14 +2661,14 @@ class ImageSpace::BootImageLoader {
             continue;
           }
           // Validate class before visiting: check that the first reference
-          // field in the class object is within the image range.
-          // If not, the class has corrupt data and should be skipped.
           {
-            bool safe = true;
-            // Check: klass's own class pointer (at offset 0) should be class_class
-            ObjPtr<mirror::Class> klass_class = klass->GetClass<kVerifyNone, kWithoutReadBarrier>();
-            uint32_t raw = reinterpret_cast32<uint32_t>(klass_class.Ptr());
-            if (raw != 0 && raw < 0x10000) {
+            bool safe = (class_class != nullptr &&
+                         reinterpret_cast<uintptr_t>(class_class.Ptr()) >= 0x10000);
+            if (!safe) {
+              fprintf(stderr, "[IMG] Skipping class at %p: class_class=%p\n", klass.Ptr(), class_class.Ptr());
+              fflush(stderr);
+            }
+            if (false) {  // disable old check
               safe = false;
             }
             if (safe) {

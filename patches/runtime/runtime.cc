@@ -1033,9 +1033,11 @@ void Runtime::RunRootClinits(Thread* self) {
     // Initialize UnstartedRuntime handler tables BEFORE setting started_=true.
     // This ensures the handler tables are populated when PerformCall routes
     // through UnstartedRuntime during class initialization.
-    // Reinitialize UnstartedRuntime (may have been initialized during early boot)
-    fprintf(stderr, "[RT] RunRootClinits: reinitializing UnstartedRuntime\n"); fflush(stderr);
-    interpreter::UnstartedRuntime::Reinitialize();
+    // Initialize/Reinitialize UnstartedRuntime for AOT class init
+    if (IsAotCompiler()) {
+      fprintf(stderr, "[RT] RunRootClinits: reinitializing UnstartedRuntime\n"); fflush(stderr);
+      interpreter::UnstartedRuntime::Reinitialize();
+    }
 
     // Now set started_ so normal JNI dispatch works for registered natives.
     // The PerformCall IsAotCompiler() check still routes through UnstartedRuntime.
