@@ -1302,6 +1302,7 @@ void ClassLinker::RunRootClinits(Thread* self) {
       // These init lazily when first used instead.
     };
     for (const char* desc : pre_init_classes) {
+      fprintf(stderr, "[CL] Pre-init: %s\n", desc); fflush(stderr);
       ObjPtr<mirror::Class> klass = FindSystemClass(self, desc);
       if (klass != nullptr) {
         StackHandleScope<1> hs2(self);
@@ -1319,18 +1320,23 @@ void ClassLinker::RunRootClinits(Thread* self) {
     }
   }
 
-  for (size_t i = 0; i < static_cast<size_t>(ClassRoot::kMax); ++i) {
-    ClassRoot cr = ClassRoot(i);
-    // Skip VarHandle family — their clinit has circular enum dependency
-    // that makes them erroneous, corrupting the boot image.
-    if (cr == ClassRoot::kJavaLangInvokeVarHandle ||
-        cr == ClassRoot::kJavaLangInvokeFieldVarHandle ||
-        cr == ClassRoot::kJavaLangInvokeStaticFieldVarHandle) {
-      continue;
+  // Skip root class init + methods/fields init when boot image provides pre-initialized classes.
+  // On ARM64 standalone, the interpreter hangs on complex clinits (Proxy→AtomicLong→VarHandle).
+  // With boot image, classes are already kVisiblyInitialized — no clinit needed.
+  if (!Runtime::Current()->GetHeap()->HasBootImageSpace()) {
+    fprintf(stderr, "[CL] Root class init loop (imageless, kMax=%zu)\n", static_cast<size_t>(ClassRoot::kMax)); fflush(stderr);
+    for (size_t i = 0; i < static_cast<size_t>(ClassRoot::kMax); ++i) {
+      ClassRoot cr = ClassRoot(i);
+      if (cr == ClassRoot::kJavaLangInvokeVarHandle ||
+          cr == ClassRoot::kJavaLangInvokeFieldVarHandle ||
+          cr == ClassRoot::kJavaLangInvokeStaticFieldVarHandle) {
+        continue;
+      }
+      EnsureRootInitialized(this, self, GetClassRoot(cr, class_roots.Get()));
     }
-    EnsureRootInitialized(this, self, GetClassRoot(cr, class_roots.Get()));
   }
 
+  if (!Runtime::Current()->GetHeap()->HasBootImageSpace()) {
   // Make sure certain well-known classes are initialized. Note that well-known
   // classes are always in the boot image, so this code is primarily intended
   // for running without boot image but may be needed for boot image if the
@@ -1407,6 +1413,9 @@ void ClassLinker::RunRootClinits(Thread* self) {
     if (field != nullptr) {
       EnsureRootInitialized(this, self, field->GetDeclaringClass());
     }
+  }
+  } else {
+    fprintf(stderr, "[CL] Skipping root/methods/fields init (boot image loaded)\n"); fflush(stderr);
   }
 }
 
