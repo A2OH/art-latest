@@ -5817,9 +5817,22 @@ bool ClassLinker::InitializeClass(Thread* self,
       }
     }
 
+    if (klass->IsRetired()) {
+      // Retired class — look up the replacement class
+      std::string temp;
+      const char* desc = klass->GetDescriptor(&temp);
+      ObjPtr<mirror::Class> replacement = LookupClass(self, desc, klass->GetClassLoader());
+      if (replacement != nullptr && !replacement->IsRetired() && replacement->IsResolved()) {
+        StackHandleScope<1> hs2(self);
+        return InitializeClass(self, hs2.NewHandle(replacement), can_init_statics, can_init_parents);
+      } else {
+        LOG(WARNING) << "InitializeClass: retired class " << desc << " has no replacement";
+        return false;
+      }
+    }
     if (!klass->IsResolved() || klass->IsErroneousResolved()) {
       LOG(WARNING) << "InitializeClass: class not resolved: " << klass->PrettyClass()
-                   << " state=" << klass->GetStatus() << " (skipping init for standalone dex2oat)";
+                   << " state=" << klass->GetStatus();
       self->ThrowNewException("Ljava/lang/NoClassDefFoundError;",
                               klass->PrettyDescriptor().c_str());
       return false;
