@@ -2403,7 +2403,8 @@ class ImageSpace::BootImageLoader {
 
     template <typename T>
     ALWAYS_INLINE T* operator()(T* src) const {
-      if (src == nullptr || !InSource(src)) return src;  // Leave out-of-range refs unchanged
+      if (UNLIKELY(src == nullptr)) return nullptr;
+      DCHECK(InSource(src));
       uint32_t raw_src = reinterpret_cast32<uint32_t>(src);
       return reinterpret_cast32<T*>(raw_src + diff_);
     }
@@ -2574,8 +2575,12 @@ class ImageSpace::BootImageLoader {
             GetClassRoot<mirror::StaticFieldVarHandle, kWithoutReadBarrier>(class_roots);
       } else {
         DCHECK(!patched_objects->Test(class_roots.Ptr()));
-        class_class = simple_relocate_visitor(
-            GetClassRoot<mirror::Class, kWithoutReadBarrier>(class_roots).Ptr());
+        {
+          auto cc_ptr = GetClassRoot<mirror::Class, kWithoutReadBarrier>(class_roots).Ptr();
+          fprintf(stderr, "[IMG] class_roots=%p ClassRoot<Class>=%p\n", class_roots.Ptr(), cc_ptr);
+          fflush(stderr);
+          class_class = cc_ptr != nullptr ? simple_relocate_visitor(cc_ptr) : nullptr;
+        }
         method_class = simple_relocate_visitor(
             GetClassRoot<mirror::Method, kWithoutReadBarrier>(class_roots).Ptr());
         constructor_class = simple_relocate_visitor(
