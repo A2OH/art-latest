@@ -2514,6 +2514,21 @@ void UnstartedRuntime::Jni(Thread* self, ArtMethod* method, mirror::Object* rece
     // Fall through to normal handling for (Field) variant
   }
 
+  // Override getStackClass2 BEFORE handler table lookup.
+  // Return java.lang.Object (a trusted, always-initialized boot class)
+  // so MethodHandles.lookup() creates a Lookup with full access for AOT.
+  if (Runtime::Current()->IsAotCompiler() &&
+      strcmp(method_name, "getStackClass2") == 0 &&
+      strcmp(declaring_class, "Ldalvik/system/VMStack;") == 0) {
+    ClassLinker* cl = Runtime::Current()->GetClassLinker();
+    // Use a non-java.* class to bypass Lookup's java.* package restriction
+    ObjPtr<mirror::Class> c = cl->FindSystemClass(self, "Ldalvik/system/VMRuntime;");
+    if (c == nullptr) c = cl->FindSystemClass(self, "Ljava/lang/Object;");
+    if (self->IsExceptionPending()) self->ClearException();
+    result->SetL(c);
+    return;
+  }
+
   const auto& iter = jni_handlers_.find(method);
   if (iter != jni_handlers_.end()) {
     result->SetL(nullptr);
@@ -2585,11 +2600,31 @@ void UnstartedRuntime::Jni(Thread* self, ArtMethod* method, mirror::Object* rece
           found_by_name = true;
         }
       } else if (strcmp(mn, "getDeclaredField") == 0 && strcmp(dc, "Ljava/lang/Class;") == 0) {
-        // Use existing handler
-        // This is already handled by UnstartedClassGetDeclaredField in invoke_handlers
-        // For JNI path, just return null (field lookup can be done by objectFieldOffset(Class, String))
-        result->SetL(nullptr);
-        found_by_name = true;
+        // Class.getDeclaredField(String) — find field and return Field object
+        // receiver = the Class, args[0] = field name String
+        if (receiver != nullptr) {
+          ObjPtr<mirror::Class> klass = receiver->AsClass();
+          ObjPtr<mirror::String> name_str = reinterpret_cast<StackReference<mirror::Object>*>(&args[0])->AsMirrorPtr()->AsString();
+          ArtField* found_field = nullptr;
+          for (ArtField& field : klass->GetIFields()) {
+            if (name_str->Equals(field.GetName())) { found_field = &field; break; }
+          }
+          if (found_field == nullptr) {
+            for (ArtField& field : klass->GetSFields()) {
+              if (name_str->Equals(field.GetName())) { found_field = &field; break; }
+            }
+          }
+          if (found_field != nullptr) {
+            PointerSize ps = Runtime::Current()->GetClassLinker()->GetImagePointerSize();
+            ObjPtr<mirror::Field> field_obj = mirror::Field::CreateFromArtField(self, found_field, /*force_resolve=*/ true);
+            result->SetL(field_obj);
+            found_by_name = true;
+          }
+        }
+        if (!found_by_name) {
+          result->SetL(nullptr);
+          found_by_name = true;
+        }
       } else if (strcmp(mn, "getInnerClassFlags") == 0 && strcmp(dc, "Ljava/lang/Class;") == 0) {
         result->SetI(0); // Return 0 flags
         found_by_name = true;
@@ -2611,13 +2646,29 @@ void UnstartedRuntime::Jni(Thread* self, ArtMethod* method, mirror::Object* rece
           found_by_name = true;
         }
       } else if (strncmp(mn, "newStringFrom", 13) == 0 && strcmp(dc, "Ljava/lang/StringFactory;") == 0) {
-        // StringFactory.newStringFromBytes/Chars/String — create String during AOT
-        // For simplicity, return empty string for AOT (enum names will be wrong but
-        // the VarHandle clinit will succeed)
-        gc::AllocatorType alloc = Runtime::Current()->GetHeap()->GetCurrentAllocator();
-        ObjPtr<mirror::String> empty = mirror::String::AllocEmptyString(self, alloc);
-        if (empty != nullptr) {
-          result->SetL(empty);
+        // StringFactory.newStringFromBytes(byte[], int, int, int)
+        // Args: [byte_array, high, offset, byte_count] for newStringFromBytes
+        // Args: [offset, char_count, char_array] for newStringFromChars
+        // Try to create proper String from byte array
+        ObjPtr<mirror::Object> arg0 = reinterpret_cast<StackReference<mirror::Object>*>(&args[0])->AsMirrorPtr();
+        if (arg0 != nullptr && arg0->IsArrayInstance()) {
+          ObjPtr<mirror::ByteArray> byte_arr = ObjPtr<mirror::ByteArray>::DownCast(arg0);
+          jint high = args[1];
+          jint offset = args[2];
+          jint count = args[3];
+          gc::AllocatorType alloc = Runtime::Current()->GetHeap()->GetCurrentAllocator();
+          StackHandleScope<1> hs(self);
+          Handle<mirror::ByteArray> h_arr(hs.NewHandle(byte_arr));
+          ObjPtr<mirror::String> str = mirror::String::AllocFromByteArray(self, count, h_arr, offset, high, alloc);
+          if (str != nullptr) {
+            result->SetL(str);
+            found_by_name = true;
+          }
+        }
+        if (!found_by_name) {
+          // Fallback: empty string
+          gc::AllocatorType alloc = Runtime::Current()->GetHeap()->GetCurrentAllocator();
+          result->SetL(mirror::String::AllocEmptyString(self, alloc));
           found_by_name = true;
         }
       } else if (strcmp(mn, "charAt") == 0 && strcmp(dc, "Ljava/lang/String;") == 0) {
@@ -2631,9 +2682,12 @@ void UnstartedRuntime::Jni(Thread* self, ArtMethod* method, mirror::Object* rece
           }
         }
       } else if (strcmp(mn, "getStackClass2") == 0 && strcmp(dc, "Ldalvik/system/VMStack;") == 0) {
-        // VMStack.getStackClass2() - return caller class for security checks
-        // During AOT, return null (bypasses Unsafe security check)
-        result->SetL(nullptr);
+        LOG(WARNING) << "[VMSTACK] getStackClass2 handler reached, returning MethodHandles";
+        // VMStack.getStackClass2() - return MethodHandles class (TRUSTED)
+        // This allows MethodHandles.lookup() to create a Lookup with full access.
+        ClassLinker* cl = Runtime::Current()->GetClassLinker();
+        ObjPtr<mirror::Class> mh_class = cl->FindSystemClass(self, "Ljava/lang/invoke/MethodHandles;");
+        result->SetL(mh_class);
         found_by_name = true;
       } else if (strcmp(mn, "getCallingClassLoader") == 0) {
         result->SetL(nullptr);

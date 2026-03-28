@@ -6072,7 +6072,7 @@ bool ClassLinker::InitializeClass(Thread* self,
             strstr(desc, "AccessType") != nullptr ||
             strstr(desc, "Daemons") != nullptr) {
           LOG(WARNING) << "Tolerating clinit failure for " << desc
-                       << " in standalone build (marking initialized with defaults)";
+                       << " in standalone build: " << self->GetException()->Dump();
           self->ClearException();
           callback = MarkClassInitialized(self, klass);
           success = true;
