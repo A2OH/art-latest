@@ -2398,7 +2398,8 @@ class ImageSpace::BootImageLoader {
 
     template <typename T>
     ALWAYS_INLINE T* operator()(T* src) const {
-      if (src == nullptr || !InSource(src)) return src;  // Tolerate corrupt/erroneous refs
+      if (src == nullptr) return src;
+      if (!InSource(src)) return nullptr;  // Null-out corrupt/erroneous refs
       uint32_t raw_src = reinterpret_cast32<uint32_t>(src);
       return reinterpret_cast32<T*>(raw_src + diff_);
     }

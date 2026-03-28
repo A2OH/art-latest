@@ -2620,6 +2620,16 @@ void UnstartedRuntime::Jni(Thread* self, ArtMethod* method, mirror::Object* rece
           result->SetL(empty);
           found_by_name = true;
         }
+      } else if (strcmp(mn, "charAt") == 0 && strcmp(dc, "Ljava/lang/String;") == 0) {
+        // String.charAt(int) — receiver is the String, args[0] is index
+        if (receiver != nullptr) {
+          ObjPtr<mirror::String> str = receiver->AsString();
+          int32_t index = args[0];
+          if (index >= 0 && index < str->GetLength()) {
+            result->SetI(str->CharAt(index));
+            found_by_name = true;
+          }
+        }
       } else if (strcmp(mn, "getStackClass2") == 0 && strcmp(dc, "Ldalvik/system/VMStack;") == 0) {
         // VMStack.getStackClass2() - return caller class for security checks
         // During AOT, return null (bypasses Unsafe security check)

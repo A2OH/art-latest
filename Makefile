@@ -355,7 +355,7 @@ IMGSPACE_PATCH_OBJ = $(BUILDDIR)/runtime/gc/space/image_space.o
 
 $(IMGSPACE_PATCH_OBJ): $(IMGSPACE_PATCH_SRC)
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -iquote $(ART)/runtime/gc/space -c $< -o $@ 2>&1 && echo "OK: image_space.cc (patched)" || { echo "FAIL: image_space.cc (patched)"; rm -f $@; }
+	$(CXX) $(CXXFLAGS) -iquote $(STUBS)/runtime/mirror -iquote $(ART)/runtime/gc/space -c $< -o $@ 2>&1 && echo "OK: image_space.cc (patched)" || { echo "FAIL: image_space.cc (patched)"; rm -f $@; }
 RUNTIME_OBJS += $(IMGSPACE_PATCH_OBJ)
 
 # Patched image.cc (version 085 to match prebuilt boot images from A11 dex2oat)
