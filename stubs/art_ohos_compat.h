@@ -1,5 +1,5 @@
-// art_ohos_compat.h - Pre-included header for OHOS ARM64 cross-compilation
-// This overrides art_gcc_compat.h for the OHOS target build.
+// art_ohos_compat.h - Pre-included header for A15 OHOS ARM64 cross-compilation
+// Merges A11's OHOS compat header with A15's art_gcc_compat.h additions.
 
 #ifndef ART_OHOS_COMPAT_H
 #define ART_OHOS_COMPAT_H
@@ -10,6 +10,8 @@
 #include <cmath>
 #include <functional>
 #include <signal.h>
+#include <cstdint>
+#include <climits>
 
 // Prevent AOSP strlcpy.h from providing strlcpy (musl has it)
 #define ART_LIBARTBASE_BASE_STRLCPY_H_
@@ -32,16 +34,12 @@
 #define IMT_SIZE 43
 #endif
 
-// For GCC compatibility with offsetof
-#include <cstdint>
-
 // ART compact DEX level (needed by dex2oat)
 #ifndef ART_DEFAULT_COMPACT_DEX_LEVEL
 #define ART_DEFAULT_COMPACT_DEX_LEVEL fast
 #endif
 
-// Enable all code generators (even for cross-compilation, the compiler
-// needs all backends for dex2oat multi-target support)
+// Enable all code generators (for cross-compilation support)
 #ifndef ART_ENABLE_CODEGEN_arm
 #define ART_ENABLE_CODEGEN_arm
 #endif
@@ -54,13 +52,14 @@
 #ifndef ART_ENABLE_CODEGEN_x86_64
 #define ART_ENABLE_CODEGEN_x86_64
 #endif
+#ifndef ART_ENABLE_CODEGEN_riscv64
+#define ART_ENABLE_CODEGEN_riscv64
+#endif
 
 // *** TARGET BUILD ***
-// This is a target build (running on device), not a host build.
-// Define ART_TARGET so the runtime uses target code paths
-// (e.g., Thread TLS via __get_tls() on ARM64).
-// However, we are NOT Android - we are OHOS with musl libc.
-// So we do NOT define __ANDROID__ or ART_TARGET_ANDROID.
+// This is a target build (running on OHOS device), not a host build.
+// We are NOT Android - we are OHOS with musl libc.
+// Do NOT define __ANDROID__ or ART_TARGET_ANDROID.
 #ifdef ART_TARGET
 #undef ART_TARGET
 #endif
@@ -72,6 +71,28 @@
 #endif
 #ifdef ANDROID
 #undef ANDROID
+#endif
+
+// Android 15 uses HIDDEN attribute extensively: namespace art HIDDEN { ... }
+// For standalone executable builds, override HIDDEN to default visibility.
+// Hidden visibility causes "hidden symbol not defined" linker errors when
+// linking compiler + runtime objects into a single dalvikvm executable.
+#undef HIDDEN
+#define HIDDEN /* default visibility for standalone build */
+#undef ALWAYS_HIDDEN
+#define ALWAYS_HIDDEN /* default visibility for standalone build */
+#ifndef EXPORT
+#define EXPORT __attribute__((visibility("default")))
+#endif
+
+// Android 15 ART metrics - stub the statsd reporting
+#ifndef ART_METRICS_REPORTING_ENABLED
+#define ART_METRICS_REPORTING_ENABLED 0
+#endif
+
+// Android 15 escape.h uses GCC 'typeof' extension; map to C++ decltype
+#ifndef typeof
+#define typeof(x) decltype(x)
 #endif
 
 // musl compatibility: sys/ucontext.h exists on musl but signal.h

@@ -25,6 +25,11 @@ using art::x86_64::X86_64Context;
 using art::x86_64::kNumberOfCpuRegisters;
 using art::x86_64::kNumberOfFloatRegisters;
 using art::x86_64::RSP;
+#elif defined(__aarch64__)
+#include "arch/arm64/context_arm64.h"
+using art::arm64::Arm64Context;
+using art::arm64::kNumberOfXRegisters;
+using art::arm64::kNumberOfDRegisters;
 #endif
 
 // art_quick_do_long_jump(gprs, fprs) - A11 assembly function
@@ -32,8 +37,10 @@ extern "C" void art_quick_do_long_jump(uintptr_t* gprs, uint64_t* fprs) __attrib
 
 namespace art HIDDEN {
 
-// Replicate A11's X86_64Context::DoLongJump() logic for A15 Context objects.
-// The A15 Context has the same gprs_/fprs_/rip_ layout as A11.
+// Replicate A11's Context::DoLongJump() logic for A15 Context objects.
+// A15 throw entrypoints return Context*; A11 assembly expects them to never return.
+// We bridge the gap by extracting registers into flat arrays and calling
+// art_quick_do_long_jump from A11's assembly.
 static void DoContextLongJump(Context* context) __attribute__((noreturn));
 static void DoContextLongJump(Context* context) {
 #if defined(__x86_64__)
@@ -63,39 +70,61 @@ static void DoContextLongJump(Context* context) {
   // will pop the return address (RIP).
   uintptr_t rsp = gprs[kNumberOfCpuRegisters - RSP - 1] - sizeof(intptr_t);
   gprs[kNumberOfCpuRegisters] = rsp;
-  // The PC to jump to. Use GetGPR on a non-standard "register" index won't work.
-  // In A11/A15, the X86_64Context stores rip_ separately.
-  // Access it via SmashCallerSaves pattern: RIP is stored in the context's rip_ field.
-  // Unfortunately rip_ is private. But we can read it through the PC that was set.
-  // The QuickExceptionHandler::PrepareLongJump() calls context->SetPC(handler_pc).
-  // SetPC sets rip_. We need to read it back.
-  // Since GetGPR/SetGPR doesn't cover RIP directly, and rip_ is protected/private,
-  // we need a different approach. SetPC writes to a member variable.
-  // For x86_64, context->GetPC() would give us the saved PC but there's no GetPC() in A15.
-  //
-  // Alternative: use the fact that A15 assembly gets the PC from Context->rip_.
-  // In A15, art_quick_do_long_jump reads from the Context object directly.
-  // In A11, DoLongJump() accesses rip_ directly (it's a member function).
-  //
-  // Since we can't access rip_ from outside, we'll read it from memory.
-  // X86_64Context layout: inherits Context (vtable ptr = 8 bytes on x86_64),
-  //   then gprs_[16] (16 * 8 = 128), fprs_[16] (16 * 8 = 128), rsp_ (8), rip_ (8), arg0_ (8)
-  // Offset of rip_ from start of object: 8 (vtable) + 128 (gprs_) + 128 (fprs_) + 8 (rsp_) = 272
-  uintptr_t* raw = reinterpret_cast<uintptr_t*>(ctx);
-  // Safer: compute from OFFSETOF_MEMBER if available, or just hardcode for x86_64
-  // sizeof(void*) [vtable] + 16*sizeof(uintptr_t*) [gprs_] + 16*sizeof(uint64_t*) [fprs_] + sizeof(uintptr_t) [rsp_]
-  // = 8 + 128 + 128 + 8 = 272  on x86_64
+
+  // Read rip_ from Context memory layout.
+  // X86_64Context layout: vtable(8) + gprs_[16](128) + fprs_[16](128) + rsp_(8) = 272
   static constexpr size_t kRipOffset = 8 + 16 * 8 + 16 * 8 + 8;  // 272
   uintptr_t rip = *reinterpret_cast<uintptr_t*>(reinterpret_cast<uint8_t*>(ctx) + kRipOffset);
 
   *(reinterpret_cast<uintptr_t*>(rsp)) = rip;
 
-  // Delete the context since we own it (was released from unique_ptr)
-  // Actually we can't delete it here since we're about to long-jump away.
-  // The memory will be leaked, which is acceptable for exception delivery.
+  art_quick_do_long_jump(gprs, fprs);
+  __builtin_unreachable();
+
+#elif defined(__aarch64__)
+  // ARM64: Arm64Context uses pointer-based gprs_/fprs_ arrays.
+  // gprs_[kNumberOfXRegisters + 1] = 34 pointers (33 X-regs + 1 for PC)
+  // fprs_[kNumberOfDRegisters] = 32 pointers (32 D-regs)
+  // art_quick_do_long_jump expects flat value arrays:
+  //   x0 = gprs[34] (values), x1 = fprs[32] (values)
+  //   gprs[31] = SP, gprs[33] = PC
+  Arm64Context* ctx = static_cast<Arm64Context*>(context);
+
+  // kNumberOfXRegisters = 33, kPC = 33
+  static constexpr size_t kPC = kNumberOfXRegisters;
+  uintptr_t gprs[kNumberOfXRegisters + 1];  // 34 entries: x0-x32 + PC
+  uint64_t fprs[kNumberOfDRegisters];        // 32 entries: d0-d31
+
+  for (size_t i = 0; i < kNumberOfXRegisters; ++i) {
+    if (ctx->IsAccessibleGPR(i)) {
+      gprs[i] = ctx->GetGPR(i);
+    } else {
+      gprs[i] = 0xDEAD0000 + i;
+    }
+  }
+  // PC is stored at index kPC (33) in gprs_ — read via memory since
+  // GetGPR doesn't allow reading the PC register.
+  // Arm64Context layout:
+  //   vtable(8) + gprs_[34](272) + fprs_[32](256) + sp_(8) + pc_(8) + arg0_(8)
+  // gprs_ starts at offset 8, PC pointer is at gprs_[33] = offset 8 + 33*8 = 272
+  // But gprs_ stores POINTERS. We need the pointed-to value.
+  // The PC was set via SetPC -> SetGPR(kPC, value) which sets gprs_[kPC] = &pc_
+  // and pc_ = value. The pc_ field is at offset:
+  //   8 (vtable) + 34*8 (gprs_) + 32*8 (fprs_) + 8 (sp_) = 8 + 272 + 256 + 8 = 544
+  static constexpr size_t kPcFieldOffset = 8 + (kNumberOfXRegisters + 1) * 8 + kNumberOfDRegisters * 8 + 8;
+  gprs[kPC] = *reinterpret_cast<uintptr_t*>(reinterpret_cast<uint8_t*>(ctx) + kPcFieldOffset);
+
+  for (size_t i = 0; i < kNumberOfDRegisters; ++i) {
+    if (ctx->IsAccessibleFPR(i)) {
+      fprs[i] = ctx->GetFPR(i);
+    } else {
+      fprs[i] = 0;
+    }
+  }
 
   art_quick_do_long_jump(gprs, fprs);
   __builtin_unreachable();
+
 #else
   (void)context;
   abort();
