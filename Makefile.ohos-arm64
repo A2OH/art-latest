@@ -428,7 +428,8 @@ ASM_INCLUDES = -I$(STUBS) \
   -I$(ART11)/runtime/interpreter \
   -I$(ART)/runtime \
   -I$(ART)/runtime/arch \
-  -I$(ART)/runtime/arch/arm64
+  -I$(ART)/runtime/arch/arm64 \
+  -I$(ART)/runtime/interpreter
 
 # ============ targets ============
 .PHONY: all libdexfile libartbase libcompiler runtime libelffile libprofile vixl android-base link-stubs asm link-runtime nativehelper dalvikvm-main clean status sve-stub metrics-stubs
@@ -496,13 +497,13 @@ $(ASM_QUICK): $(ART11)/runtime/arch/arm64/quick_entrypoints_arm64.S
 	  $(ASM_INCLUDES) \
 	  $< -o $@ 2>&1 && echo "OK: quick_entrypoints_arm64.S (A11)" || { echo "FAIL: quick_entrypoints_arm64.S"; rm -f $@; }
 
-# A15 jni_entrypoints_arm64.S (new JNI features)
-$(ASM_JNI): $(ART)/runtime/arch/arm64/jni_entrypoints_arm64.S
+# A11 jni_entrypoints_arm64.S (A15 version uses CFI macros not supported by OHOS clang)
+$(ASM_JNI): $(ART11)/runtime/arch/arm64/jni_entrypoints_arm64.S
 	@mkdir -p $(ASM_DIR)
 	@$(CC) $(TARGET_FLAGS) \
 	  -c -x assembler-with-cpp \
 	  $(ASM_INCLUDES) \
-	  $< -o $@ 2>&1 && echo "OK: jni_entrypoints_arm64.S (A15)" || { echo "FAIL: jni_entrypoints_arm64.S"; rm -f $@; }
+	  $< -o $@ 2>&1 && echo "OK: jni_entrypoints_arm64.S (A11)" || { echo "FAIL: jni_entrypoints_arm64.S"; rm -f $@; }
 
 # memcmp16 from A15
 $(ASM_MEMCMP): $(ART)/runtime/arch/arm64/memcmp16_arm64.S

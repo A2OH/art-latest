@@ -14,12 +14,16 @@
  * limitations under the License.
  */
 
+#if !defined(__MUSL__)
 #include <execinfo.h>
+#endif
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if !defined(__MUSL__)
 #include <ucontext.h>
+#endif
 #include <algorithm>
 #include <memory>
 
@@ -308,6 +312,7 @@ static int dalvikvm(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
 
   // Install a crash handler to get backtrace before ART's handler
+#if !defined(__MUSL__)
   {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -327,6 +332,7 @@ static int dalvikvm(int argc, char** argv) {
     sigaction(SIGSEGV, &sa, nullptr);
     sigaction(SIGABRT, &sa, nullptr);
   }
+#endif  // !__MUSL__
 
   // Skip over argv[0].
   argv++;

@@ -16,6 +16,14 @@
 // Prevent AOSP strlcpy.h from providing strlcpy (musl has it)
 #define ART_LIBARTBASE_BASE_STRLCPY_H_
 
+// musl compatibility: android-base/endian.h checks __BIONIC__ or __GLIBC__
+// but musl defines neither. musl has <endian.h> and <netinet/in.h> like glibc,
+// so pretend to be glibc for this header's purposes.
+#if defined(__MUSL__) && !defined(__GLIBC__) && !defined(__BIONIC__)
+#define __GLIBC__ 2
+#define __GLIBC_MINOR__ 17
+#endif
+
 // ART image base address ASLR deltas (used by image_space.cc)
 #ifndef ART_BASE_ADDRESS_MIN_DELTA
 #define ART_BASE_ADDRESS_MIN_DELTA (-0x1000000)
@@ -93,6 +101,15 @@
 // Android 15 escape.h uses GCC 'typeof' extension; map to C++ decltype
 #ifndef typeof
 #define typeof(x) decltype(x)
+#endif
+
+// musl may lack some userfaultfd constants added in newer kernels.
+// Provide fallback definitions.
+#ifndef UFFD_FEATURE_MINOR_SHMEM
+#define UFFD_FEATURE_MINOR_SHMEM (1 << 10)
+#endif
+#ifndef UFFD_USER_MODE_ONLY
+#define UFFD_USER_MODE_ONLY 1
 #endif
 
 // musl compatibility: sys/ucontext.h exists on musl but signal.h
