@@ -2529,6 +2529,19 @@ void UnstartedRuntime::Jni(Thread* self, ArtMethod* method, mirror::Object* rece
 
   // Override critical native methods BEFORE handler table lookup.
 
+  // Field.getArtField — must return valid ArtField* for FieldVarHandle construction
+  if (strcmp(method_name, "getArtField") == 0 &&
+      strcmp(declaring_class, "Ljava/lang/reflect/Field;") == 0) {
+    if (receiver != nullptr) {
+      ObjPtr<mirror::Field> field_obj = ObjPtr<mirror::Field>::DownCast(ObjPtr<mirror::Object>(receiver));
+      ArtField* art_field = field_obj->GetArtField();
+      result->SetJ(reinterpret_cast<int64_t>(art_field));
+    } else {
+      result->SetJ(0);
+    }
+    return;
+  }
+
   // Method.invoke — essential for enum values() reflection during VarHandle clinit
   if (strcmp(method_name, "invoke") == 0 &&
       strcmp(declaring_class, "Ljava/lang/reflect/Method;") == 0) {
@@ -2554,6 +2567,20 @@ void UnstartedRuntime::Jni(Thread* self, ArtMethod* method, mirror::Object* rece
   }
   // The handler table's ArtMethod* pointers don't match the call-site pointers
   // due to different class resolution contexts during Reinitialize().
+
+  // Field.getArtField — returns native ArtField* pointer for FieldVarHandle construction
+  if (strcmp(method_name, "getArtField") == 0 &&
+      strcmp(declaring_class, "Ljava/lang/reflect/Field;") == 0) {
+    if (receiver != nullptr) {
+      ObjPtr<mirror::Field> field_obj = ObjPtr<mirror::Field>::DownCast(ObjPtr<mirror::Object>(receiver));
+      ArtField* art_field = field_obj->GetArtField();
+      LOG(WARNING) << "[ARTFIELD] getArtField: " << (art_field ? art_field->PrettyField() : "NULL");
+      result->SetJ(reinterpret_cast<int64_t>(art_field));
+      return;
+    }
+    result->SetJ(0);
+    return;
+  }
 
   // Field.getBoolean — needed by findVarHandle for field access checks
   if (strcmp(method_name, "getBoolean") == 0 &&
