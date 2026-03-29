@@ -31,21 +31,47 @@ static int registerNativesOrSkip(JNIEnv* env, jclass clazz,
 static jobjectArray System_specialProperties(JNIEnv* env, jclass ignored) {
     jclass stringClass = (*env)->FindClass(env, "java/lang/String");
     if (!stringClass) return NULL;
-    jobjectArray result = (*env)->NewObjectArray(env, 4, stringClass, NULL);
+    /* Properties needed by System.<clinit>:
+     * - user.dir (CWD)
+     * - user.language, user.region (locale)
+     * - java.library.path (native libs)
+     * - file.separator, path.separator, line.separator (I/O)
+     * - android.icu.* (ICU version info)
+     */
+    const char* props[] = {
+        NULL, /* [0] user.dir=<CWD> - filled below */
+        "android.zlib.version=1.2.11",
+        "android.openssl.version=OpenSSL 1.1.1k stub",
+        NULL, /* [3] java.library.path=<LD_LIBRARY_PATH> - filled below */
+        "user.language=en",
+        "user.region=US",
+        "file.separator=/",
+        "path.separator=:",
+        "line.separator=\n",
+        "file.encoding=UTF-8",
+        "user.home=/",
+        "java.io.tmpdir=/tmp",
+        "os.arch=x86_64",
+        "os.name=Linux",
+        "android.icu.impl.ICUBinary.dataPath=/dev/null",
+        /* Don't set user.locale — Locale.forLanguageTag has NPE on standalone build.
+         * Let System.addLegacyLocaleSystemProperties fall through to the else branch
+         * which sets user.language=en and user.region=US directly. */
+    };
+    int nprops = sizeof(props) / sizeof(props[0]);
+    jobjectArray result = (*env)->NewObjectArray(env, nprops, stringClass, NULL);
     if (!result) return NULL;
     (*env)->DeleteLocalRef(env, stringClass);
 
+    /* Fill user.dir */
     char path[PATH_MAX];
     char* cwd = getcwd(path, sizeof(path));
     if (!cwd) cwd = "/";
     char user_dir[PATH_MAX + 16];
     snprintf(user_dir, sizeof(user_dir), "user.dir=%s", cwd);
     (*env)->SetObjectArrayElement(env, result, 0, (*env)->NewStringUTF(env, user_dir));
-    (*env)->SetObjectArrayElement(env, result, 1,
-        (*env)->NewStringUTF(env, "android.zlib.version=1.2.11"));
-    (*env)->SetObjectArrayElement(env, result, 2,
-        (*env)->NewStringUTF(env, "android.openssl.version=OpenSSL 1.1.1k stub"));
 
+    /* Fill java.library.path */
     const char* lib_path = getenv("LD_LIBRARY_PATH");
     if (!lib_path) lib_path = "";
     char* java_path = (char*)malloc(strlen("java.library.path=") + strlen(lib_path) + 1);
@@ -53,6 +79,16 @@ static jobjectArray System_specialProperties(JNIEnv* env, jclass ignored) {
     strcat(java_path, lib_path);
     (*env)->SetObjectArrayElement(env, result, 3, (*env)->NewStringUTF(env, java_path));
     free(java_path);
+
+    /* Fill remaining static properties */
+    for (int i = 0; i < nprops; i++) {
+        if (props[i] != NULL && i != 0 && i != 3) {
+            (*env)->SetObjectArrayElement(env, result, i, (*env)->NewStringUTF(env, props[i]));
+        }
+    }
+    /* Fill [1] and [2] which are in props[] */
+    (*env)->SetObjectArrayElement(env, result, 1, (*env)->NewStringUTF(env, props[1]));
+    (*env)->SetObjectArrayElement(env, result, 2, (*env)->NewStringUTF(env, props[2]));
 
     return result;
 }
@@ -104,6 +140,11 @@ static jboolean Version_getJvmVersionInfo(JNIEnv* env, jclass clazz) {
 static void Version_getJdkVersionInfo(JNIEnv* env, jclass clazz) { }
 
 /* ==================== java.io.FileDescriptor natives ==================== */
+
+static jboolean FileDescriptor_getAppend(JNIEnv* env, jclass clazz, jint fd) {
+    int flags = fcntl(fd, F_GETFL);
+    return (flags != -1 && (flags & O_APPEND)) ? JNI_TRUE : JNI_FALSE;
+}
 
 static jboolean FileDescriptor_isSocket(JNIEnv* env, jclass clazz, jint fd) {
     struct stat sb;
@@ -902,6 +943,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
         if (cls) {
             JNINativeMethod methods[] = {
                 {"isSocket", "(I)Z", (void*)FileDescriptor_isSocket},
+                {"getAppend", "(I)Z", (void*)FileDescriptor_getAppend},
                 {"sync", "()V", (void*)FileDescriptor_sync},
             };
             registerNativesOrSkip(env, cls, methods, sizeof(methods)/sizeof(methods[0]));
