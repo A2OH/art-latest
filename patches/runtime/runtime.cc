@@ -2561,11 +2561,13 @@ jobject Runtime::GetSystemClassLoader() const {
 // Helper macro: attempt JNI native registration, clear exception on failure.
 // Core JARs may not have all methods expected by Android 15 ART runtime.
 #define TRY_REGISTER(fn) do { \
+    fprintf(stderr, "[RT]   TRY_REGISTER(" #fn ") ...\n"); fflush(stderr); \
     fn(env); \
     if (env->ExceptionCheck()) { \
       LOG(WARNING) << "RegisterRuntimeNativeMethods: " #fn " failed (clearing exception)"; \
       env->ExceptionClear(); \
     } \
+    fprintf(stderr, "[RT]   TRY_REGISTER(" #fn ") done\n"); fflush(stderr); \
   } while (false)
 
 void Runtime::RegisterRuntimeNativeMethods(JNIEnv* env) {

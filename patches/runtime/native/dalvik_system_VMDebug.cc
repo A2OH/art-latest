@@ -634,10 +634,13 @@ static JNINativeMethod gMethods[] = {
     NATIVE_METHOD(VMDebug, addApplication, "(Ljava/lang/String;)V"),
     NATIVE_METHOD(VMDebug, removeApplication, "(Ljava/lang/String;)V"),
     NATIVE_METHOD(VMDebug, setUserId, "(I)V"),
-    NATIVE_METHOD(VMDebug, startLowOverheadTraceImpl, "()V"),
-    NATIVE_METHOD(VMDebug, stopLowOverheadTraceImpl, "()V"),
-    NATIVE_METHOD(VMDebug, dumpLowOverheadTraceImpl, "(Ljava/lang/String;)V"),
-    NATIVE_METHOD(VMDebug, dumpLowOverheadTraceFdImpl, "(I)V"),
+    // LowOverheadTrace methods removed: not declared in core-libart.jar (A15-only).
+    // Keeping them causes RegisterNatives bulk failure → class init deadlock during
+    // one-by-one fallback error handling.
+    // NATIVE_METHOD(VMDebug, startLowOverheadTraceImpl, "()V"),
+    // NATIVE_METHOD(VMDebug, stopLowOverheadTraceImpl, "()V"),
+    // NATIVE_METHOD(VMDebug, dumpLowOverheadTraceImpl, "(Ljava/lang/String;)V"),
+    // NATIVE_METHOD(VMDebug, dumpLowOverheadTraceFdImpl, "(I)V"),
 };
 
 void register_dalvik_system_VMDebug(JNIEnv* env) {

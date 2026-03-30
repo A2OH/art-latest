@@ -1203,10 +1203,13 @@ void ClassLinker::RunEarlyRootClinits(Thread* self) {
   Handle<mirror::ObjectArray<mirror::Class>> class_roots = hs.NewHandle(GetClassRoots());
 
   // Initialize Class, String, Field before WellKnownClasses::Init (matches AOSP)
+  fprintf(stderr, "[CL] RunEarlyRootClinits: EnsureRootInitialized(Class)\n"); fflush(stderr);
   EnsureRootInitialized(this, self, GetClassRoot<mirror::Class>(class_roots.Get()));
   if (self->IsExceptionPending()) { self->ClearException(); }
+  fprintf(stderr, "[CL] RunEarlyRootClinits: EnsureRootInitialized(String)\n"); fflush(stderr);
   EnsureRootInitialized(this, self, GetClassRoot<mirror::String>(class_roots.Get()));
   if (self->IsExceptionPending()) { self->ClearException(); }
+  fprintf(stderr, "[CL] RunEarlyRootClinits: EnsureRootInitialized(Field)\n"); fflush(stderr);
   EnsureRootInitialized(this, self, GetClassRoot<mirror::Field>(class_roots.Get()));
   if (self->IsExceptionPending()) { self->ClearException(); }
 
@@ -1252,13 +1255,53 @@ void ClassLinker::RunRootClinits(Thread* self) {
       }
     }
 
-    // On standalone builds without boot image, skip aggressive pre-init
-    // on ARM64 where the interpreter hangs on complex clinits.
-    // On x86_64 (dex2oat), these run successfully.
+    // Skip pre-init when boot image is loaded — classes are already initialized.
+    if (Runtime::Current()->GetHeap()->HasBootImageSpace()) {
+      fprintf(stderr, "[CL] Skipping pre-init (boot image loaded)\n"); fflush(stderr);
+      // Force-init classes that failed pre-init during dex2oat
+      // (their <clinit> has dependencies on ICU/native that aren't available in dex2oat)
+      const char* force_init_classes[] = {
+        "Ljava/lang/System;",
+        "Ljava/io/FileDescriptor;",
+        "Ljava/io/FileOutputStream;",
+        "Ljava/io/PrintStream;",
+        "Ljava/io/BufferedWriter;",
+        "Ljava/io/OutputStreamWriter;",
+        "Ljava/io/Writer;",
+        "Ljava/io/OutputStream;",
+        "Ljava/io/FilterOutputStream;",
+      };
+      for (const char* desc : force_init_classes) {
+        ObjPtr<mirror::Class> cls = FindSystemClass(self, desc);
+        if (self->IsExceptionPending()) self->ClearException();
+        if (cls != nullptr) {
+          StackHandleScope<1> hs2(self);
+          Handle<mirror::Class> h(hs2.NewHandle(cls));
+          ClassStatus status = h->GetStatus();
+          if (status == ClassStatus::kErrorResolved || status == ClassStatus::kErrorUnresolved ||
+              status < ClassStatus::kVisiblyInitialized) {
+            ObjectLock<mirror::Class> lock(self, h);
+            // Reset error status before setting to initialized
+            if (status == ClassStatus::kErrorResolved || status == ClassStatus::kErrorUnresolved) {
+              mirror::Class::SetStatus(h, ClassStatus::kResolved, self);
+              if (self->IsExceptionPending()) self->ClearException();
+            }
+            if (h->GetStatus() < ClassStatus::kVisiblyInitialized) {
+              mirror::Class::SetStatus(h, ClassStatus::kVisiblyInitialized, self);
+              fprintf(stderr, "[CL] Force-init %s OK (was %d)\n", desc, (int)status);
+            }
+          }
+          if (self->IsExceptionPending()) self->ClearException();
+        }
+      }
+      fflush(stderr);
+      return;
+    }
+    // Also skip on ARM64 standalone (interpreter hangs on complex clinits).
 #if defined(__aarch64__)
     if (!Runtime::Current()->IsAotCompiler()) {
       fprintf(stderr, "[CL] Skipping pre-init + root init (ARM64 standalone)\n"); fflush(stderr);
-      goto skip_all_init;
+      return;
     }
 #endif
 
@@ -1282,15 +1325,46 @@ void ClassLinker::RunRootClinits(Thread* self) {
       "Ljava/lang/StrictMath;",
       "Ljava/util/EnumSet;",
       "Ljava/util/RegularEnumSet;",
-      "Ljava/util/Collections;",
-      // Tier 3: VarHandle family SKIPPED - circular enum init (AccessMode <-> VarHandle).
-      // VarHandle clinit calls AccessMode.values(), but AccessMode init triggers VarHandle
-      // resolution as its enclosing class. These remain uninitialized in the boot image
-      // and will be initialized at runtime instead.
-      // SKIP: VarHandle, VarHandle$AccessType, VarHandle$AccessMode
-      // SKIP: MethodHandles, MethodHandles$Lookup, MethodType (depend on VarHandle)
-      // SKIP: FieldVarHandle, AtomicInteger, AtomicLong (depend on VarHandle)
-      // SKIP: ThreadLocal, Proxy (depend on AtomicLong)
+      // SKIP Collections — its inner classes (UnmodifiableSet, UnmodifiableCollection)
+      // get broken itables after boot image relocation, causing AbstractMethodError
+      // on Set.iterator(). Let it initialize freshly at runtime instead.
+      // "Ljava/util/Collections;",
+      // Tier 3: VarHandle family - circular enum init handled by UnstartedRuntime::Jni handlers.
+      // These MUST be initialized during dex2oat so their static fields are preserved
+      // in the boot image. At runtime, VarHandle init fails without UnstartedRuntime.
+      "Ljava/lang/invoke/VarHandle$AccessType;",
+      "Ljava/lang/invoke/VarHandle$AccessMode;",
+      "Ljava/lang/invoke/VarHandle;",
+      "Ljava/lang/invoke/MethodHandles$Lookup;",
+      "Ljava/lang/invoke/MethodType;",
+      "Ljava/lang/invoke/FieldVarHandle;",
+      "Ljava/util/concurrent/atomic/AtomicInteger;",
+      "Ljava/util/concurrent/atomic/AtomicLong;",
+      "Ljava/util/concurrent/atomic/AtomicBoolean;",
+      // Pre-init ThreadLocal classes so Entry array class exists at runtime.
+      // Without pre-init, new Entry[16] returns null (class not loadable).
+      // Don't worry about corrupt ThreadLocalMap objects — IO classes aren't
+      // pre-inited anymore so no ThreadLocalMap is created during dex2oat.
+      "Ljava/lang/ThreadLocal;",
+      "Ljava/lang/ThreadLocal$ThreadLocalMap;",
+      "Ljava/lang/ThreadLocal$ThreadLocalMap$Entry;",
+      "Ljava/lang/ref/WeakReference;",
+      "Ljava/lang/ref/Reference;",
+      // Tier 5: System and I/O — SKIP all during dex2oat.
+      // These create ThreadLocal/IoTracker objects that get baked corrupt
+      // into the boot image (Thread.clone() → CloneNotSupportedException).
+      // They're force-inited to kVisiblyInitialized at runtime in RunEarlyRootClinits.
+      // "Ljava/lang/System;",        // <clinit> needs ICU → fails
+      // "Ljava/io/FileDescriptor;",  // simple but depends on System
+      // "Ljava/io/FileOutputStream;", // creates IoTracker → ThreadLocal
+      // "Ljava/io/PrintStream;",     // needs Charset → ICU
+      "Ljava/util/TreeMap;",
+      "Ljava/util/TreeSet;",
+      "Ljava/util/HashSet;",
+      // "Ljava/util/concurrent/ConcurrentHashMap;", // needs OsConstants
+      // "Ljava/io/OutputStreamWriter;", // needs Charset
+      // "Ljava/io/BufferedWriter;",    // needs System.lineSeparator → ThreadLocal
+      // "Lsun/nio/cs/StreamEncoder;",  // needs Charset
       // Tier 6: Boxing classes and their caches (needed by image writer intrinsic objects)
       "Ljava/lang/Boolean;",
       "Ljava/lang/Byte;",

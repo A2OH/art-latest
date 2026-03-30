@@ -724,3 +724,8 @@ extern "C" size_t artCriticalNativeOutArgsSize(void* method) {
     // Pass 0 as caller_pc since the A11 path always passes the native method itself.
     return artCriticalNativeFrameSize(method, 0);
 }
+
+// Stub for ArtMethod::IsProxyMethod
+extern "C" bool _ZN3art9ArtMethod13IsProxyMethodEv() { return false; }
+// Stub for ArtMethod::GetShorty — returns empty string (never actually called in our path)
+extern "C" const char* _ZN3art9ArtMethod9GetShortyEv() { return ""; }

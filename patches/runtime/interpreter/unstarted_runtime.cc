@@ -2465,6 +2465,21 @@ void UnstartedRuntime::Jni(Thread* self, ArtMethod* method, mirror::Object* rece
   const char* declaring_class = method->GetDeclaringClassDescriptor();
 
     LOG(WARNING) << "[UNSAFE-JNI] method=" << method_name << " class=" << declaring_class;
+
+  // FileDescriptor.getAppend(int fd) — returns false (stdin/stdout/stderr not append)
+  if (strcmp(method_name, "getAppend") == 0 &&
+      strcmp(declaring_class, "Ljava/io/FileDescriptor;") == 0) {
+    result->SetZ(false);
+    return;
+  }
+
+  // FileDescriptor.isSocket(int fd) — returns false
+  if (strcmp(method_name, "isSocket") == 0 &&
+      strcmp(declaring_class, "Ljava/io/FileDescriptor;") == 0) {
+    result->SetZ(false);
+    return;
+  }
+
   if (strcmp(method_name, "getUnsafe") == 0 &&
       (strcmp(declaring_class, "Ljdk/internal/misc/Unsafe;") == 0 ||
        strcmp(declaring_class, "Lsun/misc/Unsafe;") == 0)) {

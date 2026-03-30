@@ -386,11 +386,18 @@ $(BUILDDIR)/runtime/native/%.o: patches/runtime/native/%.cc
 RUNTIME_OBJS += $(NATIVE_PATCH_OBJS)
 
 # ============ libelffile ============
-# In A15, xz_utils.cc is included (was excluded in A11)
-ELFFILE_SRCS = $(filter-out %_test.cc,$(wildcard \
+# Exclude original xz_utils.cc — use stub that disables XZ compression
+ELFFILE_SRCS = $(filter-out %_test.cc %xz_utils.cc,$(wildcard \
   $(ART)/libelffile/elf/*.cc \
   $(ART)/libelffile/stream/*.cc))
 ELFFILE_OBJS = $(patsubst $(ART)/%.cc,$(BUILDDIR)/%.o,$(ELFFILE_SRCS))
+# Add patched xz_utils stub
+XZ_PATCH_SRC = patches/libelffile/elf/xz_utils.cc
+XZ_PATCH_OBJ = $(BUILDDIR)/libelffile/elf/xz_utils_stub.o
+$(XZ_PATCH_OBJ): $(XZ_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	@$(CXX) $(CXXFLAGS) -I$(ART)/libelffile -c $< -o $@ 2>&1 && echo "OK: xz_utils_stub.cc" || { echo "FAIL: xz_utils_stub.cc"; rm -f $@; }
+ELFFILE_OBJS += $(XZ_PATCH_OBJ)
 
 # ============ libprofile ============
 PROFILE_SRCS = $(filter-out %_test.cc,$(wildcard $(ART)/libprofile/profile/*.cc))

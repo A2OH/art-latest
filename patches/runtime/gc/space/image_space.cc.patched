@@ -995,34 +995,20 @@ class ImageSpace::Loader {
     const bool is_compressed = image_header.HasCompressedBlock();
     if (!is_compressed && allow_direct_mapping) {
       uint8_t* address = (image_reservation != nullptr) ? image_reservation->Begin() : nullptr;
-      // Try to mmap at the compiled address to avoid relocation entirely.
-      // Boot image relocation has bugs that corrupt class pointers/ThreadLocal.
-      uint8_t* compiled_begin = image_header.GetImageBegin();
-      size_t map_size = CondRoundUp<kPageSizeAgnostic>(image_header.GetImageSize(), kElfSegmentAlignment);
-      MemMap map;
-      if (address == nullptr && compiled_begin != nullptr) {
-        // Try MAP_FIXED at the compiled address (our pre-reservation covers this)
-        void* fixed = mmap(compiled_begin, map_size, PROT_READ | PROT_WRITE,
-                           MAP_PRIVATE | MAP_FIXED, fd, 0);
-        if (fixed == compiled_begin) {
-          map = MemMap::MapPlaceholder(image_filename, compiled_begin, map_size);
-          fprintf(stderr, "[IMG] Loaded %s at compiled address %p (no relocation!)\n",
-                  image_filename, compiled_begin);
-          fflush(stderr);
-        } else {
-          if (fixed != MAP_FAILED) munmap(fixed, map_size);
-          fprintf(stderr, "[IMG] MAP_FIXED at %p failed for %s, falling back\n",
-                  compiled_begin, image_filename);
-          fflush(stderr);
-        }
-      }
-      if (!map.IsValid()) {
-        // Fallback: let ART choose the address (will need relocation)
-        map = MemMap::MapFileAtAddress(
-            address, map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd,
-            /*start=*/0, /*low_4gb=*/true, image_filename,
-            /*reuse=*/false, image_reservation, error_msg);
-      }
+      // The reserved memory size is aligned up to kElfSegmentAlignment to ensure
+      // that the next reserved area will be aligned to the value.
+      MemMap map = MemMap::MapFileAtAddress(
+          address,
+          CondRoundUp<kPageSizeAgnostic>(image_header.GetImageSize(), kElfSegmentAlignment),
+          PROT_READ | PROT_WRITE,
+          MAP_PRIVATE,
+          fd,
+          /*start=*/0,
+          /*low_4gb=*/true,
+          image_filename,
+          /*reuse=*/false,
+          image_reservation,
+          error_msg);
       if (map.IsValid()) {
         Runtime::MadviseFileForRange(
             madvise_size_limit, map.Size(), map.Begin(), map.End(), image_filename);
@@ -2308,11 +2294,9 @@ class ImageSpace::BootImageLoader {
       return false;
     }
 
-    // Reserve address space at the compiled base address to avoid relocation.
-    // Boot image relocation has bugs that corrupt ThreadLocal and class pointers.
-    uint8_t* addr = reinterpret_cast<uint8_t*>(base_address);
-    fprintf(stderr, "[IMG] Reserving at compiled address 0x%x (no ASLR)\n", base_address);
-    fflush(stderr);
+    // Reserve address space. If relocating, choose a random address for ALSR.
+    uint8_t* addr = reinterpret_cast<uint8_t*>(
+        relocate_ ? ART_BASE_ADDRESS + ChooseRelocationOffsetDelta() : base_address);
     MemMap image_reservation =
         ReserveBootImageMemory(addr, image_reservation_size + extra_reservation_size, error_msg);
     if (!image_reservation.IsValid()) {
