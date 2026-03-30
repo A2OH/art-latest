@@ -92,33 +92,122 @@ static jobject NativeConverter_charsetForName(JNIEnv* env, jclass clazz, jstring
     if (!jname) return NULL;
     const char* name = (*env)->GetStringUTFChars(env, jname, NULL);
     const CharsetInfo* info = findCharset(name);
+    fprintf(stderr, "[icu] charsetForName(\"%s\") -> %s\n", name, info ? info->name : "NOT FOUND");
     (*env)->ReleaseStringUTFChars(env, jname, name);
     if (!info) return NULL;
 
-    /* Create CharsetICU(canonicalName, icuCanonName, aliases) */
+    /* Create Charset object without calling Charset(String, String[]) constructor.
+     * The constructor calls Collections.unmodifiableSet() which triggers a broken
+     * interface dispatch (Set.iterator() AbstractMethodError) in our standalone build.
+     * Instead, use Unsafe.allocateInstance + manual field setting. */
     jclass charsetCls = (*env)->FindClass(env, "com/android/icu/charset/CharsetICU");
     if (!charsetCls) return NULL;
-    jmethodID ctor = (*env)->GetMethodID(env, charsetCls, "<init>",
-        "(Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;)V");
-    if (!ctor) {
-        (*env)->DeleteLocalRef(env, charsetCls);
-        return NULL;
+
+    /* Call CharsetICU constructor normally (sets up ICU fields), but then
+     * replace the aliasSet with a plain HashSet to avoid Collections$UnmodifiableSet
+     * which has broken itable dispatch for Set.iterator(). */
+    jobject result = NULL;
+    {
+        jmethodID ctor = (*env)->GetMethodID(env, charsetCls, "<init>",
+            "(Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;)V");
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        if (ctor) {
+            jclass stringCls = (*env)->FindClass(env, "java/lang/String");
+            jobjectArray aliases = (*env)->NewObjectArray(env, info->aliasCount, stringCls, NULL);
+            for (int i = 0; i < info->aliasCount; i++) {
+                (*env)->SetObjectArrayElement(env, aliases, i,
+                    (*env)->NewStringUTF(env, info->aliases[i]));
+            }
+            result = (*env)->NewObject(env, charsetCls, ctor,
+                (*env)->NewStringUTF(env, info->name),
+                (*env)->NewStringUTF(env, info->icuName),
+                aliases);
+            if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); result = NULL; }
+            /* Replace aliasSet (UnmodifiableSet) with an empty HashSet.
+             * UnmodifiableSet has broken itable dispatch for iterator().
+             * Aliases won't be available via aliases() but cache() won't crash. */
+            if (result) {
+                jclass baseCls = (*env)->FindClass(env, "java/nio/charset/Charset");
+                jfieldID aliasF = baseCls ? (*env)->GetFieldID(env, baseCls, "aliasSet", "Ljava/util/Set;") : NULL;
+                if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+                if (aliasF) {
+                    jclass hsCls = (*env)->FindClass(env, "java/util/HashSet");
+                    jmethodID hsInit0 = hsCls ? (*env)->GetMethodID(env, hsCls, "<init>", "()V") : NULL;
+                    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+                    if (hsInit0) {
+                        jobject emptySet = (*env)->NewObject(env, hsCls, hsInit0);
+                        if (emptySet && !(*env)->ExceptionCheck(env)) {
+                            (*env)->SetObjectField(env, result, aliasF, emptySet);
+                        }
+                    }
+                    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+                }
+            }
+        }
     }
 
-    jclass stringCls = (*env)->FindClass(env, "java/lang/String");
-    jobjectArray aliases = (*env)->NewObjectArray(env, info->aliasCount, stringCls, NULL);
-    for (int i = 0; i < info->aliasCount; i++) {
-        (*env)->SetObjectArrayElement(env, aliases, i, (*env)->NewStringUTF(env, info->aliases[i]));
-    }
+    if (result) {
+        /* Set Charset fields manually:
+         * - name (String) - canonical name
+         * - aliasSet (Set<String>) - use a plain HashSet to avoid UnmodifiableSet
+         */
+        jclass baseCharsetCls = (*env)->FindClass(env, "java/nio/charset/Charset");
+        if (baseCharsetCls) {
+            jfieldID nameField = (*env)->GetFieldID(env, baseCharsetCls, "name", "Ljava/lang/String;");
+            jfieldID aliasSetField = (*env)->GetFieldID(env, baseCharsetCls, "aliasSet", "Ljava/util/Set;");
+            if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
 
-    jobject result = (*env)->NewObject(env, charsetCls, ctor,
-        (*env)->NewStringUTF(env, info->name),
-        (*env)->NewStringUTF(env, info->icuName),
-        aliases);
+            if (nameField)
+                (*env)->SetObjectField(env, result, nameField, (*env)->NewStringUTF(env, info->name));
+
+            /* Create a plain HashSet for aliases (avoids Collections.unmodifiableSet) */
+            if (aliasSetField) {
+                jclass hsCls = (*env)->FindClass(env, "java/util/HashSet");
+                jmethodID hsInit = hsCls ? (*env)->GetMethodID(env, hsCls, "<init>", "()V") : NULL;
+                if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+                if (hsInit) {
+                    jobject aliasSet = (*env)->NewObject(env, hsCls, hsInit);
+                    if (aliasSet && !(*env)->ExceptionCheck(env)) {
+                        jmethodID addMethod = (*env)->GetMethodID(env, hsCls, "add", "(Ljava/lang/Object;)Z");
+                        if (addMethod) {
+                            for (int i = 0; i < info->aliasCount; i++) {
+                                (*env)->CallBooleanMethod(env, aliasSet, addMethod,
+                                    (*env)->NewStringUTF(env, info->aliases[i]));
+                            }
+                        }
+                        (*env)->SetObjectField(env, result, aliasSetField, aliasSet);
+                    }
+                    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+                }
+            }
+            if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+
+            /* Set CharsetICU.icuCanonicalName */
+            jfieldID icuNameField = (*env)->GetFieldID(env, charsetCls, "icuCanonicalName", "Ljava/lang/String;");
+            if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+            if (icuNameField)
+                (*env)->SetObjectField(env, result, icuNameField, (*env)->NewStringUTF(env, info->icuName));
+            if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        }
+    } else {
+        /* Fallback: try constructor (will fail if UnmodifiableSet is broken) */
+        jmethodID ctor = (*env)->GetMethodID(env, charsetCls, "<init>",
+            "(Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;)V");
+        if (ctor) {
+            jclass stringCls = (*env)->FindClass(env, "java/lang/String");
+            jobjectArray aliases = (*env)->NewObjectArray(env, info->aliasCount, stringCls, NULL);
+            for (int i = 0; i < info->aliasCount; i++) {
+                (*env)->SetObjectArrayElement(env, aliases, i, (*env)->NewStringUTF(env, info->aliases[i]));
+            }
+            result = (*env)->NewObject(env, charsetCls, ctor,
+                (*env)->NewStringUTF(env, info->name),
+                (*env)->NewStringUTF(env, info->icuName),
+                aliases);
+            if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); result = NULL; }
+        }
+    }
 
     (*env)->DeleteLocalRef(env, charsetCls);
-    (*env)->DeleteLocalRef(env, stringCls);
-    (*env)->DeleteLocalRef(env, aliases);
     return result;
 }
 
@@ -250,11 +339,13 @@ static void NativeConverter_setCallbackEncode(JNIEnv* env, jclass clazz, jlong h
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     JNIEnv* env;
+    fprintf(stderr, "[icu_jni] JNI_OnLoad entered\n");
     if ((*vm)->GetEnv(vm, (void**)&env, JNI_VERSION_1_6) != JNI_OK) return -1;
 
     /* Register Icu4cMetadata methods */
     {
         jclass cls = (*env)->FindClass(env, "com/android/icu/util/Icu4cMetadata");
+        fprintf(stderr, "[icu_jni] Icu4cMetadata FindClass: %p\n", cls);
         if (cls) {
             JNINativeMethod methods[] = {
                 {"getTzdbVersion", "()Ljava/lang/String;", (void*)Icu4cMetadata_getTzdbVersion},
@@ -270,6 +361,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     /* Register libcore.icu.ICU methods (A15 uses this class name) */
     {
         jclass cls = (*env)->FindClass(env, "libcore/icu/ICU");
+        fprintf(stderr, "[icu_jni] libcore.icu.ICU FindClass: %p\n", cls);
         if (cls) {
             JNINativeMethod methods[] = {
                 {"getIcuVersion", "()Ljava/lang/String;", (void*)Icu4cMetadata_getIcuVersion},
@@ -284,7 +376,9 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
 
     /* Register NativeConverter methods */
     {
+        fprintf(stderr, "[icu_jni] About to FindClass NativeConverter...\n");
         jclass cls = (*env)->FindClass(env, "com/android/icu/charset/NativeConverter");
+        fprintf(stderr, "[icu_jni] NativeConverter FindClass: %p\n", cls);
         if (cls) {
             JNINativeMethod methods[] = {
                 {"charsetForName", "(Ljava/lang/String;)Ljava/nio/charset/Charset;", (void*)NativeConverter_charsetForName},
@@ -304,10 +398,19 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
                 {"setCallbackDecode", "(JIILjava/lang/String;)V", (void*)NativeConverter_setCallbackDecode},
                 {"setCallbackEncode", "(JII[B)V", (void*)NativeConverter_setCallbackEncode},
             };
-            (*env)->RegisterNatives(env, cls, methods, sizeof(methods)/sizeof(methods[0]));
+            fprintf(stderr, "[icu_jni] Registering %d NativeConverter methods...\n", (int)(sizeof(methods)/sizeof(methods[0])));
+            registerNativesOrSkip(env, cls, methods, sizeof(methods)/sizeof(methods[0]));
+            fprintf(stderr, "[icu_jni] NativeConverter registration done\n");
             (*env)->DeleteLocalRef(env, cls);
+        } else {
+            fprintf(stderr, "[icu_jni] NativeConverter class NOT FOUND - checking exception\n");
+            if ((*env)->ExceptionCheck(env)) {
+                (*env)->ExceptionDescribe(env);
+                (*env)->ExceptionClear(env);
+            }
         }
     }
 
+    fprintf(stderr, "[icu_jni] JNI_OnLoad complete\n");
     return JNI_VERSION_1_6;
 }

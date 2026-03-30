@@ -914,7 +914,9 @@ bool Runtime::ParseOptions(const RuntimeOptions& raw_options,
                            bool ignore_unrecognized,
                            RuntimeArgumentMap* runtime_options) {
   Locks::Init();
+  fprintf(stderr, "[RT-DBG] Locks::Init done, calling InitLogging\n");
   InitLogging(/* argv= */ nullptr, Abort);  // Calls Locks::Init() as a side effect.
+  fprintf(stderr, "[RT-DBG] InitLogging done, calling ParsedOptions::Parse\n");
   bool parsed = ParsedOptions::Parse(raw_options, ignore_unrecognized, runtime_options);
   if (!parsed) {
     LOG(ERROR) << "Failed to parse options";

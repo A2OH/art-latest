@@ -798,6 +798,7 @@ link-dex2oat: all dex2oat-build ziparchive sigchain nativehelper fault-handler-s
 	$(CXX) -o $(BUILDDIR)/bin/dex2oat \
 	  $(TARGET_FLAGS) -static \
 	  -stdlib=libc++ \
+	  -Wl,--no-gc-sections \
 	  -fuse-ld=lld \
 	  -Wl,--unresolved-symbols=ignore-in-object-files \
 	  -Wl,--allow-multiple-definition \
