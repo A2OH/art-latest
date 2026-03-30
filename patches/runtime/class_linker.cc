@@ -1387,6 +1387,12 @@ void ClassLinker::RunRootClinits(Thread* self) {
     };
     for (const char* desc : pre_init_classes) {
       fprintf(stderr, "[CL] Pre-init: %s\n", desc); fflush(stderr);
+      // Skip VarHandle classes — their enum init uses clone() which crashes
+      // with null objects during boot image creation
+      if (strstr(desc, "VarHandle") != nullptr) {
+        fprintf(stderr, "[CL] Skipping VarHandle class: %s\n", desc);
+        continue;
+      }
       ObjPtr<mirror::Class> klass = FindSystemClass(self, desc);
       if (klass != nullptr) {
         StackHandleScope<1> hs2(self);

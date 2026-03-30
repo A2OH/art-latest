@@ -1988,6 +1988,7 @@ void UnstartedRuntime::UnstartedJNIClassGetNameNative(Thread* self,
                                                       mirror::Object* receiver,
                                                       [[maybe_unused]] uint32_t* args,
                                                       JValue* result) {
+  if (UNLIKELY(receiver == nullptr)) { result->SetL(nullptr); return; }
   StackHandleScope<1> hs(self);
   result->SetL(mirror::Class::ComputeName(hs.NewHandle(receiver->AsClass())));
 }
@@ -2022,6 +2023,10 @@ void UnstartedRuntime::UnstartedJNIObjectInternalClone(Thread* self,
                                                        mirror::Object* receiver,
                                                        [[maybe_unused]] uint32_t* args,
                                                        JValue* result) {
+  if (UNLIKELY(receiver == nullptr)) {
+    result->SetL(nullptr);
+    return;
+  }
   StackHandleScope<1> hs(self);
   Handle<mirror::Object> h_receiver = hs.NewHandle(receiver);
   result->SetL(mirror::Object::Clone(h_receiver, self));

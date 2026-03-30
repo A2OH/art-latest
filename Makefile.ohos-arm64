@@ -206,7 +206,6 @@ RUNTIME_EXCLUDE = %backtrace_helper.cc \
   %arch/arm/quick_entrypoints_cc_arm.cc \
   %arch/arm64/thread_arm64.cc \
   %arch/arm64/entrypoints_init_arm64.cc \
-  %arch/arm64/context_arm64.cc \
   %arch/arm64/fault_handler_arm64.cc \
   %arch/x86/thread_x86.cc \
   %arch/x86/entrypoints_init_x86.cc \
