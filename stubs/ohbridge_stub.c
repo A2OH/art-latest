@@ -486,25 +486,25 @@ static jlong ohb_apk_nativeLoad(JNIEnv* e, jclass c, jint format, jstring path, 
     fprintf(stderr, "[ApkAssets] nativeLoad('%s', format=%d, flags=%d)\n", p, format, flags);
     /* Return a fake but non-zero handle. The framework will use this handle
        in nativeGetStringBlock, nativeGetResourceTable, etc. */
-    jlong handle = 0xAA000000L + (++g_apk_count);
+    jlong handle = (jlong)(intptr_t)calloc(1, 4096);
     if (path) (*e)->ReleaseStringUTFChars(e, path, p);
     return handle;
 }
 static jlong ohb_apk_nativeLoadFd(JNIEnv* e, jclass c, jint format, jobject fd, jstring friendlyName, jint flags, jobject provider) {
-    return 0xAA100000L + (++g_apk_count);
+    return (jlong)(intptr_t)calloc(1, 4096);
 }
 static jlong ohb_apk_nativeLoadFromPath(JNIEnv* e, jclass c, jstring path, jboolean system) {
-    return 0xAA200000L + (++g_apk_count);
+    return (jlong)(intptr_t)calloc(1, 4096);
 }
 static void ohb_apk_nativeDestroy(JNIEnv* e, jclass c, jlong ptr) {}
-static jlong ohb_apk_nativeOpenXml(JNIEnv* e, jclass c, jlong ptr, jstring name) { return 0xAA400000L; }
+static jlong ohb_apk_nativeOpenXml(JNIEnv* e, jclass c, jlong ptr, jstring name) { return (jlong)(intptr_t)calloc(1, 4096); }
 static jstring ohb_apk_nativeGetAssetPath(JNIEnv* e, jclass c, jlong ptr) { return (*e)->NewStringUTF(e, ""); }
-static jlong ohb_apk_nativeGetStringBlock(JNIEnv* e, jclass c, jlong ptr) { return 0xAA300000L; }
+static jlong ohb_apk_nativeGetStringBlock(JNIEnv* e, jclass c, jlong ptr) { return (jlong)(intptr_t)calloc(1, 4096); }
 static jboolean ohb_apk_nativeDefinesOverlayable(JNIEnv* e, jclass c, jlong ptr) { return 0; }
 static jlong ohb_apk_nativeGetOverlayableInfo(JNIEnv* e, jclass c, jlong ptr, jstring name) { return 0; }
 /* XmlBlock natives */
-static jlong ohb_xb_nativeGetStringBlock(JNIEnv* e, jclass c, jlong ptr) { return 0xAA500000L; }
-static jlong ohb_xb_nativeCreateParseState(JNIEnv* e, jclass c, jlong ptr, jint resid) { return 0xAA600000L; }
+static jlong ohb_xb_nativeGetStringBlock(JNIEnv* e, jclass c, jlong ptr) { return (jlong)(intptr_t)calloc(1, 4096); }
+static jlong ohb_xb_nativeCreateParseState(JNIEnv* e, jclass c, jlong ptr, jint resid) { return (jlong)(intptr_t)calloc(1, 4096); }
 static jint ohb_xb_nativeNext(JNIEnv* e, jclass c, jlong state) { return 1; /* END_DOCUMENT */ }
 static jint ohb_xb_nativeGetNamespace(JNIEnv* e, jclass c, jlong state) { return -1; }
 static jint ohb_xb_nativeGetName(JNIEnv* e, jclass c, jlong state) { return -1; }
@@ -518,11 +518,11 @@ static jstring ohb_sb_nativeGetString(JNIEnv* e, jclass c, jlong ptr, jint idx) 
 static jintArray ohb_sb_nativeGetStyle(JNIEnv* e, jclass c, jlong ptr, jint idx) { return NULL; }
 static void ohb_sb_nativeDestroy(JNIEnv* e, jclass c, jlong ptr) {}
 /* AssetManager native stubs */
-static jlong ohb_am_nativeCreate(JNIEnv* e, jclass c) { return 0xDEAD0010L; }
+static jlong ohb_am_nativeCreate(JNIEnv* e, jclass c) { return (jlong)(intptr_t)calloc(1, 4096); /* real allocated memory */ }
 static void ohb_am_nativeDestroy(JNIEnv* e, jclass c, jlong p) {}
 static jlong ohb_am_nativeGetThemeFreeFunction(JNIEnv* e, jclass c) { return 0; /* no-op destructor */ }
 static void ohb_am_nativeSetApkAssets(JNIEnv* e, jclass c, jlong p, jobjectArray a, jboolean b, jboolean b2) {}
-static jlong ohb_am_nativeThemeCreate(JNIEnv* e, jclass c, jlong p) { return 0xDEAD0011L; }
+static jlong ohb_am_nativeThemeCreate(JNIEnv* e, jclass c, jlong p) { return (jlong)(intptr_t)calloc(1, 4096); }
 static void ohb_am_nativeThemeDestroy(JNIEnv* e, jclass c, jlong p) {}
 static void ohb_am_nativeSetConfiguration(JNIEnv* e, jclass c, jlong p,
     jint mcc, jint mnc, jstring locale, jobjectArray localeList,
@@ -559,11 +559,11 @@ static jint ohb_log_println(JNIEnv* e, jclass c, jint buf, jint prio, jstring ta
 static jboolean ohb_log_isLoggable(JNIEnv* e, jclass c, jstring tag, jint level) { return level >= 4; }
 static jint ohb_log_maxPayload(JNIEnv* e, jclass c) { return 4068; }
 /* Binder stubs */
-static jlong ohb_binder_getNativeBBinderHolder(JNIEnv* e, jobject t) { return 0xDEAD0002L; }
+static jlong ohb_binder_getNativeBBinderHolder(JNIEnv* e, jobject t) { return (jlong)(intptr_t)calloc(1, 256); }
 static void ohb_binder_init(JNIEnv* e, jobject t) {}
 static jlong ohb_binder_getFinalizer(JNIEnv* e, jclass c) { return 0; }
 /* Parcel stubs */
-static jlong ohb_parcel_nativeCreate(JNIEnv* e, jclass c) { return 0xDEAD0003L; }
+static jlong ohb_parcel_nativeCreate(JNIEnv* e, jclass c) { return (jlong)(intptr_t)calloc(1, 256); }
 static void ohb_parcel_nativeDestroy(JNIEnv* e, jclass c, jlong p) {}
 static void ohb_parcel_nativeFreeBuffer(JNIEnv* e, jclass c, jlong p) {}
 static jint ohb_parcel_nativeDataSize(JNIEnv* e, jclass c, jlong p) { return 0; }
@@ -571,9 +571,9 @@ static jint ohb_parcel_nativeDataAvail(JNIEnv* e, jclass c, jlong p) { return 0;
 static jint ohb_parcel_nativeDataPosition(JNIEnv* e, jclass c, jlong p) { return 0; }
 /* HardwareRenderer stubs */
 static void ohb_hwrender_nSetName(JNIEnv* e, jclass c, jlong p, jstring n) {}
-static jlong ohb_hwrender_nCreateProxy(JNIEnv* e, jclass c, jboolean b, jlong p) { return 0xDEAD0004L; }
+static jlong ohb_hwrender_nCreateProxy(JNIEnv* e, jclass c, jboolean b, jlong p) { return (jlong)(intptr_t)calloc(1, 256); }
 
-static jlong ohb_mq_nativeInit(JNIEnv* e, jobject t) { return 0xDEAD0001L; }
+static jlong ohb_mq_nativeInit(JNIEnv* e, jobject t) { return (jlong)(intptr_t)calloc(1, 256); }
 static void ohb_mq_nativeDestroy(JNIEnv* e, jobject t, jlong p) {}
 static void ohb_mq_nativePollOnce(JNIEnv* e, jobject t, jlong p, jint ms) {
     if (ms < 0) ms = 100; if (ms > 1000) ms = 1000; usleep(ms * 1000);
