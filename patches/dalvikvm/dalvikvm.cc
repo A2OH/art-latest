@@ -1643,15 +1643,9 @@ static int dalvikvm(int argc, char** argv) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = [](int sig, siginfo_t* info, void* ctx) {
-      ucontext_t* uc = (ucontext_t*)ctx;
-      fprintf(stderr, "\n[dalvikvm] CRASH: signal=%d addr=%p rip=0x%llx\n",
-              sig, info->si_addr,
-              (unsigned long long)uc->uc_mcontext.gregs[REG_RIP]);
+      fprintf(stderr, "\n[dalvikvm] CRASH: signal=%d addr=%p\n",
+              sig, info->si_addr);
       fflush(stderr);
-      // Call backtrace
-      void* bt[20];
-      int n = backtrace(bt, 20);
-      backtrace_symbols_fd(bt, n, 2);
       _exit(128 + sig);
     };
     sa.sa_flags = SA_SIGINFO;

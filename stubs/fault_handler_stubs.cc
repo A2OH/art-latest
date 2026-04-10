@@ -28,3 +28,14 @@ uintptr_t FaultManager::GetFaultSp(void*) {
 }
 
 }  // namespace art
+
+// Stub membarrier for kernel 4.9 compatibility
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <errno.h>
+
+extern "C" int membarrier(int cmd, unsigned int flags, int cpu_id) {
+    // Return success for all membarrier commands
+    // On kernel 4.9, the real syscall fails — this stub prevents crashes
+    return 0;
+}
