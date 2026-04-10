@@ -1073,6 +1073,19 @@ void Runtime::RunRootClinits(Thread* self) {
 
 bool Runtime::Start() {
   fprintf(stderr, "[RT] Runtime::Start() ENTERED\n"); fflush(stderr);
+
+  // Deferred classpath-to-BCP append (after boot image loaded successfully)
+  if (!class_path_string_.empty()) {
+    std::vector<std::string> cp_entries;
+    Split(class_path_string_, ':', &cp_entries);
+    for (const std::string& entry : cp_entries) {
+      fprintf(stderr, "[RT] Deferred BCP append: %s\n", entry.c_str());
+      boot_class_path_.push_back(entry);
+      if (!boot_class_path_locations_.empty()) {
+        boot_class_path_locations_.push_back(entry);
+      }
+    }
+  }
   VLOG(startup) << "Runtime::Start entering";
 
   CHECK(!no_sig_chain_) << "A started runtime should have sig chain enabled";
@@ -1752,19 +1765,9 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
   class_path_string_ = runtime_options.ReleaseOrDefault(Opt::ClassPath);
 
   // PATCHED: In standalone builds, the system classloader is not created (causes SEGV).
-  // Instead, append -classpath DEXes to the boot classpath so FindClass with
-  // null classloader (boot CL) can find app classes.
-  if (!class_path_string_.empty()) {
-    std::vector<std::string> cp_entries;
-    Split(class_path_string_, ':', &cp_entries);
-    for (const std::string& entry : cp_entries) {
-      fprintf(stderr, "[RT] Appending classpath entry to boot classpath: %s\n", entry.c_str());
-      boot_class_path_.push_back(entry);
-      if (!boot_class_path_locations_.empty()) {
-        boot_class_path_locations_.push_back(entry);
-      }
-    }
-  }
+  // NOTE: classpath-to-BCP append moved to AFTER boot image loading
+  // to prevent boot image validation failure.
+  // See Runtime::Start() for the deferred append.
 
   properties_ = runtime_options.ReleaseOrDefault(Opt::PropertiesList);
 

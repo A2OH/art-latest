@@ -28,3 +28,23 @@ bool ReadFileToString(const std::string& path, std::string* content, bool follow
     return false;
 }
 }}
+
+// ExecUtils vtable stub
+namespace art {
+class ExecUtils {
+public:
+  virtual ~ExecUtils() {}
+  virtual int Exec(const void* args, void* err) const { return -1; }
+};
+// Force vtable emission
+static ExecUtils __exec_utils_vtable_anchor;
+}
+
+// android::base file descriptor stubs
+namespace android { namespace base {
+int SendFileDescriptorVector(int fd, const void* data, unsigned long len, const void* fds) { return -1; }
+int ReceiveFileDescriptorVector(int fd, void* data, unsigned long len, unsigned long maxfds, void* out) { return -1; }
+}}
+
+// Log error write
+extern "C" int __android_log_error_write(int tag, const char* subTag, int uid, const char* data, int dataLen) { return 0; }

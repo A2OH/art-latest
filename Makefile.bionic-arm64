@@ -480,7 +480,7 @@ link-stubs: $(STUBS_OBJ)
 sve-stub: $(SVE_STUB_OBJ)
 	@echo "=== SVE stub (ARM64) ==="
 
-metrics-stubs: $(METRICS_STUBS_OBJ) $(BUILDDIR)/stubs/thread_cpu_stub.o
+metrics-stubs: $(METRICS_STUBS_OBJ) $(BUILDDIR)/stubs/thread_cpu_stub.o $(BUILDDIR)/stubs/exact_stubs.o
 	@echo "=== metrics stubs (ARM64) ==="
 
 # ARM64 assembly entry points
@@ -662,7 +662,7 @@ link-runtime: all ziparchive sigchain nativehelper dalvikvm-main fault-handler-s
 	  $(BUILDDIR)/stubs/template_instantiations.o \
 	  $(BUILDDIR)/fmtlib/format.o \
 	  $(BUILDDIR)/tinyxml2/tinyxml2.o \
-	  $(METRICS_STUBS_OBJ) $(BUILDDIR)/stubs/thread_cpu_stub.o \
+	  $(METRICS_STUBS_OBJ) $(BUILDDIR)/stubs/thread_cpu_stub.o $(BUILDDIR)/stubs/exact_stubs.o \
 	  $(BUILDDIR)/jni_stubs/icu_jni_stub.o \
 	  $(BUILDDIR)/jni_stubs/javacore_stub.o \
 	  $(BUILDDIR)/jni_stubs/openjdk_stub.o \
@@ -714,7 +714,7 @@ $(SVE_STUB_OBJ): $(STUBS)/code_generator_vector_arm64_sve_stub.cc
 	@$(CXX) $(CXXFLAGS) -I$(ART)/compiler/optimizing -c $< -o $@ 2>&1 && echo "OK: SVE stub" || { echo "FAIL: SVE stub"; rm -f $@; }
 
 # Metrics stubs object
-$(METRICS_STUBS_OBJ) $(BUILDDIR)/stubs/thread_cpu_stub.o: $(STUBS)/metrics_stubs.cc
+$(METRICS_STUBS_OBJ) $(BUILDDIR)/stubs/thread_cpu_stub.o $(BUILDDIR)/stubs/exact_stubs.o: $(STUBS)/metrics_stubs.cc
 	@mkdir -p $(dir $@)
 	@$(CXX) $(CXXFLAGS) -c $< -o $@ 2>&1 && echo "OK: metrics_stubs.cc" || { echo "FAIL: metrics_stubs.cc"; rm -f $@; }
 
