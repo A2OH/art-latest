@@ -913,8 +913,8 @@ void CompilerDriver::PreCompile(jobject class_loader,
       // InitializeClasses would trigger cascading failures from VarHandle circular deps
       // and cause SIGSEGV in the interpreter when virtual calls hit null objects.
       // Classes will be initialized at runtime instead.
-      LOG(WARNING) << "Skipping InitializeClasses for standalone boot image build";
-      VLOG(compiler) << "InitializeClasses (skipped): " << GetMemoryUsageString(false);
+      // InitializeClasses enabled for boot image class pre-init
+      InitializeClasses(class_loader, dex_files, timings);
     }
     {
       // Create conflict tables, as the runtime expects boot image classes to

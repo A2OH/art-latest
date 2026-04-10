@@ -995,35 +995,17 @@ class ImageSpace::Loader {
     const bool is_compressed = image_header.HasCompressedBlock();
     if (!is_compressed && allow_direct_mapping) {
       uint8_t* address = (image_reservation != nullptr) ? image_reservation->Begin() : nullptr;
-      // Try to mmap at the compiled address to avoid relocation entirely.
-      // Boot image relocation has bugs that corrupt class pointers/ThreadLocal.
-      uint8_t* compiled_begin = image_header.GetImageBegin();
       size_t map_size = CondRoundUp<kPageSizeAgnostic>(image_header.GetImageSize(), kElfSegmentAlignment);
-      MemMap map;
-      if (address == nullptr && compiled_begin != nullptr) {
-        // Try MAP_FIXED at the compiled address (our pre-reservation covers this)
-        void* fixed = mmap(compiled_begin, map_size, PROT_READ | PROT_WRITE,
-                           MAP_PRIVATE | MAP_FIXED, fd, 0);
-        if (fixed == compiled_begin) {
-          map = MemMap::MapPlaceholder(image_filename, compiled_begin, map_size);
-          fprintf(stderr, "[IMG] Loaded %s at compiled address %p (no relocation!)\n",
-                  image_filename, compiled_begin);
-          fflush(stderr);
-        } else {
-          if (fixed != MAP_FAILED) munmap(fixed, map_size);
-          fprintf(stderr, "[IMG] MAP_FIXED at %p failed for %s, falling back\n",
-                  compiled_begin, image_filename);
-          fflush(stderr);
-        }
-      }
-      if (!map.IsValid()) {
-        // Fallback: let ART choose the address (will need relocation)
-        map = MemMap::MapFileAtAddress(
-            address, map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd,
-            /*start=*/0, /*low_4gb=*/true, image_filename,
-            /*reuse=*/false, image_reservation, error_msg);
-      }
+      // Map via the reservation (which is at the compiled address).
+      // MapFileAtAddress with reservation uses MAP_FIXED at reservation->Begin().
+      MemMap map = MemMap::MapFileAtAddress(
+          address, map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd,
+          /*start=*/0, /*low_4gb=*/true, image_filename,
+          /*reuse=*/false, image_reservation, error_msg);
       if (map.IsValid()) {
+        fprintf(stderr, "[IMG] Loaded %s at %p (size=0x%zx)\n",
+                image_filename, map.Begin(), map.Size());
+        fflush(stderr);
         Runtime::MadviseFileForRange(
             madvise_size_limit, map.Size(), map.Begin(), map.End(), image_filename);
       }
@@ -2309,15 +2291,32 @@ class ImageSpace::BootImageLoader {
     }
 
     // Reserve address space at the compiled base address to avoid relocation.
-    // Boot image relocation has bugs that corrupt ThreadLocal and class pointers.
+    // Cross-compiled boot images have absolute pointers baked in; loading at
+    // a different address requires relocation which is fragile for cross-ISA images.
     uint8_t* addr = reinterpret_cast<uint8_t*>(base_address);
-    fprintf(stderr, "[IMG] Reserving at compiled address 0x%x (no ASLR)\n", base_address);
+    uint32_t total_size = image_reservation_size + extra_reservation_size;
+    fprintf(stderr, "[IMG] Reserving 0x%x bytes at compiled address 0x%x\n", total_size, base_address);
     fflush(stderr);
     MemMap image_reservation =
-        ReserveBootImageMemory(addr, image_reservation_size + extra_reservation_size, error_msg);
+        ReserveBootImageMemory(addr, total_size, error_msg);
     if (!image_reservation.IsValid()) {
       return false;
     }
+    // Verify we got the compiled address. MapAnonymous uses addr as a hint,
+    // not a requirement. If the kernel placed us elsewhere, the image's baked-in
+    // pointers (image_methods_, image_roots_, etc.) will be wrong.
+    if (image_reservation.Begin() != addr) {
+      fprintf(stderr, "[IMG] WARNING: reservation at %p instead of %p (diff=0x%lx)\n",
+              image_reservation.Begin(), addr,
+              (long)(image_reservation.Begin() - addr));
+      fflush(stderr);
+      // Fall back to imageless mode rather than crash with corrupt pointers.
+      *error_msg = StringPrintf("Boot image reservation at %p instead of compiled address %p",
+                                image_reservation.Begin(), addr);
+      return false;
+    }
+    fprintf(stderr, "[IMG] Reservation OK at %p\n", image_reservation.Begin());
+    fflush(stderr);
 
     // Load components.
     std::vector<std::unique_ptr<ImageSpace>> spaces;
@@ -2679,24 +2678,7 @@ class ImageSpace::BootImageLoader {
             fflush(stderr);
             continue;
           }
-          // Validate class before visiting: check that the first reference
-          {
-            bool safe = (class_class != nullptr &&
-                         reinterpret_cast<uintptr_t>(class_class.Ptr()) >= 0x10000);
-            if (!safe) {
-              fprintf(stderr, "[IMG] Skipping class at %p: class_class=%p\n", klass.Ptr(), class_class.Ptr());
-              fflush(stderr);
-            }
-            if (false) {  // disable old check
-              safe = false;
-            }
-            if (safe) {
-              // VisitClass relocated to skip on ARM64 (hangs on corrupt class data)
-#if !defined(__aarch64__)
-              main_patch_object_visitor.VisitClass(klass, class_class);
-#endif
-            }
-          }
+          main_patch_object_visitor.VisitClass(klass, class_class);
           // Then patch the non-embedded vtable and iftable.
           ObjPtr<mirror::PointerArray> vtable =
               klass->GetVTable<kVerifyNone, kWithoutReadBarrier>();
@@ -2732,12 +2714,6 @@ class ImageSpace::BootImageLoader {
       uint32_t objects_end = image_header.GetObjectsSection().Size();
       DCHECK_ALIGNED(objects_end, kObjectAlignment);
       fprintf(stderr, "[IMG] Objects loop: %u objects to patch\n", objects_end); fflush(stderr);
-#if defined(__aarch64__)
-      // Skip objects loop on ARM64 — corrupt object data causes infinite loops
-      // The boot image data is usable without full relocation for interpreter mode
-      fprintf(stderr, "[IMG] Skipping objects loop on ARM64\n"); fflush(stderr);
-      if (false)
-#endif
       for (uint32_t pos = sizeof(ImageHeader); pos != objects_end; ) {
         mirror::Object* object = reinterpret_cast<mirror::Object*>(space->Begin() + pos);
         // Note: use Test() rather than Set() as this is the last time we're checking this object.
@@ -2792,17 +2768,18 @@ class ImageSpace::BootImageLoader {
                            TimingLogger* logger)
       REQUIRES_SHARED(Locks::mutator_lock_) {
     TimingLogger::ScopedTiming timing("MaybeRelocateSpaces", logger);
-#if defined(__aarch64__)
-    // Skip relocation on ARM64 standalone build — the VisitPackedArtMethods
-    // loop hangs on corrupt method data. Classes are loaded from DEX at runtime.
-    fprintf(stderr, "[IMG] Skipping MaybeRelocateSpaces on ARM64\n"); fflush(stderr);
-    return;
-#endif
+    // NOTE: Previously skipped on ARM64 due to hangs, but the real issue was
+    // the image being mapped at the wrong address. With the reservation check
+    // above, we now guarantee diff=0, so DoRelocateSpaces returns immediately.
     ImageSpace* first_space = spaces.front().get();
     const ImageHeader& first_space_header = first_space->GetImageHeader();
     int64_t base_diff64 =
         static_cast<int64_t>(reinterpret_cast32<uint32_t>(first_space->Begin())) -
         static_cast<int64_t>(reinterpret_cast32<uint32_t>(first_space_header.GetImageBegin()));
+    fprintf(stderr, "[IMG] MaybeRelocateSpaces: actual=%p compiled=%p diff=%lld\n",
+            first_space->Begin(), first_space_header.GetImageBegin(),
+            (long long)base_diff64);
+    fflush(stderr);
     if (!relocate_) {
       DCHECK_EQ(base_diff64, 0);
     }

@@ -98,7 +98,11 @@ static jint linux_getppid(JNIEnv* env, jobject thiz) { return getppid(); }
 
 /* sysconf */
 static jlong linux_sysconf(JNIEnv* env, jobject thiz, jint name) {
+    /* Westlake: clamp processor count to 4 — bionic static sysconf returns garbage on some devices */
     long result = sysconf((int)name);
+    if ((name == _SC_NPROCESSORS_CONF || name == _SC_NPROCESSORS_ONLN) && (result <= 0 || result > 64)) {
+        result = 4;
+    }
     return (jlong)result;
 }
 
@@ -109,12 +113,9 @@ static jboolean linux_isatty(JNIEnv* env, jobject thiz, jobject fdObj) {
 }
 
 /* writeBytes(FileDescriptor fd, Object buffer, int offset, int byteCount) */
-static int writeBytes_called = 0;
 static jint linux_writeBytes(JNIEnv* env, jobject thiz,
                               jobject fdObj, jobject buffer, jint offset, jint byteCount) {
-    if (writeBytes_called++ < 3) fprintf(stderr, "[javacore] linux_writeBytes called (fd_obj=%p, count=%d)\n", fdObj, byteCount);
     int fd = getFd(env, fdObj);
-    if (writeBytes_called <= 3) fprintf(stderr, "[javacore]   fd=%d\n", fd);
     if (fd < 0) {
         throwErrnoException(env, "write", EBADF);
         return -1;
@@ -571,16 +572,516 @@ static void OsConstants_initConstants(JNIEnv* env, jclass clazz) {
     #undef SET_INT
 }
 
+/* ==================== libcore.io.Memory stubs ==================== */
+
+static jbyte Memory_peekByte(JNIEnv* env, jclass cls, jlong address) {
+    return *(jbyte*)(uintptr_t)address;
+}
+static void Memory_pokeByte(JNIEnv* env, jclass cls, jlong address, jbyte value) {
+    *(jbyte*)(uintptr_t)address = value;
+}
+static jint Memory_peekIntNative(JNIEnv* env, jclass cls, jlong address) {
+    return *(jint*)(uintptr_t)address;
+}
+static void Memory_pokeIntNative(JNIEnv* env, jclass cls, jlong address, jint value) {
+    *(jint*)(uintptr_t)address = value;
+}
+static jlong Memory_peekLongNative(JNIEnv* env, jclass cls, jlong address) {
+    return *(jlong*)(uintptr_t)address;
+}
+static void Memory_pokeLongNative(JNIEnv* env, jclass cls, jlong address, jlong value) {
+    *(jlong*)(uintptr_t)address = value;
+}
+static jshort Memory_peekShortNative(JNIEnv* env, jclass cls, jlong address) {
+    return *(jshort*)(uintptr_t)address;
+}
+static void Memory_pokeShortNative(JNIEnv* env, jclass cls, jlong address, jshort value) {
+    *(jshort*)(uintptr_t)address = value;
+}
+static void Memory_peekByteArray(JNIEnv* env, jclass cls, jlong address, jbyteArray dst, jint dstOffset, jint count) {
+    jbyte* ptr = (jbyte*)(uintptr_t)address;
+    (*env)->SetByteArrayRegion(env, dst, dstOffset, count, ptr);
+}
+static void Memory_peekCharArray(JNIEnv* env, jclass cls, jlong address, jcharArray dst, jint dstOffset, jint count, jboolean swap) {
+    jchar* ptr = (jchar*)(uintptr_t)address;
+    (*env)->SetCharArrayRegion(env, dst, dstOffset, count, ptr);
+}
+static void Memory_peekIntArray(JNIEnv* env, jclass cls, jlong address, jintArray dst, jint dstOffset, jint count, jboolean swap) {
+    jint* ptr = (jint*)(uintptr_t)address;
+    (*env)->SetIntArrayRegion(env, dst, dstOffset, count, ptr);
+}
+static void Memory_peekShortArray(JNIEnv* env, jclass cls, jlong address, jshortArray dst, jint dstOffset, jint count, jboolean swap) {
+    jshort* ptr = (jshort*)(uintptr_t)address;
+    (*env)->SetShortArrayRegion(env, dst, dstOffset, count, ptr);
+}
+static void Memory_peekLongArray(JNIEnv* env, jclass cls, jlong address, jlongArray dst, jint dstOffset, jint count, jboolean swap) {
+    jlong* ptr = (jlong*)(uintptr_t)address;
+    (*env)->SetLongArrayRegion(env, dst, dstOffset, count, ptr);
+}
+static void Memory_peekFloatArray(JNIEnv* env, jclass cls, jlong address, jfloatArray dst, jint dstOffset, jint count, jboolean swap) {
+    jfloat* ptr = (jfloat*)(uintptr_t)address;
+    (*env)->SetFloatArrayRegion(env, dst, dstOffset, count, ptr);
+}
+static void Memory_peekDoubleArray(JNIEnv* env, jclass cls, jlong address, jdoubleArray dst, jint dstOffset, jint count, jboolean swap) {
+    jdouble* ptr = (jdouble*)(uintptr_t)address;
+    (*env)->SetDoubleArrayRegion(env, dst, dstOffset, count, ptr);
+}
+static void Memory_memmove(JNIEnv* env, jclass cls, jobject dstObj, jint dstOff, jobject srcObj, jint srcOff, jlong count) {
+    if (!dstObj || !srcObj || count <= 0) return;
+    jbyte* dst = (jbyte*)(*env)->GetPrimitiveArrayCritical(env, dstObj, NULL);
+    jbyte* src = (jbyte*)(*env)->GetPrimitiveArrayCritical(env, srcObj, NULL);
+    if (dst && src) memmove(dst + dstOff, src + srcOff, (size_t)count);
+    if (src) (*env)->ReleasePrimitiveArrayCritical(env, srcObj, src, JNI_ABORT);
+    if (dst) (*env)->ReleasePrimitiveArrayCritical(env, dstObj, dst, 0);
+}
+
+/* ==================== NativeBN stubs (BigInteger/BigDecimal) ==================== */
+/* Minimal BigNum using malloc'd long value + sign bit */
+typedef struct { long val; int neg; } SimpleBN;
+static void nativeBN_free(void* ptr) { if (ptr) free(ptr); }
+
+static jlong NativeBN_getNativeFinalizer(JNIEnv* env, jclass cls) {
+    return (jlong)(void*)nativeBN_free;
+}
+static jlong NativeBN_BN_new(JNIEnv* env, jclass cls) {
+    SimpleBN* bn = (SimpleBN*)calloc(1, sizeof(SimpleBN));
+    return (jlong)(uintptr_t)bn;
+}
+static void NativeBN_BN_free(JNIEnv* env, jclass cls, jlong a) {
+    if (a) free((void*)(uintptr_t)a);
+}
+static void NativeBN_putLongInt(JNIEnv* env, jclass cls, jlong a, jlong dw) {
+    SimpleBN* bn = (SimpleBN*)(uintptr_t)a;
+    if (bn) { bn->val = dw < 0 ? -dw : dw; bn->neg = dw < 0 ? 1 : 0; }
+}
+static void NativeBN_putULongInt(JNIEnv* env, jclass cls, jlong a, jlong dw, jboolean neg) {
+    SimpleBN* bn = (SimpleBN*)(uintptr_t)a;
+    if (bn) { bn->val = dw; bn->neg = neg ? 1 : 0; }
+}
+static jlong NativeBN_longInt(JNIEnv* env, jclass cls, jlong a) {
+    SimpleBN* bn = (SimpleBN*)(uintptr_t)a;
+    if (!bn) return 0;
+    return bn->neg ? -bn->val : bn->val;
+}
+static jint NativeBN_sign(JNIEnv* env, jclass cls, jlong a) {
+    SimpleBN* bn = (SimpleBN*)(uintptr_t)a;
+    if (!bn || bn->val == 0) return 0;
+    return bn->neg ? -1 : 1;
+}
+static jint NativeBN_bitLength(JNIEnv* env, jclass cls, jlong a) {
+    SimpleBN* bn = (SimpleBN*)(uintptr_t)a;
+    if (!bn || bn->val == 0) return 0;
+    long v = bn->val;
+    int bits = 0;
+    while (v > 0) { bits++; v >>= 1; }
+    return bits;
+}
+static jint NativeBN_BN_cmp(JNIEnv* env, jclass cls, jlong a, jlong b) {
+    SimpleBN* ba = (SimpleBN*)(uintptr_t)a;
+    SimpleBN* bb = (SimpleBN*)(uintptr_t)b;
+    if (!ba || !bb) return 0;
+    long va = ba->neg ? -ba->val : ba->val;
+    long vb = bb->neg ? -bb->val : bb->val;
+    return va < vb ? -1 : va > vb ? 1 : 0;
+}
+static void NativeBN_BN_copy(JNIEnv* env, jclass cls, jlong to, jlong from) {
+    SimpleBN* bt = (SimpleBN*)(uintptr_t)to;
+    SimpleBN* bf = (SimpleBN*)(uintptr_t)from;
+    if (bt && bf) { bt->val = bf->val; bt->neg = bf->neg; }
+}
+static jstring NativeBN_BN_bn2dec(JNIEnv* env, jclass cls, jlong a) {
+    SimpleBN* bn = (SimpleBN*)(uintptr_t)a;
+    char buf[32];
+    if (!bn) { snprintf(buf, sizeof(buf), "0"); }
+    else { snprintf(buf, sizeof(buf), "%s%ld", bn->neg ? "-" : "", bn->val); }
+    return (*env)->NewStringUTF(env, buf);
+}
+static jstring NativeBN_BN_bn2hex(JNIEnv* env, jclass cls, jlong a) {
+    SimpleBN* bn = (SimpleBN*)(uintptr_t)a;
+    char buf[32];
+    if (!bn) { snprintf(buf, sizeof(buf), "0"); }
+    else { snprintf(buf, sizeof(buf), "%s%lX", bn->neg ? "-" : "", bn->val); }
+    return (*env)->NewStringUTF(env, buf);
+}
+static jint NativeBN_BN_dec2bn(JNIEnv* env, jclass cls, jlong a, jstring str) {
+    SimpleBN* bn = (SimpleBN*)(uintptr_t)a;
+    if (!bn || !str) return 0;
+    const char* s = (*env)->GetStringUTFChars(env, str, NULL);
+    long v = atol(s);
+    (*env)->ReleaseStringUTFChars(env, str, s);
+    bn->neg = v < 0 ? 1 : 0;
+    bn->val = v < 0 ? -v : v;
+    return 1;
+}
+static jint NativeBN_BN_hex2bn(JNIEnv* env, jclass cls, jlong a, jstring str) {
+    SimpleBN* bn = (SimpleBN*)(uintptr_t)a;
+    if (!bn || !str) return 0;
+    const char* s = (*env)->GetStringUTFChars(env, str, NULL);
+    long v = strtol(s, NULL, 16);
+    (*env)->ReleaseStringUTFChars(env, str, s);
+    bn->neg = v < 0 ? 1 : 0;
+    bn->val = v < 0 ? -v : v;
+    return 1;
+}
+static void NativeBN_BN_set_negative(JNIEnv* env, jclass cls, jlong b, jint n) {
+    SimpleBN* bn = (SimpleBN*)(uintptr_t)b;
+    if (bn) bn->neg = n ? 1 : 0;
+}
+static jboolean NativeBN_BN_is_bit_set(JNIEnv* env, jclass cls, jlong a, jint n) {
+    SimpleBN* bn = (SimpleBN*)(uintptr_t)a;
+    if (!bn || n < 0 || n >= 64) return JNI_FALSE;
+    return (bn->val >> n) & 1 ? JNI_TRUE : JNI_FALSE;
+}
+static void NativeBN_BN_shift(JNIEnv* env, jclass cls, jlong r, jlong a, jint n) {
+    SimpleBN* br = (SimpleBN*)(uintptr_t)r;
+    SimpleBN* ba = (SimpleBN*)(uintptr_t)a;
+    if (!br || !ba) return;
+    br->neg = ba->neg;
+    if (n >= 0) br->val = ba->val << n;
+    else br->val = ba->val >> (-n);
+}
+static void NativeBN_BN_add_word(JNIEnv* env, jclass cls, jlong a, jint w) {
+    SimpleBN* bn = (SimpleBN*)(uintptr_t)a;
+    if (bn) bn->val += w;
+}
+static void NativeBN_BN_mul_word(JNIEnv* env, jclass cls, jlong a, jint w) {
+    SimpleBN* bn = (SimpleBN*)(uintptr_t)a;
+    if (bn) bn->val *= w;
+}
+static jint NativeBN_BN_mod_word(JNIEnv* env, jclass cls, jlong a, jint w) {
+    SimpleBN* bn = (SimpleBN*)(uintptr_t)a;
+    if (!bn || w == 0) return 0;
+    return (jint)(bn->val % w);
+}
+static void NativeBN_BN_add(JNIEnv* env, jclass cls, jlong r, jlong a, jlong b) {
+    SimpleBN* br = (SimpleBN*)(uintptr_t)r;
+    SimpleBN* ba = (SimpleBN*)(uintptr_t)a;
+    SimpleBN* bb = (SimpleBN*)(uintptr_t)b;
+    if (!br || !ba || !bb) return;
+    long va = ba->neg ? -ba->val : ba->val;
+    long vb = bb->neg ? -bb->val : bb->val;
+    long vr = va + vb;
+    br->neg = vr < 0 ? 1 : 0;
+    br->val = vr < 0 ? -vr : vr;
+}
+/* Stubs for less-used methods */
+static void NativeBN_BN_bin2bn(JNIEnv* env, jclass cls, jbyteArray s, jint len, jboolean neg, jlong ret) {
+    SimpleBN* bn = (SimpleBN*)(uintptr_t)ret;
+    if (!bn || !s) return;
+    jbyte* data = (*env)->GetByteArrayElements(env, s, NULL);
+    long v = 0;
+    for (int i = 0; i < len && i < 8; i++) v = (v << 8) | (data[i] & 0xFF);
+    (*env)->ReleaseByteArrayElements(env, s, data, JNI_ABORT);
+    bn->val = v; bn->neg = neg ? 1 : 0;
+}
+static jbyteArray NativeBN_BN_bn2bin(JNIEnv* env, jclass cls, jlong a) {
+    SimpleBN* bn = (SimpleBN*)(uintptr_t)a;
+    if (!bn) { jbyteArray r = (*env)->NewByteArray(env, 1); return r; }
+    long v = bn->val;
+    int bytes = 0; long tmp = v;
+    do { bytes++; tmp >>= 8; } while (tmp > 0);
+    jbyteArray r = (*env)->NewByteArray(env, bytes);
+    jbyte buf[8];
+    for (int i = bytes - 1; i >= 0; i--) { buf[i] = (jbyte)(v & 0xFF); v >>= 8; }
+    (*env)->SetByteArrayRegion(env, r, 0, bytes, buf);
+    return r;
+}
+static void NativeBN_litEndInts2bn(JNIEnv* env, jclass cls, jintArray ints, jint len, jboolean neg, jlong ret) {
+    SimpleBN* bn = (SimpleBN*)(uintptr_t)ret;
+    if (!bn || !ints || len == 0) return;
+    jint* data = (*env)->GetIntArrayElements(env, ints, NULL);
+    long v = 0;
+    for (int i = len - 1; i >= 0 && i < 2; i--) v = (v << 32) | ((long)data[i] & 0xFFFFFFFFL);
+    (*env)->ReleaseIntArrayElements(env, ints, data, JNI_ABORT);
+    bn->val = v; bn->neg = neg ? 1 : 0;
+}
+static jintArray NativeBN_bn2litEndInts(JNIEnv* env, jclass cls, jlong a) {
+    SimpleBN* bn = (SimpleBN*)(uintptr_t)a;
+    long v = bn ? bn->val : 0;
+    int count = v > 0xFFFFFFFFL ? 2 : 1;
+    jintArray r = (*env)->NewIntArray(env, count);
+    jint buf[2] = { (jint)(v & 0xFFFFFFFFL), (jint)((v >> 32) & 0xFFFFFFFFL) };
+    (*env)->SetIntArrayRegion(env, r, 0, count, buf);
+    return r;
+}
+static void NativeBN_twosComp2bn(JNIEnv* env, jclass cls, jbyteArray s, jint len, jlong ret) {
+    NativeBN_BN_bin2bn(env, cls, s, len, 0, ret);
+}
+
+/* NativeBN arithmetic operations */
+static void NativeBN_BN_sub(JNIEnv* env, jclass cls, jlong r, jlong a, jlong b) {
+    SimpleBN* br = (SimpleBN*)(uintptr_t)r;
+    SimpleBN* ba = (SimpleBN*)(uintptr_t)a;
+    SimpleBN* bb = (SimpleBN*)(uintptr_t)b;
+    if (!br || !ba || !bb) return;
+    long va = ba->neg ? -ba->val : ba->val;
+    long vb = bb->neg ? -bb->val : bb->val;
+    long vr = va - vb;
+    br->neg = vr < 0 ? 1 : 0; br->val = vr < 0 ? -vr : vr;
+}
+static void NativeBN_BN_mul(JNIEnv* env, jclass cls, jlong r, jlong a, jlong b) {
+    SimpleBN* br = (SimpleBN*)(uintptr_t)r;
+    SimpleBN* ba = (SimpleBN*)(uintptr_t)a;
+    SimpleBN* bb = (SimpleBN*)(uintptr_t)b;
+    if (!br || !ba || !bb) return;
+    br->val = ba->val * bb->val;
+    br->neg = (ba->neg != bb->neg) ? 1 : 0;
+    if (br->val == 0) br->neg = 0;
+}
+static void NativeBN_BN_div(JNIEnv* env, jclass cls, jlong dv, jlong rem, jlong m, jlong d) {
+    SimpleBN* bdv = (SimpleBN*)(uintptr_t)dv;
+    SimpleBN* brem = (SimpleBN*)(uintptr_t)rem;
+    SimpleBN* bm = (SimpleBN*)(uintptr_t)m;
+    SimpleBN* bd = (SimpleBN*)(uintptr_t)d;
+    if (!bm || !bd || bd->val == 0) return;
+    long vm = bm->neg ? -bm->val : bm->val;
+    long vd = bd->neg ? -bd->val : bd->val;
+    if (bdv) { long q = vm / vd; bdv->neg = q < 0 ? 1 : 0; bdv->val = q < 0 ? -q : q; }
+    if (brem) { long r2 = vm % vd; brem->neg = r2 < 0 ? 1 : 0; brem->val = r2 < 0 ? -r2 : r2; }
+}
+static void NativeBN_BN_exp(JNIEnv* env, jclass cls, jlong r, jlong a, jlong p) {
+    SimpleBN* br = (SimpleBN*)(uintptr_t)r;
+    SimpleBN* ba = (SimpleBN*)(uintptr_t)a;
+    SimpleBN* bp = (SimpleBN*)(uintptr_t)p;
+    if (!br || !ba || !bp) return;
+    long base = ba->val, exp = bp->val, result = 1;
+    for (long i = 0; i < exp && i < 62; i++) result *= base;
+    br->val = result; br->neg = (ba->neg && (exp & 1)) ? 1 : 0;
+}
+static void NativeBN_BN_gcd(JNIEnv* env, jclass cls, jlong r, jlong a, jlong b) {
+    SimpleBN* br = (SimpleBN*)(uintptr_t)r;
+    SimpleBN* ba = (SimpleBN*)(uintptr_t)a;
+    SimpleBN* bb = (SimpleBN*)(uintptr_t)b;
+    if (!br || !ba || !bb) return;
+    long x = ba->val, y = bb->val;
+    while (y != 0) { long t = y; y = x % y; x = t; }
+    br->val = x; br->neg = 0;
+}
+static void NativeBN_BN_nnmod(JNIEnv* env, jclass cls, jlong r, jlong a, jlong m) {
+    SimpleBN* br = (SimpleBN*)(uintptr_t)r;
+    SimpleBN* ba = (SimpleBN*)(uintptr_t)a;
+    SimpleBN* bm = (SimpleBN*)(uintptr_t)m;
+    if (!br || !ba || !bm || bm->val == 0) return;
+    long va = ba->neg ? -ba->val : ba->val;
+    long vr = va % bm->val;
+    if (vr < 0) vr += bm->val;
+    br->val = vr; br->neg = 0;
+}
+static void NativeBN_BN_mod_exp(JNIEnv* env, jclass cls, jlong r, jlong a, jlong p, jlong m) {
+    SimpleBN* br = (SimpleBN*)(uintptr_t)r;
+    SimpleBN* ba = (SimpleBN*)(uintptr_t)a;
+    SimpleBN* bp = (SimpleBN*)(uintptr_t)p;
+    SimpleBN* bm = (SimpleBN*)(uintptr_t)m;
+    if (!br || !ba || !bp || !bm || bm->val == 0) return;
+    long base = ba->val % bm->val, exp = bp->val, mod = bm->val, result = 1;
+    base %= mod;
+    while (exp > 0) {
+        if (exp & 1) result = (result * base) % mod;
+        exp >>= 1; base = (base * base) % mod;
+    }
+    br->val = result; br->neg = 0;
+}
+static void NativeBN_BN_mod_inverse(JNIEnv* env, jclass cls, jlong ret, jlong a, jlong n) {
+    SimpleBN* br = (SimpleBN*)(uintptr_t)ret;
+    if (br) { br->val = 1; br->neg = 0; } /* stub */
+}
+static void NativeBN_BN_generate_prime_ex(JNIEnv* env, jclass cls, jlong ret, jint bits,
+        jboolean safe, jlong add, jlong rem) {
+    SimpleBN* br = (SimpleBN*)(uintptr_t)ret;
+    if (br) { br->val = (1L << (bits > 62 ? 62 : bits)) - 1; br->neg = 0; }
+}
+static jboolean NativeBN_BN_primality_test(JNIEnv* env, jclass cls, jlong candidate,
+        jint checks, jboolean trial) {
+    return JNI_FALSE; /* not prime — safe default */
+}
+
+/* ==================== ICU / LocaleData stubs ==================== */
+
+/* Helper to set a String field on LocaleData */
+static void ld_setString(JNIEnv* env, jobject ld, jclass cls, const char* name, const char* val) {
+    jfieldID f = (*env)->GetFieldID(env, cls, name, "Ljava/lang/String;");
+    if (f) (*env)->SetObjectField(env, ld, f, (*env)->NewStringUTF(env, val));
+    else (*env)->ExceptionClear(env);
+}
+/* Helper to set a char field */
+static void ld_setChar(JNIEnv* env, jobject ld, jclass cls, const char* name, jchar val) {
+    jfieldID f = (*env)->GetFieldID(env, cls, name, "C");
+    if (f) (*env)->SetCharField(env, ld, f, val);
+    else (*env)->ExceptionClear(env);
+}
+/* Helper to set an Integer field */
+static void ld_setInteger(JNIEnv* env, jobject ld, jclass cls, const char* name, int val) {
+    jfieldID f = (*env)->GetFieldID(env, cls, name, "Ljava/lang/Integer;");
+    if (!f) { (*env)->ExceptionClear(env); return; }
+    jclass intCls = (*env)->FindClass(env, "java/lang/Integer");
+    jmethodID valueOf = (*env)->GetStaticMethodID(env, intCls, "valueOf", "(I)Ljava/lang/Integer;");
+    jobject obj = (*env)->CallStaticObjectMethod(env, intCls, valueOf, val);
+    (*env)->SetObjectField(env, ld, f, obj);
+}
+/* Helper to set a String[] field */
+static void ld_setStringArray(JNIEnv* env, jobject ld, jclass cls, const char* name,
+                              const char** vals, int count) {
+    jfieldID f = (*env)->GetFieldID(env, cls, name, "[Ljava/lang/String;");
+    if (!f) { (*env)->ExceptionClear(env); return; }
+    jclass strCls = (*env)->FindClass(env, "java/lang/String");
+    jobjectArray arr = (*env)->NewObjectArray(env, count, strCls, NULL);
+    for (int i = 0; i < count; i++)
+        (*env)->SetObjectArrayElement(env, arr, i, (*env)->NewStringUTF(env, vals[i]));
+    (*env)->SetObjectField(env, ld, f, arr);
+}
+
+/* getBestDateTimePatternNative(skeleton, languageTag) → pattern string */
+static jstring ICU_getBestDateTimePatternNative(JNIEnv* env, jclass cls,
+        jstring skeleton, jstring languageTag) {
+    return skeleton ? skeleton : (*env)->NewStringUTF(env, "yyyy-MM-dd HH:mm:ss");
+}
+static jstring ICU_getCurrencyCode(JNIEnv* env, jclass cls, jstring countryCode) {
+    return (*env)->NewStringUTF(env, "USD");
+}
+static jstring ICU_getISO3Country(JNIEnv* env, jclass cls, jstring languageTag) {
+    return (*env)->NewStringUTF(env, "USA");
+}
+static jstring ICU_getISO3Language(JNIEnv* env, jclass cls, jstring languageTag) {
+    return (*env)->NewStringUTF(env, "eng");
+}
+static jstring ICU_getScript(JNIEnv* env, jclass cls, jstring locale) {
+    return (*env)->NewStringUTF(env, "");
+}
+static jobjectArray ICU_getISOLanguagesNative(JNIEnv* env, jclass cls) {
+    jclass strCls = (*env)->FindClass(env, "java/lang/String");
+    jobjectArray arr = (*env)->NewObjectArray(env, 1, strCls, NULL);
+    (*env)->SetObjectArrayElement(env, arr, 0, (*env)->NewStringUTF(env, "en"));
+    return arr;
+}
+static jobjectArray ICU_getISOCountriesNative(JNIEnv* env, jclass cls) {
+    jclass strCls = (*env)->FindClass(env, "java/lang/String");
+    jobjectArray arr = (*env)->NewObjectArray(env, 1, strCls, NULL);
+    (*env)->SetObjectArrayElement(env, arr, 0, (*env)->NewStringUTF(env, "US"));
+    return arr;
+}
+static jobjectArray ICU_getAvailableLocalesNative(JNIEnv* env, jclass cls) {
+    jclass strCls = (*env)->FindClass(env, "java/lang/String");
+    const char* locales[] = {"en_US", "en", ""};
+    jobjectArray arr = (*env)->NewObjectArray(env, 3, strCls, NULL);
+    for (int i = 0; i < 3; i++)
+        (*env)->SetObjectArrayElement(env, arr, i, (*env)->NewStringUTF(env, locales[i]));
+    return arr;
+}
+static void ICU_setDefaultLocale(JNIEnv* env, jclass cls, jstring languageTag) { /* no-op */ }
+static jstring ICU_getDefaultLocale(JNIEnv* env, jclass cls) {
+    return (*env)->NewStringUTF(env, "en_US");
+}
+
+static jboolean ICU_initLocaleDataNative(JNIEnv* env, jclass thiz,
+        jstring languageTag, jobject localeData) {
+    jclass cls = (*env)->GetObjectClass(env, localeData);
+    if (!cls) return JNI_FALSE;
+
+    /* Calendar */
+    ld_setInteger(env, localeData, cls, "firstDayOfWeek", 1);         /* Sunday */
+    ld_setInteger(env, localeData, cls, "minimalDaysInFirstWeek", 1);
+
+    /* AM/PM */
+    const char* amPm[] = {"AM", "PM"};
+    ld_setStringArray(env, localeData, cls, "amPm", amPm, 2);
+
+    /* Month names (13 entries — Java Calendar months are 0-based, 12=Undecimber) */
+    const char* longMonths[] = {"January","February","March","April","May","June",
+        "July","August","September","October","November","December",""};
+    const char* shortMonths[] = {"Jan","Feb","Mar","Apr","May","Jun",
+        "Jul","Aug","Sep","Oct","Nov","Dec",""};
+    const char* tinyMonths[] = {"J","F","M","A","M","J","J","A","S","O","N","D",""};
+    ld_setStringArray(env, localeData, cls, "longMonthNames", longMonths, 13);
+    ld_setStringArray(env, localeData, cls, "shortMonthNames", shortMonths, 13);
+    ld_setStringArray(env, localeData, cls, "tinyMonthNames", tinyMonths, 13);
+    ld_setStringArray(env, localeData, cls, "longStandAloneMonthNames", longMonths, 13);
+    ld_setStringArray(env, localeData, cls, "shortStandAloneMonthNames", shortMonths, 13);
+    ld_setStringArray(env, localeData, cls, "tinyStandAloneMonthNames", tinyMonths, 13);
+
+    /* Weekday names (8 entries — Java Calendar days are 1-based, index 0 is empty) */
+    const char* longDays[] = {"","Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"};
+    const char* shortDays[] = {"","Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+    const char* tinyDays[] = {"","S","M","T","W","T","F","S"};
+    ld_setStringArray(env, localeData, cls, "longWeekdayNames", longDays, 8);
+    ld_setStringArray(env, localeData, cls, "shortWeekdayNames", shortDays, 8);
+    ld_setStringArray(env, localeData, cls, "tinyWeekdayNames", tinyDays, 8);
+    ld_setStringArray(env, localeData, cls, "longStandAloneWeekdayNames", longDays, 8);
+    ld_setStringArray(env, localeData, cls, "shortStandAloneWeekdayNames", shortDays, 8);
+    ld_setStringArray(env, localeData, cls, "tinyStandAloneWeekdayNames", tinyDays, 8);
+
+    /* Eras */
+    const char* eras[] = {"BC", "AD"};
+    ld_setStringArray(env, localeData, cls, "eras", eras, 2);
+
+    /* Relative days */
+    ld_setString(env, localeData, cls, "yesterday", "Yesterday");
+    ld_setString(env, localeData, cls, "today", "Today");
+    ld_setString(env, localeData, cls, "tomorrow", "Tomorrow");
+
+    /* Time/date formats */
+    ld_setString(env, localeData, cls, "fullTimeFormat", "h:mm:ss a zzzz");
+    ld_setString(env, localeData, cls, "longTimeFormat", "h:mm:ss a z");
+    ld_setString(env, localeData, cls, "mediumTimeFormat", "h:mm:ss a");
+    ld_setString(env, localeData, cls, "shortTimeFormat", "h:mm a");
+    ld_setString(env, localeData, cls, "fullDateFormat", "EEEE, MMMM d, y");
+    ld_setString(env, localeData, cls, "longDateFormat", "MMMM d, y");
+    ld_setString(env, localeData, cls, "mediumDateFormat", "MMM d, y");
+    ld_setString(env, localeData, cls, "shortDateFormat", "M/d/yy");
+
+    /* 12/24hr time variants */
+    ld_setString(env, localeData, cls, "timeFormat_hm", "h:mm a");
+    ld_setString(env, localeData, cls, "timeFormat_Hm", "HH:mm");
+    ld_setString(env, localeData, cls, "timeFormat_hms", "h:mm:ss a");
+    ld_setString(env, localeData, cls, "timeFormat_Hms", "HH:mm:ss");
+    ld_setString(env, localeData, cls, "narrowAm", "a");
+    ld_setString(env, localeData, cls, "narrowPm", "p");
+
+    /* Number formatting */
+    ld_setChar(env, localeData, cls, "zeroDigit", '0');
+    ld_setChar(env, localeData, cls, "decimalSeparator", '.');
+    ld_setChar(env, localeData, cls, "groupingSeparator", ',');
+    ld_setChar(env, localeData, cls, "patternSeparator", ';');
+    ld_setString(env, localeData, cls, "percent", "%");
+    ld_setString(env, localeData, cls, "perMill", "\u2030");
+    ld_setChar(env, localeData, cls, "monetarySeparator", '.');
+    ld_setString(env, localeData, cls, "minusSign", "-");
+    ld_setString(env, localeData, cls, "exponentSeparator", "E");
+    ld_setString(env, localeData, cls, "infinity", "\u221E");
+    ld_setString(env, localeData, cls, "NaN", "NaN");
+
+    /* Currency */
+    ld_setString(env, localeData, cls, "currencySymbol", "$");
+    ld_setString(env, localeData, cls, "internationalCurrencySymbol", "USD");
+
+    /* Number patterns */
+    ld_setString(env, localeData, cls, "numberPattern", "#,##0.###");
+    ld_setString(env, localeData, cls, "integerPattern", "#,##0");
+    ld_setString(env, localeData, cls, "currencyPattern", "\u00A4#,##0.00");
+    ld_setString(env, localeData, cls, "percentPattern", "#,##0%");
+
+    return JNI_TRUE;
+}
+
+/* AsynchronousCloseMonitor stubs */
+static void ACM_signalBlockedThreads(JNIEnv* env, jclass cls, jobject fd) { /* no-op */ }
+
+/* Thread.nicenessForPriority (Android 14+) — maps Java priority 1-10 to Linux niceness */
+static jint Thread_nicenessForPriority(JNIEnv* env, jclass cls, jint priority) {
+    /* Standard Android mapping: MIN_PRIORITY(1)→19, NORM(5)→0, MAX(10)→-8 */
+    static const int kNiceValues[] = {19, 16, 13, 10, 0, -2, -4, -5, -6, -8};
+    if (priority < 1) priority = 1;
+    if (priority > 10) priority = 10;
+    return kNiceValues[priority - 1];
+}
+
 /* ==================== JNI_OnLoad ==================== */
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     JNIEnv* env;
     if ((*vm)->GetEnv(vm, (void**)&env, JNI_VERSION_1_6) != JNI_OK) return -1;
 
-    fprintf(stderr, "[javacore] JNI_OnLoad starting\n");
     /* Register native methods for libcore.io.Linux */
     jclass linuxClass = (*env)->FindClass(env, "libcore/io/Linux");
-    fprintf(stderr, "[javacore] Linux class: %p\n", linuxClass);
     if (linuxClass) {
         JNINativeMethod methods[] = {
             {"getpwuid", "(I)Landroid/system/StructPasswd;", (void*)linux_getpwuid},
@@ -629,9 +1130,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
             {"realpath", "(Ljava/lang/String;)Ljava/lang/String;", (void*)linux_realpath},
             {"getxattr", "(Ljava/lang/String;Ljava/lang/String;)[B", (void*)linux_getxattr},
         };
-        int n = sizeof(methods)/sizeof(methods[0]);
-        registerNativesOrSkip(env, linuxClass, methods, n);
-        fprintf(stderr, "[javacore] Linux: registered %d methods\n", n);
+        registerNativesOrSkip(env, linuxClass, methods, sizeof(methods)/sizeof(methods[0]));
         (*env)->DeleteLocalRef(env, linuxClass);
     }
 
@@ -641,6 +1140,137 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
         if (cls) {
             JNINativeMethod methods[] = {
                 {"initConstants", "()V", (void*)OsConstants_initConstants},
+            };
+            registerNativesOrSkip(env, cls, methods, 1);
+            (*env)->DeleteLocalRef(env, cls);
+        }
+    }
+
+    /* AsynchronousCloseMonitor */
+    {
+        jclass cls = (*env)->FindClass(env, "libcore/io/AsynchronousCloseMonitor");
+        if (cls) {
+            JNINativeMethod methods[] = {
+                {"signalBlockedThreads", "(Ljava/io/FileDescriptor;)V", (void*)ACM_signalBlockedThreads},
+            };
+            registerNativesOrSkip(env, cls, methods, 1);
+            (*env)->DeleteLocalRef(env, cls);
+        }
+    }
+
+    /* java.math.NativeBN - BigInteger/BigDecimal support */
+    {
+        jclass cls = (*env)->FindClass(env, "java/math/NativeBN");
+        if (cls) {
+            JNINativeMethod methods[] = {
+                {"getNativeFinalizer", "()J", (void*)NativeBN_getNativeFinalizer},
+                {"BN_new", "()J", (void*)NativeBN_BN_new},
+                {"BN_free", "(J)V", (void*)NativeBN_BN_free},
+                {"BN_cmp", "(JJ)I", (void*)NativeBN_BN_cmp},
+                {"BN_copy", "(JJ)V", (void*)NativeBN_BN_copy},
+                {"putLongInt", "(JJ)V", (void*)NativeBN_putLongInt},
+                {"putULongInt", "(JJZ)V", (void*)NativeBN_putULongInt},
+                {"BN_dec2bn", "(JLjava/lang/String;)I", (void*)NativeBN_BN_dec2bn},
+                {"BN_hex2bn", "(JLjava/lang/String;)I", (void*)NativeBN_BN_hex2bn},
+                {"BN_bin2bn", "([BIZJ)V", (void*)NativeBN_BN_bin2bn},
+                {"litEndInts2bn", "([IIZJ)V", (void*)NativeBN_litEndInts2bn},
+                {"twosComp2bn", "([BIJ)V", (void*)NativeBN_twosComp2bn},
+                {"longInt", "(J)J", (void*)NativeBN_longInt},
+                {"BN_bn2dec", "(J)Ljava/lang/String;", (void*)NativeBN_BN_bn2dec},
+                {"BN_bn2hex", "(J)Ljava/lang/String;", (void*)NativeBN_BN_bn2hex},
+                {"BN_bn2bin", "(J)[B", (void*)NativeBN_BN_bn2bin},
+                {"bn2litEndInts", "(J)[I", (void*)NativeBN_bn2litEndInts},
+                {"sign", "(J)I", (void*)NativeBN_sign},
+                {"BN_set_negative", "(JI)V", (void*)NativeBN_BN_set_negative},
+                {"bitLength", "(J)I", (void*)NativeBN_bitLength},
+                {"BN_is_bit_set", "(JI)Z", (void*)NativeBN_BN_is_bit_set},
+                {"BN_shift", "(JJI)V", (void*)NativeBN_BN_shift},
+                {"BN_add_word", "(JI)V", (void*)NativeBN_BN_add_word},
+                {"BN_mul_word", "(JI)V", (void*)NativeBN_BN_mul_word},
+                {"BN_mod_word", "(JI)I", (void*)NativeBN_BN_mod_word},
+                {"BN_add", "(JJJ)V", (void*)NativeBN_BN_add},
+                {"BN_sub", "(JJJ)V", (void*)NativeBN_BN_sub},
+                {"BN_mul", "(JJJ)V", (void*)NativeBN_BN_mul},
+                {"BN_div", "(JJJJ)V", (void*)NativeBN_BN_div},
+                {"BN_exp", "(JJJ)V", (void*)NativeBN_BN_exp},
+                {"BN_gcd", "(JJJ)V", (void*)NativeBN_BN_gcd},
+                {"BN_nnmod", "(JJJ)V", (void*)NativeBN_BN_nnmod},
+                {"BN_mod_exp", "(JJJJ)V", (void*)NativeBN_BN_mod_exp},
+                {"BN_mod_inverse", "(JJJ)V", (void*)NativeBN_BN_mod_inverse},
+                {"BN_generate_prime_ex", "(JIZJJ)V", (void*)NativeBN_BN_generate_prime_ex},
+                {"BN_primality_test", "(JIZ)Z", (void*)NativeBN_BN_primality_test},
+            };
+            registerNativesOrSkip(env, cls, methods, sizeof(methods)/sizeof(methods[0]));
+            (*env)->DeleteLocalRef(env, cls);
+        }
+    }
+
+    /* libcore.io.Memory - direct memory access for NIO/mmap */
+    {
+        jclass cls = (*env)->FindClass(env, "libcore/io/Memory");
+        if (cls) {
+            JNINativeMethod methods[] = {
+                {"peekByte", "(J)B", (void*)Memory_peekByte},
+                {"pokeByte", "(JB)V", (void*)Memory_pokeByte},
+                {"peekIntNative", "(J)I", (void*)Memory_peekIntNative},
+                {"pokeIntNative", "(JI)V", (void*)Memory_pokeIntNative},
+                {"peekLongNative", "(J)J", (void*)Memory_peekLongNative},
+                {"pokeLongNative", "(JJ)V", (void*)Memory_pokeLongNative},
+                {"peekShortNative", "(J)S", (void*)Memory_peekShortNative},
+                {"pokeShortNative", "(JS)V", (void*)Memory_pokeShortNative},
+                {"peekByteArray", "(J[BII)V", (void*)Memory_peekByteArray},
+                {"peekCharArray", "(J[CIIZ)V", (void*)Memory_peekCharArray},
+                {"peekIntArray", "(J[IIIZ)V", (void*)Memory_peekIntArray},
+                {"peekShortArray", "(J[SIIZ)V", (void*)Memory_peekShortArray},
+                {"peekLongArray", "(J[JIIZ)V", (void*)Memory_peekLongArray},
+                {"peekFloatArray", "(J[FIIZ)V", (void*)Memory_peekFloatArray},
+                {"peekDoubleArray", "(J[DIIZ)V", (void*)Memory_peekDoubleArray},
+                {"memmove", "(Ljava/lang/Object;ILjava/lang/Object;IJ)V", (void*)Memory_memmove},
+            };
+            registerNativesOrSkip(env, cls, methods, sizeof(methods)/sizeof(methods[0]));
+            (*env)->DeleteLocalRef(env, cls);
+        }
+    }
+
+    /* ICU - initLocaleDataNative (required for NumberFormat, Currency, etc.) */
+    {
+        jclass cls = (*env)->FindClass(env, "libcore/icu/ICU");
+        if (cls) {
+            JNINativeMethod methods[] = {
+                {"initLocaleDataNative", "(Ljava/lang/String;Llibcore/icu/LocaleData;)Z",
+                 (void*)ICU_initLocaleDataNative},
+                {"getBestDateTimePatternNative", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                 (void*)ICU_getBestDateTimePatternNative},
+                {"getCurrencyCode", "(Ljava/lang/String;)Ljava/lang/String;",
+                 (void*)ICU_getCurrencyCode},
+                {"getISO3Country", "(Ljava/lang/String;)Ljava/lang/String;",
+                 (void*)ICU_getISO3Country},
+                {"getISO3Language", "(Ljava/lang/String;)Ljava/lang/String;",
+                 (void*)ICU_getISO3Language},
+                {"getScript", "(Ljava/lang/String;)Ljava/lang/String;",
+                 (void*)ICU_getScript},
+                {"getISOLanguagesNative", "()[Ljava/lang/String;",
+                 (void*)ICU_getISOLanguagesNative},
+                {"getISOCountriesNative", "()[Ljava/lang/String;",
+                 (void*)ICU_getISOCountriesNative},
+                {"getAvailableLocalesNative", "()[Ljava/lang/String;",
+                 (void*)ICU_getAvailableLocalesNative},
+                {"setDefaultLocale", "(Ljava/lang/String;)V",
+                 (void*)ICU_setDefaultLocale},
+                {"getDefaultLocale", "()Ljava/lang/String;",
+                 (void*)ICU_getDefaultLocale},
+            };
+            registerNativesOrSkip(env, cls, methods, sizeof(methods)/sizeof(methods[0]));
+            (*env)->DeleteLocalRef(env, cls);
+        }
+    }
+
+    /* java.lang.Thread — nicenessForPriority (Android 14+) */
+    {
+        jclass cls = (*env)->FindClass(env, "java/lang/Thread");
+        if (cls) {
+            JNINativeMethod methods[] = {
+                {"nicenessForPriority", "(I)I", (void*)Thread_nicenessForPriority},
             };
             registerNativesOrSkip(env, cls, methods, 1);
             (*env)->DeleteLocalRef(env, cls);
