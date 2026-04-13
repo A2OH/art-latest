@@ -247,6 +247,38 @@ static void Unsafe_putOrderedObject(JNIEnv* env, jobject, jobject javaObj, jlong
   obj->SetFieldObject<false>(MemberOffset(offset), newValue);
 }
 
+// Native implementation of objectFieldOffset(Class, String) — bypasses Java version
+// which calls Field.getName() and fails during early class init.
+// NOT static — needs to be accessible from runtime.cc for direct registration.
+jlong Unsafe_objectFieldOffsetClassString(JNIEnv* env, jobject, jclass javaClass, jstring javaName) {
+  ScopedFastNativeObjectAccess soa(env);
+  ObjPtr<mirror::Class> klass = soa.Decode<mirror::Class>(javaClass);
+  ObjPtr<mirror::String> name = soa.Decode<mirror::String>(javaName);
+  if (klass == nullptr || name == nullptr) {
+    ThrowNullPointerException("objectFieldOffset: null class or name");
+    return 0;
+  }
+  // Convert Java String to C string
+  std::string name_str = name->ToModifiedUtf8();
+  // Search instance fields
+  for (uint32_t i = 0; i < klass->NumInstanceFields(); i++) {
+    ArtField* field = klass->GetInstanceField(i);
+    if (name_str == field->GetName()) {
+      return field->GetOffset().SizeValue();
+    }
+  }
+  // Search static fields
+  for (uint32_t i = 0; i < klass->NumStaticFields(); i++) {
+    ArtField* field = klass->GetStaticField(i);
+    if (name_str == field->GetName()) {
+      return field->GetOffset().SizeValue();
+    }
+  }
+  soa.Self()->ThrowNewException("Ljava/lang/InternalError;",
+           (std::string("Field not found: ") + name_str).c_str());
+  return 0;
+}
+
 static jint Unsafe_getArrayBaseOffsetForComponentType(JNIEnv* env, jclass, jclass component_class) {
   ScopedFastNativeObjectAccess soa(env);
   ObjPtr<mirror::Class> component = soa.Decode<mirror::Class>(component_class);
@@ -572,6 +604,11 @@ static JNINativeMethod gMethods[] = {
     OVERLOADED_FAST_NATIVE_METHOD(Unsafe, putLong, "(JJ)V", putLongJJ),
     OVERLOADED_FAST_NATIVE_METHOD(Unsafe, putFloat, "(JF)V", putFloatJF),
     OVERLOADED_FAST_NATIVE_METHOD(Unsafe, putDouble, "(JD)V", putDoubleJD),
+
+    // objectFieldOffset(Class, String) — native override of Java implementation
+    // to avoid Field.getName() issues during early class init
+    OVERLOADED_FAST_NATIVE_METHOD(Unsafe, objectFieldOffset,
+        "(Ljava/lang/Class;Ljava/lang/String;)J", objectFieldOffsetClassString),
 
     // CAS
     FAST_NATIVE_METHOD(Unsafe, loadFence, "()V"),

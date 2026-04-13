@@ -403,10 +403,11 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
             fprintf(stderr, "[icu_jni] NativeConverter registration done\n");
             (*env)->DeleteLocalRef(env, cls);
         } else {
-            fprintf(stderr, "[icu_jni] NativeConverter class NOT FOUND - checking exception\n");
+            fprintf(stderr, "[icu_jni] NativeConverter class NOT FOUND - skipping\n"); fflush(stderr);
             if ((*env)->ExceptionCheck(env)) {
-                (*env)->ExceptionDescribe(env);
+                fprintf(stderr, "[icu_jni] ExceptionCheck=true, clearing...\n"); fflush(stderr);
                 (*env)->ExceptionClear(env);
+                fprintf(stderr, "[icu_jni] ExceptionClear done\n"); fflush(stderr);
             }
         }
     }

@@ -419,12 +419,9 @@ const void* ClassLinker::FindBootJniStub(uint32_t flags, std::string_view shorty
 }
 
 const void* ClassLinker::FindBootJniStub(JniStubKey key) {
-  auto it = boot_image_jni_stubs_.find(key);
-  if (it == boot_image_jni_stubs_.end()) {
-    return nullptr;
-  } else {
-    return it->second;
-  }
+  // PATCH: Always return null — boot image JNI stubs have stale addresses
+  // from dex2oat's binary. All JNI calls go through InterpreterJni instead.
+  return nullptr;
 }
 
 ClassLinker::VisiblyInitializedCallback* ClassLinker::MarkClassInitialized(
@@ -676,11 +673,11 @@ void ClassLinker::CheckSystemClass(Thread* self, Handle<mirror::Class> c1, const
                  << " numMethods=" << c2->NumMethods()
                  << " numSFields=" << c2->NumStaticFields()
                  << " numIFields=" << c2->NumInstanceFields();
-    // If the mismatch is for String, try to use c2 instead
+    // For String mismatch: replace class root with DEX-loaded version (c2)
     if (strcmp(descriptor, "Ljava/lang/String;") == 0) {
-      LOG(WARNING) << "  String mismatch: pre-allocated ClassSize="
-                   << mirror::String::ClassSize(image_pointer_size_)
-                   << " actual c2 classSize=" << c2->GetClassSize();
+      SetClassRoot(ClassRoot::kJavaLangString, c2);
+      LOG(WARNING) << "  String root = c2 (" << static_cast<void*>(c2.Ptr())
+                   << ", " << c2->NumMethods() << " methods)";
     }
   }
 }
@@ -1094,6 +1091,25 @@ bool ClassLinker::InitWithoutImage(std::vector<std::unique_ptr<const DexFile>> b
 
   FinishInit(self);
 
+  // Fix DexCache String entries: ensure all caches point to the root String class
+  {
+    ObjPtr<mirror::Class> string_root = GetClassRoot<mirror::String>();
+    const char* desc = "Ljava/lang/String;";
+    for (const auto& dex_file : GetBootClassPath()) {
+      const dex::TypeId* type_id = dex_file->FindTypeId(desc);
+      if (type_id != nullptr) {
+        dex::TypeIndex idx = dex_file->GetIndexForTypeId(*type_id);
+        ObjPtr<mirror::DexCache> dc = FindDexCache(self, *dex_file);
+        if (dc != nullptr) {
+          ObjPtr<mirror::Class> resolved = dc->GetResolvedType(idx);
+          if (resolved != nullptr && resolved != string_root) {
+            dc->SetResolvedType(idx, string_root);
+          }
+        }
+      }
+    }
+  }
+
   VLOG(startup) << "ClassLinker::InitFromCompiler exiting";
 
   return true;
@@ -1199,18 +1215,29 @@ static void EnsureRootInitialized(ClassLinker* class_linker,
 
 void ClassLinker::RunEarlyRootClinits(Thread* self) {
   fprintf(stderr, "[CL] RunEarlyRootClinits: entering\n"); fflush(stderr);
+
+  // With boot image, classes are pre-initialized. Skip ForceInit but init WellKnownClasses caches.
+  if (Runtime::Current()->GetHeap()->HasBootImageSpace()) {
+    fprintf(stderr, "[CL] RunEarlyRootClinits: boot image — init WellKnownClasses caches\n"); fflush(stderr);
+    WellKnownClasses::Init(self->GetJniEnv());
+    if (self->IsExceptionPending()) self->ClearException();
+    return;
+  }
+
   StackHandleScope<1u> hs(self);
   Handle<mirror::ObjectArray<mirror::Class>> class_roots = hs.NewHandle(GetClassRoots());
 
-  // Initialize Class, String, Field before WellKnownClasses::Init (matches AOSP)
-  fprintf(stderr, "[CL] RunEarlyRootClinits: EnsureRootInitialized(Class)\n"); fflush(stderr);
-  EnsureRootInitialized(this, self, GetClassRoot<mirror::Class>(class_roots.Get()));
-  if (self->IsExceptionPending()) { self->ClearException(); }
-  fprintf(stderr, "[CL] RunEarlyRootClinits: EnsureRootInitialized(String)\n"); fflush(stderr);
-  EnsureRootInitialized(this, self, GetClassRoot<mirror::String>(class_roots.Get()));
-  if (self->IsExceptionPending()) { self->ClearException(); }
-  fprintf(stderr, "[CL] RunEarlyRootClinits: EnsureRootInitialized(Field)\n"); fflush(stderr);
-  EnsureRootInitialized(this, self, GetClassRoot<mirror::Field>(class_roots.Get()));
+  // Force ALL root classes to VisiblyInitialized without running <clinit>.
+  // Root classes (Class, String, Object, etc.) are pre-allocated and special-cased by ART.
+  // Without a boot image, EnsureInitialized triggers <clinit> → circular init → hang/NPE.
+  fprintf(stderr, "[CL] RunEarlyRootClinits: ForceInit all %d root classes\n",
+          static_cast<int>(class_roots->GetLength())); fflush(stderr);
+  for (int32_t i = 0; i < class_roots->GetLength(); i++) {
+    ObjPtr<mirror::Class> root = class_roots->Get(i);
+    if (root != nullptr && !root->IsVisiblyInitialized()) {
+      root->SetStatusForPrimitiveOrArray(ClassStatus::kVisiblyInitialized);
+    }
+  }
   if (self->IsExceptionPending()) { self->ClearException(); }
 
   fprintf(stderr, "[CL] RunEarlyRootClinits: calling WellKnownClasses::Init\n"); fflush(stderr);
@@ -1218,12 +1245,6 @@ void ClassLinker::RunEarlyRootClinits(Thread* self) {
   fprintf(stderr, "[CL] RunEarlyRootClinits: WellKnownClasses::Init done\n"); fflush(stderr);
   if (self->IsExceptionPending()) self->ClearException();
 
-  // Initialize FinalizerReference (needed for InetAddress, matches AOSP)
-  if (WellKnownClasses::java_lang_ref_FinalizerReference_add != nullptr) {
-    EnsureRootInitialized(
-        this, self, WellKnownClasses::java_lang_ref_FinalizerReference_add->GetDeclaringClass());
-    if (self->IsExceptionPending()) { self->ClearException(); }
-  }
   fprintf(stderr, "[CL] RunEarlyRootClinits: done\n"); fflush(stderr);
 }
 
@@ -1628,13 +1649,20 @@ bool ClassLinker::InitFromBootImage(std::string* error_msg) {
       runtime->GetOatFileManager().RegisterImageOatFiles(spaces);
   DCHECK(!oat_files.empty());
   const OatHeader& default_oat_header = oat_files[0]->GetOatHeader();
-  jni_dlsym_lookup_trampoline_ = default_oat_header.GetJniDlsymLookupTrampoline();
-  jni_dlsym_lookup_critical_trampoline_ = default_oat_header.GetJniDlsymLookupCriticalTrampoline();
-  quick_resolution_trampoline_ = default_oat_header.GetQuickResolutionTrampoline();
-  quick_imt_conflict_trampoline_ = default_oat_header.GetQuickImtConflictTrampoline();
-  quick_generic_jni_trampoline_ = default_oat_header.GetQuickGenericJniTrampoline();
-  quick_to_interpreter_bridge_trampoline_ = default_oat_header.GetQuickToInterpreterBridge();
-  nterp_trampoline_ = default_oat_header.GetNterpTrampoline();
+  // Override OAT header trampolines with OUR runtime's assembly stubs.
+  // The OAT header values are stale (from the dex2oat process) and cause SIGBUS
+  // when used as entry points for newly-loaded classes.
+  jni_dlsym_lookup_trampoline_ = GetJniDlsymLookupStub();
+  jni_dlsym_lookup_critical_trampoline_ = GetJniDlsymLookupCriticalStub();
+  quick_resolution_trampoline_ = GetQuickResolutionStub();
+  quick_imt_conflict_trampoline_ = GetQuickImtConflictStub();
+  quick_generic_jni_trampoline_ = GetQuickGenericJniStub();
+  quick_to_interpreter_bridge_trampoline_ = GetQuickToInterpreterBridge();
+  nterp_trampoline_ = interpreter::GetNterpEntryPoint();
+  fprintf(stderr, "[CL] Overrode OAT trampolines with runtime stubs: interp=%p jni=%p res=%p\n",
+          quick_to_interpreter_bridge_trampoline_, quick_generic_jni_trampoline_,
+          quick_resolution_trampoline_);
+  fflush(stderr);
   if (kIsDebugBuild) {
     // Check that the other images use the same trampoline.
     for (size_t i = 1; i < oat_files.size(); ++i) {
@@ -3951,6 +3979,9 @@ uint32_t ClassLinker::SizeOfClassWithoutEmbeddedTables(const DexFile& dex_file,
 }
 
 void ClassLinker::FixupStaticTrampolines(Thread* self, ObjPtr<mirror::Class> klass) {
+  // PATCH: Skip trampoline fixup — interpreter handles all methods.
+  // FixupStaticTrampolines sets entry points to AOT code/nterp which have stale addresses.
+  return;
   ScopedAssertNoThreadSuspension sants(__FUNCTION__);
   DCHECK(klass->IsVisiblyInitialized()) << klass->PrettyDescriptor();
   size_t num_direct_methods = klass->NumDirectMethods();
@@ -4532,7 +4563,9 @@ void ClassLinker::RegisterDexFileLocked(const DexFile& dex_file,
     WriteBarrier::ForEveryFieldWrite(class_loader);
   }
   bool inserted = dex_caches_.emplace(&dex_file, std::move(data)).second;
-  CHECK(inserted);
+  if (!inserted) {
+    LOG(WARNING) << "Duplicate DexCache for " << dex_file.GetLocation() << " (ignoring)";
+  }
 }
 
 ObjPtr<mirror::DexCache> ClassLinker::DecodeDexCacheLocked(Thread* self, const DexCacheData* data) {
@@ -5879,6 +5912,8 @@ bool ClassLinker::InitializeClass(Thread* self,
     return true;
   }
 
+  // (class init logging removed — was too verbose)
+
   // Fast fail if initialization requires a full runtime. Not part of the JLS.
   if (!CanWeInitializeClass(klass.Get(), can_init_statics, can_init_parents)) {
     return false;
@@ -6175,25 +6210,19 @@ bool ClassLinker::InitializeClass(Thread* self,
       // In standalone/imageless builds, certain classes have circular init
       // dependencies (e.g., VarHandle ↔ AccessType enums, AtomicInteger → VarHandle).
       // Rather than crash, tolerate the failure and mark as initialized with defaults.
-      if (!Runtime::Current()->GetHeap()->HasBootImageSpace()) {
+      // Westlake standalone mode: tolerate clinit failures.
+      // Many framework classes fail init due to missing system services,
+      // unresolved native methods, or property resolution errors.
+      // Mark as initialized so dependent classes can proceed.
+      {
         std::string temp;
         const char* desc = klass->GetDescriptor(&temp);
-        if (strstr(desc, "VarHandle") != nullptr ||
-            strstr(desc, "AtomicInteger") != nullptr ||
-            strstr(desc, "AtomicLong") != nullptr ||
-            strstr(desc, "AtomicBoolean") != nullptr ||
-            strstr(desc, "AtomicReference") != nullptr ||
-            strstr(desc, "AccessMode") != nullptr ||
-            strstr(desc, "AccessType") != nullptr ||
-            strstr(desc, "Daemons") != nullptr) {
-          LOG(WARNING) << "Tolerating clinit failure for " << desc
-                       << " in standalone build: " << self->GetException()->Dump();
-          self->ClearException();
-          callback = MarkClassInitialized(self, klass);
-          success = true;
-          // Skip the normal error handling
-          goto clinit_done;
-        }
+        LOG(WARNING) << "Tolerating clinit failure for " << desc
+                     << ": " << self->GetException()->Dump();
+        self->ClearException();
+        callback = MarkClassInitialized(self, klass);
+        success = true;
+        goto clinit_done;
       }
       WrapExceptionInInitializer(klass);
       mirror::Class::SetStatus(klass, ClassStatus::kErrorResolved, self);
@@ -10306,9 +10335,13 @@ ObjPtr<mirror::Class> ClassLinker::DoResolveType(dex::TypeIndex type_idx,
   const char* descriptor = dex_cache->GetDexFile()->GetTypeDescriptor(type_idx);
   ObjPtr<mirror::Class> resolved = FindClass(self, descriptor, class_loader);
   if (resolved != nullptr) {
-    // TODO: we used to throw here if resolved's class loader was not the
-    //       boot class loader. This was to permit different classes with the
-    //       same name to be loaded simultaneously by different loaders
+    // For String: always use the pre-allocated root class to avoid identity mismatch
+    if (strcmp(descriptor, "Ljava/lang/String;") == 0) {
+      ObjPtr<mirror::Class> root = GetClassRoot<mirror::String>();
+      if (root != nullptr && resolved != root) {
+        resolved = root;
+      }
+    }
     dex_cache->SetResolvedType(type_idx, resolved);
   } else {
     CHECK(self->IsExceptionPending())

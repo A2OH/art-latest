@@ -22,6 +22,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
 #if !defined(__MUSL__)
 #include <ucontext.h>
 #endif
@@ -42,6 +44,103 @@
 #include "scoped_thread_state_change-inl.h"
 #include "thread.h"
 #include "object_lock.h"
+
+// Throwable.printStackTrace() no-op — prevents infinite loop when JNI
+// ExceptionDescribe calls printStackTrace which triggers more exceptions.
+extern "C" JNIEXPORT void JNICALL
+Java_java_lang_Throwable_printStackTrace_noop(JNIEnv*, jobject) {
+  // Intentionally empty — prevents cascading exception handling loops
+}
+
+// String.lastIndexOf(int) native replacement — the interpreted version has a
+// register corruption bug where length() return clobbers the ch parameter.
+// Implementation: pure JNI, no callbacks into Java to avoid re-entrancy issues.
+extern "C" JNIEXPORT jint JNICALL
+Java_java_lang_String_lastIndexOf_native(JNIEnv* env, jobject thiz, jint ch) {
+  fprintf(stderr, "[lastIdx] NATIVE called ch=%d thiz=%p\n", ch, thiz);
+  fflush(stderr);
+  jint len = env->GetStringLength((jstring)thiz);
+  if (ch < 0x10000) {  // BMP character — scan backward through chars
+    const jchar* chars = env->GetStringChars((jstring)thiz, nullptr);
+    if (!chars) return -1;
+    jint result = -1;
+    for (jint i = (len < 0 ? 0 : len) - 1; i >= 0; i--) {
+      if (chars[i] == (jchar)ch) { result = i; break; }
+    }
+    env->ReleaseStringChars((jstring)thiz, chars);
+    return result;
+  }
+  // Supplementary character — encode as surrogate pair and search
+  jchar hi = (jchar)((ch >> 10) + 0xD7C0);
+  jchar lo = (jchar)((ch & 0x3FF) + 0xDC00);
+  const jchar* chars = env->GetStringChars((jstring)thiz, nullptr);
+  if (!chars) return -1;
+  jint result = -1;
+  for (jint i = len - 2; i >= 0; i--) {
+    if (chars[i] == hi && chars[i+1] == lo) { result = i; break; }
+  }
+  env->ReleaseStringChars((jstring)thiz, chars);
+  return result;
+}
+
+// Sysprop stubs from framework_native_stubs.c
+extern "C" jobject SocProperties_soc_manufacturer(JNIEnv*, jclass);
+extern "C" jobject SocProperties_soc_model(JNIEnv*, jclass);
+extern "C" jobject TelephonyProperties_baseband_version(JNIEnv*, jclass);
+
+// TextUtils.formatSimple replacement — pure C, ZERO JNI calls to avoid
+// recursive class loading. Only handles %s (from String args) and %d/%x.
+extern "C" JNIEXPORT jstring JNICALL
+Java_android_text_TextUtils_formatSimple(JNIEnv* env, jclass, jstring fmt, jobjectArray args) {
+  if (!fmt) return env->NewStringUTF("");
+  const char* fmtStr = env->GetStringUTFChars(fmt, nullptr);
+  if (!fmtStr) return fmt;
+
+  int argCount = args ? env->GetArrayLength(args) : 0;
+  int argIdx = 0;
+  char result[2048];
+  int pos = 0;
+
+  for (const char* p = fmtStr; *p && pos < 2040; p++) {
+    if (*p == '%' && *(p+1)) {
+      const char* spec = p + 1;
+      // Skip flags/width/precision
+      while (*spec == '-' || *spec == '+' || *spec == '0' || *spec == ' ' ||
+             *spec == '#' || (*spec >= '0' && *spec <= '9') || *spec == '.') spec++;
+      if (*spec == 's' && argIdx < argCount) {
+        // %s — get arg as String directly (avoid toString() which triggers class loading)
+        jobject arg = env->GetObjectArrayElement(args, argIdx++);
+        if (arg && env->IsInstanceOf(arg, env->FindClass("java/lang/String"))) {
+          const char* s = env->GetStringUTFChars((jstring)arg, nullptr);
+          if (s) { int n = strlen(s); if (pos+n<2040) { memcpy(result+pos,s,n); pos+=n; } env->ReleaseStringUTFChars((jstring)arg, s); }
+        } else {
+          // For non-String args, just put "?" — avoids calling toString()
+          result[pos++] = '?';
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        p = spec;
+      } else if ((*spec == 'd' || *spec == 'x' || *spec == 'X') && argIdx < argCount) {
+        // %d/%x — consume the arg but just put "0" (avoid Integer.intValue JNI call)
+        argIdx++;
+        result[pos++] = '0';
+        p = spec;
+      } else if (*spec == '%') {
+        result[pos++] = '%'; p = spec;
+      } else {
+        // Unknown specifier — consume arg and skip
+        if (argIdx < argCount) argIdx++;
+        p = spec;
+      }
+    } else {
+      result[pos++] = *p;
+    }
+  }
+  result[pos] = 0;
+  env->ReleaseStringUTFChars(fmt, fmtStr);
+  // Clear any stale exceptions from FindClass
+  if (env->ExceptionCheck()) env->ExceptionClear();
+  return env->NewStringUTF(result);
+}
 
 // Thread.clone() override — returns 'this' instead of throwing CloneNotSupportedException.
 extern "C" JNIEXPORT jobject JNICALL
@@ -1162,11 +1261,19 @@ static int InvokeMain(JNIEnv* env, char** argv) {
                                      const char* shorty, void* nativeFunc) {
               art::ObjPtr<art::mirror::Class> cls =
                   art::Runtime::Current()->GetClassLinker()->FindSystemClass(soa.Self(), classDesc);
+              if (cls == nullptr) {
+                if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
+                fprintf(stderr, "[dalvikvm] DBG: class %s not found\n", classDesc);
+              }
               if (cls != nullptr) {
+                int total = 0, matched = 0;
                 for (art::ArtMethod& m : cls->GetDeclaredMethods(art::kRuntimePointerSize)) {
+                  total++;
                   if (strcmp(m.GetName(), methodName) == 0) {
-                    fprintf(stderr, "[dalvikvm] DBG: %s.%s shorty=%s (want %s) native=%d\n",
-                            classDesc, methodName, m.GetShorty(), shorty, m.IsNative());
+                    matched++;
+                    fprintf(stderr, "[dalvikvm] DBG: %s.%s shorty=%s sig=%s (want %s) native=%d\n",
+                            classDesc, methodName, m.GetShorty(),
+                            m.GetSignature().ToString().c_str(), shorty, m.IsNative());
                   }
                   if (strcmp(m.GetName(), methodName) == 0 &&
                       strcmp(m.GetShorty(), shorty) == 0 && !m.IsNative()) {
@@ -1177,6 +1284,10 @@ static int InvokeMain(JNIEnv* env, char** argv) {
                     break;
                   }
                 }
+                if (matched == 0) {
+                  fprintf(stderr, "[dalvikvm] DBG: %s.%s NOT FOUND (%d total methods)\n",
+                          classDesc, methodName, total);
+                }
               }
               if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
             };
@@ -1184,7 +1295,130 @@ static int InvokeMain(JNIEnv* env, char** argv) {
                 (void*)Java_java_lang_Float_toStringImpl);
             patchToNative("Ljava/lang/Double;", "toString", "LD",
                 (void*)Java_java_lang_Double_toStringImpl);
+            // Stub SocProperties/TelephonyProperties to break circular class init
+            // that causes StackOverflow during Build.<clinit>.
+            auto patchToNativeBySig = [&](const char* classDesc, const char* methodName,
+                                          const char* sig, void* nativeFunc) {
+              art::ObjPtr<art::mirror::Class> cls =
+                  art::Runtime::Current()->GetClassLinker()->FindSystemClass(soa.Self(), classDesc);
+              if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
+              if (cls != nullptr) {
+                for (art::ArtMethod& m : cls->GetDeclaredMethods(art::kRuntimePointerSize)) {
+                  if (strcmp(m.GetName(), methodName) == 0 &&
+                      m.GetSignature().ToString() == sig && !m.IsNative()) {
+                    m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+                    m.SetEntryPointFromJni(nativeFunc);
+                    fprintf(stderr, "[dalvikvm] Patched %s.%s → native\n", classDesc, methodName);
+                    break;
+                  }
+                }
+              }
+              if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
+            };
+            patchToNativeBySig("Landroid/sysprop/SocProperties;", "soc_manufacturer",
+                "()Ljava/util/Optional;", (void*)SocProperties_soc_manufacturer);
+            patchToNativeBySig("Landroid/sysprop/SocProperties;", "soc_model",
+                "()Ljava/util/Optional;", (void*)SocProperties_soc_model);
+            patchToNativeBySig("Landroid/sysprop/TelephonyProperties;", "baseband_version",
+                "()Ljava/util/List;", (void*)TelephonyProperties_baseband_version);
+
+            // Replace TextUtils.formatSimple with String.format delegation.
+            // The built-in only handles %s/%d and crashes on %x, %08x, etc.
+            // Note: can't use patchToNative because GetShorty() returns wrong value
+            // for non-boot-image methods. Match by name + signature instead.
+            {
+              art::ObjPtr<art::mirror::Class> txCls =
+                  art::Runtime::Current()->GetClassLinker()->FindSystemClass(
+                      soa.Self(), "Landroid/text/TextUtils;");
+              if (txCls != nullptr) {
+                for (art::ArtMethod& m : txCls->GetDeclaredMethods(art::kRuntimePointerSize)) {
+                  if (strcmp(m.GetName(), "formatSimple") == 0 &&
+                      m.GetSignature().ToString() ==
+                          "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;" &&
+                      !m.IsNative()) {
+                    m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+                    m.SetEntryPointFromJni(
+                        reinterpret_cast<void*>(Java_android_text_TextUtils_formatSimple));
+                    fprintf(stderr, "[dalvikvm] Patched TextUtils.formatSimple → native\n");
+                    break;
+                  }
+                }
+              }
+              if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
+            }
             if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
+            // Patch Throwable.printStackTrace() to no-op — prevents infinite loops when
+            // JNI ExceptionDescribe calls printStackTrace which triggers more exceptions.
+            {
+              art::ObjPtr<art::mirror::Class> throwableCls =
+                  art::Runtime::Current()->GetClassLinker()->FindSystemClass(
+                      soa.Self(), "Ljava/lang/Throwable;");
+              if (throwableCls != nullptr) {
+                for (art::ArtMethod& m : throwableCls->GetDeclaredMethods(art::kRuntimePointerSize)) {
+                  if (strcmp(m.GetName(), "printStackTrace") == 0 &&
+                      m.GetSignature().ToString() == "()V" && !m.IsNative()) {
+                    m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+                    m.SetEntryPointFromJni(
+                        reinterpret_cast<void*>(Java_java_lang_Throwable_printStackTrace_noop));
+                    fprintf(stderr, "[dalvikvm] Patched Throwable.printStackTrace() → no-op\n");
+                    break;
+                  }
+                }
+              }
+              if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
+            }
+            // Patch String.lastIndexOf(int) bytecode — the interpreter has a
+            // register corruption bug where length() clobbers the ch parameter.
+            // Fix: save ch to v0 before calling length, restore after.
+            // Original:   length→v0, v0=v0-1, lastIndexOf(v1,v2,v0)
+            // Patched:    length→v0, v0=v0-1, lastIndexOf(v1,v2,v0) [same but with v2 protected]
+            // Actually: just replace the whole method with one that calls lastIndexOf(II)
+            // using only registers that don't conflict.
+            //
+            // New bytecode for lastIndexOf(I)I (regs=3, ins=2: v1=this, v2=ch):
+            // 0: move v0, v2          ; save ch to v0
+            // 1: invoke-virtual {v1}, length()I
+            // 4: move-result v2       ; v2 = length (overwrites ch)
+            // 5: add-int/lit8 v2, v2, -1  ; v2 = length - 1
+            // 7: invoke-virtual {v1, v0, v2}, lastIndexOf(II)I  ; v0=ch(saved), v2=fromIndex
+            // a: move-result v0
+            // b: return v0
+            {
+              art::ObjPtr<art::mirror::Class> strCls =
+                  art::Runtime::Current()->GetClassLinker()->FindSystemClass(
+                      soa.Self(), "Ljava/lang/String;");
+              if (strCls != nullptr) {
+                for (art::ArtMethod& m : strCls->GetDeclaredMethods(art::kRuntimePointerSize)) {
+                  if (strcmp(m.GetName(), "lastIndexOf") == 0 &&
+                      m.GetSignature().ToString() == "(I)I" && !m.IsNative()) {
+                    // Patch the vtable entry to point to our patched ArtMethod
+                    m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+                    m.SetEntryPointFromJni(
+                        reinterpret_cast<void*>(Java_java_lang_String_lastIndexOf_native));
+                    // entry point already set by VisitPackedArtMethods
+                    // Also patch via vtable
+                    art::ObjPtr<art::mirror::PointerArray> vtable = strCls->GetVTableDuringLinking();
+                    if (vtable != nullptr) {
+                      int vtable_count = vtable->GetLength();
+                      for (int vi = 0; vi < vtable_count; vi++) {
+                        auto* vm = vtable->GetElementPtrSize<art::ArtMethod*>(vi, art::kRuntimePointerSize);
+                        if (vm && strcmp(vm->GetName(), "lastIndexOf") == 0 &&
+                            vm->GetSignature().ToString() == "(I)I") {
+                          vm->SetAccessFlags(vm->GetAccessFlags() | art::kAccNative);
+                          vm->SetEntryPointFromJni(
+                              reinterpret_cast<void*>(Java_java_lang_String_lastIndexOf_native));
+                          // entry point already set
+                          fprintf(stderr, "[dalvikvm] Patched String vtable[%d] lastIndexOf(I)\n", vi);
+                        }
+                      }
+                    }
+                    fprintf(stderr, "[dalvikvm] Patched String.lastIndexOf(I) → native\n");
+                    break;
+                  }
+                }
+              }
+              if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
+            }
           }
 
           if (psErr) {
@@ -1197,7 +1431,51 @@ static int InvokeMain(JNIEnv* env, char** argv) {
       }
       } // end of re-found classes block
     }
-    // (Force-init moved above before field setting)
+    // Null out IoTracker on System.out/err FileOutputStream to avoid BlockGuard NPE
+    // The tracker field calls BlockGuard.getThreadPolicy() which crashes with boot image
+    {
+      jclass fosCls = env->FindClass("java/io/FileOutputStream");
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      if (fosCls) {
+        jfieldID trackerF = env->GetFieldID(fosCls, "tracker", "Llibcore/io/IoTracker;");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (trackerF) {
+          // Get the FileOutputStream from System.out's underlying stream
+          jclass psCls2 = env->FindClass("java/io/PrintStream");
+          if (env->ExceptionCheck()) env->ExceptionClear();
+          if (psCls2 && systemCls) {
+            jfieldID outF2 = env->GetStaticFieldID(systemCls, "out", "Ljava/io/PrintStream;");
+            jfieldID errF2 = env->GetStaticFieldID(systemCls, "err", "Ljava/io/PrintStream;");
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            // PrintStream has a field 'out' (inherited from FilterOutputStream)
+            jfieldID filterOut = env->GetFieldID(psCls2, "out", "Ljava/io/OutputStream;");
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            if (filterOut && outF2) {
+              jobject ps = env->GetStaticObjectField(systemCls, outF2);
+              if (ps) {
+                jobject fos = env->GetObjectField(ps, filterOut);
+                if (fos && env->IsInstanceOf(fos, fosCls)) {
+                  env->SetObjectField(fos, trackerF, nullptr);
+                }
+              }
+              if (env->ExceptionCheck()) env->ExceptionClear();
+            }
+            if (filterOut && errF2) {
+              jobject ps = env->GetStaticObjectField(systemCls, errF2);
+              if (ps) {
+                jobject fos = env->GetObjectField(ps, filterOut);
+                if (fos && env->IsInstanceOf(fos, fosCls)) {
+                  env->SetObjectField(fos, trackerF, nullptr);
+                }
+              }
+              if (env->ExceptionCheck()) env->ExceptionClear();
+            }
+          }
+          fprintf(stderr, "[dalvikvm] Nulled IoTracker on System.out/err\n");
+        }
+      }
+      if (env->ExceptionCheck()) env->ExceptionClear();
+    }
     if (env->ExceptionCheck()) env->ExceptionClear();
     fflush(stderr);
   }
@@ -1319,6 +1597,68 @@ static int InvokeMain(JNIEnv* env, char** argv) {
           fprintf(stderr, "[dalvikvm] Cleared Thread.threadLocals\n");
         }
       }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
+
+  // Force-initialize BlockGuard class so threadPolicy ThreadLocal is created
+  // With verify-only boot image, <clinit> wasn't run during image generation
+  {
+    ScopedObjectAccess soa(art::Thread::Current());
+    art::ObjPtr<art::mirror::Class> bgClass = art::Runtime::Current()->GetClassLinker()->
+        FindSystemClass(art::Thread::Current(), "Ldalvik/system/BlockGuard;");
+    if (bgClass != nullptr) {
+      art::StackHandleScope<1> hs(art::Thread::Current());
+      art::Handle<art::mirror::Class> h(hs.NewHandle(bgClass));
+      art::Runtime::Current()->GetClassLinker()->EnsureInitialized(
+          art::Thread::Current(), h, true, true);
+      if (art::Thread::Current()->IsExceptionPending()) {
+        art::Thread::Current()->ClearException();
+      }
+      fprintf(stderr, "[dalvikvm] BlockGuard force-initialized\n");
+    }
+  }
+  if (env->ExceptionCheck()) env->ExceptionClear();
+
+  // Register MessageQueue native methods (needed for Looper/Handler/ActivityThread)
+  {
+    jclass mqCls = env->FindClass("android/os/MessageQueue");
+    if (env->ExceptionCheck()) { env->ExceptionClear(); mqCls = nullptr; }
+    if (mqCls) {
+      // Stub natives for MessageQueue — minimal epoll-based Looper
+      static auto nativeInit = +[](JNIEnv*, jobject) -> jlong {
+        int epollFd = epoll_create1(EPOLL_CLOEXEC);
+        int eventFd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        if (epollFd >= 0 && eventFd >= 0) {
+          struct epoll_event ev = {}; ev.events = EPOLLIN; ev.data.fd = eventFd;
+          epoll_ctl(epollFd, EPOLL_CTL_ADD, eventFd, &ev);
+        }
+        return (jlong)((((int64_t)epollFd) << 32) | (eventFd & 0xFFFFFFFFL));
+      };
+      static auto nativeDestroy = +[](JNIEnv*, jobject, jlong ptr) {
+        close((int)(ptr >> 32)); close((int)(ptr & 0xFFFFFFFFL));
+      };
+      static auto nativePollOnce = +[](JNIEnv*, jobject, jlong ptr, jint timeoutMs) {
+        struct epoll_event events[4];
+        epoll_wait((int)(ptr >> 32), events, 4, timeoutMs > 0 ? timeoutMs : 0);
+      };
+      static auto nativeWake = +[](JNIEnv*, jobject, jlong ptr) {
+        uint64_t val = 1; write((int)(ptr & 0xFFFFFFFFL), &val, sizeof(val));
+      };
+      static auto nativeIsPolling = +[](JNIEnv*, jobject, jlong) -> jboolean { return JNI_FALSE; };
+      static auto nativeSetFdEvents = +[](JNIEnv*, jobject, jlong, jint, jint) {};
+
+      JNINativeMethod methods[] = {
+        {"nativeInit", "()J", (void*)nativeInit},
+        {"nativeDestroy", "(J)V", (void*)nativeDestroy},
+        {"nativePollOnce", "(JI)V", (void*)nativePollOnce},
+        {"nativeWake", "(J)V", (void*)nativeWake},
+        {"nativeIsPolling", "(J)Z", (void*)nativeIsPolling},
+        {"nativeSetFileDescriptorEvents", "(JII)V", (void*)nativeSetFdEvents},
+      };
+      int rc = env->RegisterNatives(mqCls, methods, 6);
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      fprintf(stderr, "[dalvikvm] MessageQueue natives registered (rc=%d)\n", rc);
     }
     if (env->ExceptionCheck()) env->ExceptionClear();
   }
@@ -1524,6 +1864,35 @@ static int InvokeMain(JNIEnv* env, char** argv) {
       }
     }
     if (env->ExceptionCheck()) env->ExceptionClear();
+  }
+
+  // Late-patch sysprop methods right before main() — after all class loading
+  // so the entries don't get overwritten by ClassLinker.
+  {
+    art::ScopedObjectAccess soa(art::Thread::Current());
+    auto latePatch = [&](const char* classDesc, const char* methodName,
+                         const char* sig, void* nativeFunc) {
+      art::ObjPtr<art::mirror::Class> cls =
+          art::Runtime::Current()->GetClassLinker()->FindSystemClass(soa.Self(), classDesc);
+      if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
+      if (cls == nullptr) return;
+      for (art::ArtMethod& m : cls->GetDeclaredMethods(art::kRuntimePointerSize)) {
+        if (strcmp(m.GetName(), methodName) == 0 &&
+            m.GetSignature().ToString() == sig) {
+          if (!m.IsNative()) m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+          m.SetEntryPointFromJni(nativeFunc);
+          fprintf(stderr, "[dalvikvm] Late-patched %s.%s\n", classDesc, methodName);
+          break;
+        }
+      }
+      if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
+    };
+    latePatch("Landroid/sysprop/SocProperties;", "soc_manufacturer",
+        "()Ljava/util/Optional;", (void*)SocProperties_soc_manufacturer);
+    latePatch("Landroid/sysprop/SocProperties;", "soc_model",
+        "()Ljava/util/Optional;", (void*)SocProperties_soc_model);
+    latePatch("Landroid/sysprop/TelephonyProperties;", "baseband_version",
+        "()Ljava/util/List;", (void*)TelephonyProperties_baseband_version);
   }
 
   fprintf(stderr, "[dalvikvm] Calling main()...\n");
@@ -1753,7 +2122,69 @@ extern "C" const char *__asan_default_options() {
     return "detect_leaks=0";
 }
 
+// SIGBUS handler to log the faulting address and program counter
+static void westlake_sigbus_handler(int sig, siginfo_t* info, void* ucontext_raw) {
+  ucontext_t* uc = reinterpret_cast<ucontext_t*>(ucontext_raw);
+  void* fault_addr = info->si_addr;
+  void* pc = nullptr;
+  void* lr = nullptr;
+#if defined(__aarch64__)
+  pc = reinterpret_cast<void*>(uc->uc_mcontext.pc);
+  lr = reinterpret_cast<void*>(uc->uc_mcontext.regs[30]);
+#endif
+  char buf[256];
+  int n = snprintf(buf, sizeof(buf),
+      "\n[WESTLAKE_SIGBUS] sig=%d addr=%p pc=%p lr=%p\n"
+      "[WESTLAKE_SIGBUS] x0=%p x1=%p x19=%p\n",
+      sig, fault_addr, pc, lr,
+#if defined(__aarch64__)
+      reinterpret_cast<void*>(uc->uc_mcontext.regs[0]),
+      reinterpret_cast<void*>(uc->uc_mcontext.regs[1]),
+      reinterpret_cast<void*>(uc->uc_mcontext.regs[19])
+#else
+      nullptr, nullptr, nullptr
+#endif
+  );
+  write(STDERR_FILENO, buf, n);
+
+  // Try to get the current ART method from the Thread
+  art::Thread* self = art::Thread::Current();
+  if (self != nullptr) {
+    const art::ManagedStack* stack = self->GetManagedStack();
+    if (stack != nullptr) {
+      art::ShadowFrame* frame = stack->GetTopShadowFrame();
+      if (frame != nullptr) {
+        art::ArtMethod* method = frame->GetMethod();
+        if (method != nullptr) {
+          const char* shorty = method->GetShorty();
+          n = snprintf(buf, sizeof(buf),
+              "[WESTLAKE_SIGBUS] current_method=%p native=%d entry=%p jni=%p shorty=%s\n",
+              method, method->IsNative(),
+              method->GetEntryPointFromQuickCompiledCode(),
+              method->GetEntryPointFromJni(),
+              shorty ? shorty : "?");
+          write(STDERR_FILENO, buf, n);
+          std::string pretty = method->PrettyMethod();
+          n = snprintf(buf, sizeof(buf), "[WESTLAKE_SIGBUS] method: %s\n", pretty.c_str());
+          write(STDERR_FILENO, buf, n);
+        }
+      }
+    }
+  }
+
+  // Re-raise to get default crash handler
+  signal(sig, SIG_DFL);
+  raise(sig);
+}
+
 int main(int argc, char** argv) {
+  // Install SIGBUS handler to diagnose stale entry points
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_sigaction = westlake_sigbus_handler;
+  sa.sa_flags = SA_SIGINFO;
+  sigaction(SIGBUS, &sa, nullptr);
+
   // Do not allow static destructors to be called, since it's conceivable that
   // daemons may still awaken (literally).
   art::FastExit(art::dalvikvm(argc, argv));

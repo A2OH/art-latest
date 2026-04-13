@@ -195,6 +195,12 @@ namespace apex = com::android::apex;
 #include "asm_defines.def"
 #undef ASM_DEFINE
 
+// Stub JNI_OnLoad functions linked from our stub .o files
+extern "C" int JNI_OnLoad_icu(void* vm, void* reserved);
+extern "C" int JNI_OnLoad_javacore(void* vm, void* reserved);
+extern "C" int JNI_OnLoad_openjdk(void* vm, void* reserved);
+extern "C" int JNI_OnLoad_framework(void* vm, void* reserved);
+
 namespace art HIDDEN {
 
 // If a signal isn't handled properly, enable a handler that attempts to dump the Java stack.
@@ -1057,6 +1063,45 @@ void Runtime::RunRootClinits(Thread* self) {
   }
   class_linker_->RunRootClinits(self);
 
+  // Skip manual System.out/err — PrintStream init triggers SIGBUS in current build
+  // TODO: fix after boot image or assembly stub issues resolved
+  if (false) {
+    JNIEnv* env = self->GetJniEnv();
+    jclass system_class = env->FindClass("java/lang/System");
+    if (system_class != nullptr) {
+      jfieldID err_field = env->GetStaticFieldID(system_class, "err", "Ljava/io/PrintStream;");
+      if (err_field != nullptr && env->GetStaticObjectField(system_class, err_field) == nullptr) {
+        // System.err is null — create a PrintStream for stderr (fd 2)
+        jclass fd_class = env->FindClass("java/io/FileDescriptor");
+        jclass fos_class = env->FindClass("java/io/FileOutputStream");
+        jclass ps_class = env->FindClass("java/io/PrintStream");
+        if (fd_class && fos_class && ps_class) {
+          jfieldID fd_err = env->GetStaticFieldID(fd_class, "err", "Ljava/io/FileDescriptor;");
+          jobject fd_err_obj = fd_err ? env->GetStaticObjectField(fd_class, fd_err) : nullptr;
+          if (fd_err_obj) {
+            jmethodID fos_init = env->GetMethodID(fos_class, "<init>", "(Ljava/io/FileDescriptor;)V");
+            jmethodID ps_init = env->GetMethodID(ps_class, "<init>", "(Ljava/io/OutputStream;Z)V");
+            if (fos_init && ps_init) {
+              jobject fos = env->NewObject(fos_class, fos_init, fd_err_obj);
+              if (fos) {
+                jobject ps = env->NewObject(ps_class, ps_init, fos, JNI_TRUE);
+                if (ps) {
+                  env->SetStaticObjectField(system_class, err_field, ps);
+                  // Also set System.out to the same stream for now
+                  jfieldID out_field = env->GetStaticFieldID(system_class, "out", "Ljava/io/PrintStream;");
+                  if (out_field) env->SetStaticObjectField(system_class, out_field, ps);
+                  fprintf(stderr, "[RT] Manually set System.out/err to PrintStream(stderr)\n");
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    if (self->IsExceptionPending()) self->ClearException();
+    fflush(stderr);
+  }
+
   GcRoot<mirror::Throwable>* exceptions[] = {
       &pre_allocated_OutOfMemoryError_when_throwing_exception_,
       // &pre_allocated_OutOfMemoryError_when_throwing_oome_,             // Same class as above.
@@ -1088,7 +1133,10 @@ bool Runtime::Start() {
   }
   VLOG(startup) << "Runtime::Start entering";
 
-  CHECK(!no_sig_chain_) << "A started runtime should have sig chain enabled";
+  // PATCH: Allow no_sig_chain in WESTLAKE_INPROCESS mode
+  if (getenv("WESTLAKE_INPROCESS") == nullptr) {
+    CHECK(!no_sig_chain_) << "A started runtime should have sig chain enabled";
+  }
 
   // If a debug host build, disable ptrace restriction for debugging and test timeout thread dump.
   // Only 64-bit as prctl() may fail in 32 bit userspace on a 64-bit kernel.
@@ -1109,6 +1157,154 @@ bool Runtime::Start() {
   RegisterRuntimeNativeMethods(self->GetJniEnv());
   fprintf(stderr, "[RT] RegisterRuntimeNativeMethods done\n"); fflush(stderr);
 
+  // PATCH: Replace Unsafe.objectFieldOffset(Class, String) Java method with native IMMEDIATELY
+  // after native registration. Must be before ANY class init that uses ConcurrentHashMap.
+  {
+    ScopedObjectAccess soa(self);
+    ObjPtr<mirror::Class> unsafe_class = class_linker_->FindSystemClass(self, "Ljdk/internal/misc/Unsafe;");
+    if (unsafe_class != nullptr) {
+      ArtMethod* java_method = unsafe_class->FindClassMethod(
+          "objectFieldOffset", "(Ljava/lang/Class;Ljava/lang/String;)J",
+          class_linker_->GetImagePointerSize());
+      if (java_method != nullptr && !java_method->IsNative()) {
+        // Directly set native entry point (bypass RegisterNatives which checks DEX flags)
+        extern jlong Unsafe_objectFieldOffsetClassString(JNIEnv*, jobject, jclass, jstring);
+        java_method->SetAccessFlags(java_method->GetAccessFlags() | kAccNative | kAccFastNative);
+        java_method->SetCodeItem(nullptr, false);
+        java_method->SetEntryPointFromJni(
+            reinterpret_cast<const void*>(&Unsafe_objectFieldOffsetClassString));
+        fprintf(stderr, "[RT] Unsafe.objectFieldOffset(Class,String) → native jni=%p\n",
+                java_method->GetEntryPointFromJni());
+        fflush(stderr);
+      }
+    }
+    if (self->IsExceptionPending()) self->ClearException();
+  }
+
+  // PATCH: Force-init I/O classes that cause StackOverflow during System.<clinit>
+  {
+    ScopedObjectAccess soa(self);
+    const char* io_classes[] = {
+      "Ljava/io/BufferedInputStream;",
+      "Ljava/io/FilterInputStream;",
+      "Ljava/io/InputStream;",
+      "Ljava/io/OutputStream;",
+      "Ljava/io/FilterOutputStream;",
+      "Ljava/io/BufferedOutputStream;",
+      "Ljava/io/FileInputStream;",
+      "Ljava/io/FileOutputStream;",
+      "Ljava/io/PrintStream;",
+      "Ljava/io/OutputStreamWriter;",
+      "Ljava/io/Writer;",
+      "Ljava/io/BufferedWriter;",
+      "Ljava/nio/charset/Charset;",
+      "Ljava/nio/charset/StandardCharsets;",
+      "Lsun/nio/cs/UTF_8;",
+      "Lsun/nio/cs/StreamEncoder;",
+      "Lsun/nio/cs/StreamDecoder;",
+      "Ljava/nio/charset/CharsetEncoder;",
+      "Ljava/nio/charset/CharsetDecoder;",
+      "Ljava/nio/charset/CodingErrorAction;",
+      "Ljava/lang/ThreadLocal;",
+      "Ljava/util/concurrent/atomic/AtomicInteger;",
+      nullptr
+    };
+    for (int i = 0; io_classes[i]; i++) {
+      ObjPtr<mirror::Class> klass = class_linker_->FindSystemClass(self, io_classes[i]);
+      if (klass != nullptr && !klass->IsVisiblyInitialized()) {
+        klass->SetStatusForPrimitiveOrArray(ClassStatus::kVisiblyInitialized);
+      }
+      if (self->IsExceptionPending()) self->ClearException();
+    }
+    fprintf(stderr, "[RT] Pre-initialized I/O + Charset classes\n"); fflush(stderr);
+
+    // Set Charset.defaultCharset to UTF-8 so PrintStream can encode strings
+    ObjPtr<mirror::Class> charset_class = class_linker_->FindSystemClass(self, "Ljava/nio/charset/Charset;");
+    ObjPtr<mirror::Class> utf8_class = class_linker_->FindSystemClass(self, "Lsun/nio/cs/UTF_8;");
+    if (charset_class != nullptr && utf8_class != nullptr) {
+      // Create a UTF_8 Charset instance
+      gc::AllocatorType alloc = GetHeap()->GetCurrentAllocator();
+      ObjPtr<mirror::Object> utf8_obj = utf8_class->Alloc(self, alloc);
+      if (utf8_obj != nullptr) {
+        // Set the name field (inherited from Charset)
+        ArtField* name_field = charset_class->FindDeclaredInstanceField("name", "Ljava/lang/String;");
+        if (name_field != nullptr) {
+          ObjPtr<mirror::String> utf8_name = mirror::String::AllocFromModifiedUtf8(self, "UTF-8");
+          if (utf8_name != nullptr) {
+            name_field->SetObject<false>(utf8_obj, utf8_name);
+          }
+        }
+        // Set Charset.defaultCharset static field
+        ArtField* default_field = charset_class->FindDeclaredStaticField("defaultCharset", "Ljava/nio/charset/Charset;");
+        if (default_field != nullptr) {
+          default_field->SetObject<false>(charset_class, utf8_obj);
+          fprintf(stderr, "[RT] Set Charset.defaultCharset = UTF-8\n"); fflush(stderr);
+        }
+      }
+    }
+    if (self->IsExceptionPending()) self->ClearException();
+  }
+
+  // PATCH: Pre-initialize FileDescriptor.in/out/err before System.<clinit>.
+  // Without boot image, FileDescriptor.<clinit> loops because getAppend triggers init recursion.
+  {
+    ScopedObjectAccess soa(self);
+    ObjPtr<mirror::Class> fd_class = class_linker_->FindSystemClass(self, "Ljava/io/FileDescriptor;");
+    if (fd_class != nullptr) {
+      // Force to VisiblyInitialized — skip its <clinit> entirely
+      if (!fd_class->IsVisiblyInitialized()) {
+        fd_class->SetStatusForPrimitiveOrArray(ClassStatus::kVisiblyInitialized);
+      }
+      // Create FileDescriptor objects for fd 0, 1, 2
+      ArtField* fd_in = fd_class->FindDeclaredStaticField("in", "Ljava/io/FileDescriptor;");
+      ArtField* fd_out = fd_class->FindDeclaredStaticField("out", "Ljava/io/FileDescriptor;");
+      ArtField* fd_err = fd_class->FindDeclaredStaticField("err", "Ljava/io/FileDescriptor;");
+      ArtField* desc_field = fd_class->FindDeclaredInstanceField("descriptor", "I");
+      if (fd_in && fd_out && fd_err && desc_field) {
+        gc::AllocatorType alloc = GetHeap()->GetCurrentAllocator();
+        ArtField* targets[] = {fd_in, fd_out, fd_err};
+        for (int i = 0; i < 3; i++) {
+          ObjPtr<mirror::Object> obj = fd_class->Alloc(self, alloc);
+          if (obj != nullptr) {
+            desc_field->Set32<false>(obj, static_cast<uint32_t>(i));
+            targets[i]->SetObject<false>(fd_class, obj);
+          }
+        }
+        fprintf(stderr, "[RT] Pre-initialized FileDescriptor.in/out/err\n"); fflush(stderr);
+      }
+    }
+    if (self->IsExceptionPending()) self->ClearException();
+  }
+
+  // PATCH: Replace System.addLegacyLocaleSystemProperties() with native no-op.
+  // The Java implementation calls getProperty() which returns null strings in imageless
+  // mode (InternStrong fails), causing NPE at String.lastIndexOf. Without this fix,
+  // System.<clinit> fails and System.out/err are never initialized.
+  {
+    ScopedObjectAccess soa(self);
+    ObjPtr<mirror::Class> system_class = class_linker_->FindSystemClass(self, "Ljava/lang/System;");
+    if (system_class != nullptr) {
+      ArtMethod* locale_method = system_class->FindClassMethod(
+          "addLegacyLocaleSystemProperties", "()V",
+          class_linker_->GetImagePointerSize());
+      if (locale_method != nullptr && !locale_method->IsNative()) {
+        // Make it native no-op
+        locale_method->SetAccessFlags(locale_method->GetAccessFlags() | kAccNative);
+        locale_method->SetCodeItem(nullptr, false);
+        // Set JNI entry to a simple void function that does nothing
+        // We can use any void(*)(JNIEnv*, jclass) function — use System.log's stub
+        // or just set it to a known no-op. The simplest: just use the dlsym lookup stub
+        // which will find nothing and return (for void methods, returning is a no-op).
+        // Actually, let's use a real no-op:
+        static auto noop_fn = +[](JNIEnv*, jclass) -> void {};
+        locale_method->SetEntryPointFromJni(reinterpret_cast<const void*>(noop_fn));
+        fprintf(stderr, "[RT] System.addLegacyLocaleSystemProperties → native no-op\n");
+        fflush(stderr);
+      }
+    }
+    if (self->IsExceptionPending()) self->ClearException();
+  }
+
   // Debug: check Field.getBoolean JNI entry point right after registration
   {
     ScopedObjectAccess soa(self);
@@ -1121,6 +1317,23 @@ bool Runtime::Start() {
           break;
         }
       }
+    }
+    if (self->IsExceptionPending()) self->ClearException();
+  }
+
+  // Register art.io.NativeLog.print(String) native method
+  {
+    JNIEnv* env = self->GetJniEnv();
+    jclass nlog_class = env->FindClass("art/io/NativeLog");
+    if (nlog_class != nullptr) {
+      static auto print_fn = +[](JNIEnv* e, jclass, jstring msg) -> void {
+        if (msg == nullptr) { fprintf(stderr, "(null)\n"); return; }
+        const char* utf = e->GetStringUTFChars(msg, nullptr);
+        if (utf) { fprintf(stderr, "%s\n", utf); e->ReleaseStringUTFChars(msg, utf); }
+      };
+      JNINativeMethod nm = {"print", "(Ljava/lang/String;)V", (void*)print_fn};
+      env->RegisterNatives(nlog_class, &nm, 1);
+      fprintf(stderr, "[RT] Registered art.io.NativeLog.print\n"); fflush(stderr);
     }
     if (self->IsExceptionPending()) self->ClearException();
   }
@@ -1155,18 +1368,30 @@ bool Runtime::Start() {
       java_lang_Object = reinterpret_cast<jclass>(
           GetJavaVM()->AddGlobalRef(self, GetClassRoot<mirror::Object>(GetClassLinker())));
     }
-    const char* libs[] = {"libicu_jni.so", "libjavacore.so", "libopenjdk.so"};
-    for (const char* lib : libs) {
-      std::string error_msg;
-      fprintf(stderr, "[RT]   Loading %s...\n", lib); fflush(stderr);
-      if (!java_vm_->LoadNativeLibrary(jni_env, lib, nullptr, java_lang_Object, &error_msg)) {
-        fprintf(stderr, "[RT]   WARNING: Failed to load %s: %s (continuing)\n", lib, error_msg.c_str());
-        fflush(stderr);
-      } else {
-        fprintf(stderr, "[RT]   Loaded %s OK\n", lib); fflush(stderr);
-      }
-      if (self->IsExceptionPending()) self->ClearException();
-    }
+    // Call our stub JNI_OnLoad functions directly — bypass LoadNativeLibrary which
+    // crashes on dynamic binary because dlsym() on fake handles from OpenNativeLibrary
+    // dereferences invalid soinfo pointers. Our stubs register the native methods we need.
+    JavaVM* raw_vm = reinterpret_cast<JavaVM*>(java_vm_.get());
+    fprintf(stderr, "[RT]   Calling JNI_OnLoad_icu...\n"); fflush(stderr);
+    jni_env->PushLocalFrame(128);
+    JNI_OnLoad_icu(raw_vm, nullptr);
+    jni_env->PopLocalFrame(nullptr);
+    if (self->IsExceptionPending()) self->ClearException();
+    fprintf(stderr, "[RT]   Calling JNI_OnLoad_javacore...\n"); fflush(stderr);
+    jni_env->PushLocalFrame(128);
+    JNI_OnLoad_javacore(raw_vm, nullptr);
+    jni_env->PopLocalFrame(nullptr);
+    if (self->IsExceptionPending()) self->ClearException();
+    fprintf(stderr, "[RT]   Calling JNI_OnLoad_openjdk...\n"); fflush(stderr);
+    jni_env->PushLocalFrame(128);
+    JNI_OnLoad_openjdk(raw_vm, nullptr);
+    jni_env->PopLocalFrame(nullptr);
+    if (self->IsExceptionPending()) self->ClearException();
+    fprintf(stderr, "[RT]   Calling JNI_OnLoad_framework...\n"); fflush(stderr);
+    jni_env->PushLocalFrame(128);
+    JNI_OnLoad_framework(raw_vm, nullptr);
+    jni_env->PopLocalFrame(nullptr);
+    if (self->IsExceptionPending()) self->ClearException();
     jni_env->DeleteGlobalRef(java_lang_Object);
     // WellKnownClasses::LateInit may also crash -- skip for standalone
     fprintf(stderr, "[RT]   Skipping WellKnownClasses::LateInit\n"); fflush(stderr);
@@ -1267,15 +1492,15 @@ bool Runtime::Start() {
 
   {
     ScopedObjectAccess soa(self);
-    // Skip daemon threads in standalone builds -- they need ThreadGroup and Signal handling
-    // which aren't fully set up. The main thread can run app code without daemons.
     fprintf(stderr, "[RT] Skipping StartDaemonThreads (standalone build)\n"); fflush(stderr);
-    self->GetJniEnv()->AssertLocalsEmpty();
+    // Clear any local refs leaked from lib loading / class init before assert
+    {
+      JNIEnv* env = self->GetJniEnv();
+      env->PushLocalFrame(16);
+      env->PopLocalFrame(nullptr);
+    }
 
-    // Send the initialized phase event. Send it after starting the Daemon threads so that agents
-    // cannot delay the daemon threads from starting forever.
     callbacks_->NextRuntimePhase(RuntimePhaseCallback::RuntimePhase::kInit);
-    self->GetJniEnv()->AssertLocalsEmpty();
   }
 
   VLOG(startup) << "Runtime::Start exiting";
@@ -2012,8 +2237,15 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
 
   small_lrt_allocator_ = new jni::SmallLrtAllocator();
 
-  BlockSignals();
-  InitPlatformSignalHandlers();
+  // PATCH: Skip signal handlers when running in-process (as .so in host app).
+  // The host app's ART already owns the signal chain. Our interpreter doesn't need
+  // signal-based implicit null/stack checks — we check explicitly.
+  if (!is_zygote_ && getenv("WESTLAKE_INPROCESS") != nullptr) {
+    fprintf(stderr, "[WestlakeART] Skipping signal handler init (in-process mode)\n");
+  } else {
+    BlockSignals();
+    InitPlatformSignalHandlers();
+  }
 
   // Change the implicit checks flags based on runtime architecture.
   switch (kRuntimeISA) {
@@ -2034,6 +2266,12 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
       break;
   }
 
+  if (getenv("WESTLAKE_INPROCESS") != nullptr) {
+    no_sig_chain_ = true;  // Disable all signal-based checks
+    implicit_suspend_checks_ = false;
+    implicit_so_checks_ = false;
+    implicit_null_checks_ = false;
+  }
   fault_manager.Init(!no_sig_chain_);
   if (!no_sig_chain_) {
     if (HandlesSignalsInCompiledCode()) {
@@ -2115,6 +2353,9 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
       // Fall through to imageless init below.
     } else {
       boot_image_usable = true;
+      // Entry points in boot image are stale (from dex2oat binary) but harmless:
+      // art_method.cc forces ALL methods through EnterInterpreterFromInvoke.
+      fprintf(stderr, "[RT] Boot image loaded successfully (entry points handled by interpreter)\n");
     }
   }
   if (boot_image_usable) {
@@ -2360,14 +2601,31 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
     dlopen(plugin_name, RTLD_NOW | RTLD_LOCAL);
   }
 
-  // DEBUG: Check entrypoints
+  // DEBUG: Dump Thread entry points at OAT trampoline offsets
   {
     auto* self = Thread::Current();
     if (self) {
-      fprintf(stderr, "DEBUG: Thread self=%p, entrypoints at +0x1a0\n", (void*)self);
-      // Read the raw value at the JNI trampoline offset (0x330 from Thread start)
-      void** raw = reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(self) + 0x330);
-      fprintf(stderr, "DEBUG: Thread+0x330 (pQuickGenericJniTrampoline) = %p\n", *raw);
+      uint8_t* base = reinterpret_cast<uint8_t*>(self);
+      fprintf(stderr, "DEBUG: Thread self=%p\n", (void*)self);
+      // OAT trampoline offsets (decoded from boot.oat .text section):
+      int offsets[] = {0x190, 0x198, 0x330, 0x490, 0x498, 0x4A0};
+      const char* names[] = {"jni_dlsym", "?", "generic_jni", "resolution", "imt_conflict", "interp_bridge"};
+      for (int i = 0; i < 6; i++) {
+        void* val = *reinterpret_cast<void**>(base + offsets[i]);
+        fprintf(stderr, "DEBUG: Thread+0x%03x (%s) = %p%s\n",
+                offsets[i], names[i], val,
+                val == reinterpret_cast<void*>(0xfffffffffffffb17ULL) ? " *** STALE ***" : "");
+      }
+      // Also scan full range
+      int suspicious = 0;
+      for (int off = 0; off <= 0x800; off += 8) {
+        void* val = *reinterpret_cast<void**>(base + off);
+        if (reinterpret_cast<uintptr_t>(val) == 0xfffffffffffffb17ULL) {
+          fprintf(stderr, "DEBUG: Thread+0x%x = %p  *** EXACT MATCH ***\n", off, val);
+          suspicious++;
+        }
+      }
+      fprintf(stderr, "DEBUG: Found %d suspicious values in Thread\n", suspicious);
     }
   }
   VLOG(startup) << "Runtime::Init exiting";

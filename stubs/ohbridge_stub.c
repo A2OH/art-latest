@@ -999,3 +999,44 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
 
     return JNI_VERSION_1_6;
 }
+
+/* MessageQueue native stubs for Looper/Handler support */
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+
+static jlong MessageQueue_nativeInit(JNIEnv* env, jobject obj) {
+    // Create epoll fd + event fd (minimal Looper implementation)
+    int epollFd = epoll_create1(EPOLL_CLOEXEC);
+    int eventFd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (epollFd >= 0 && eventFd >= 0) {
+        struct epoll_event ev;
+        ev.events = EPOLLIN;
+        ev.data.fd = eventFd;
+        epoll_ctl(epollFd, EPOLL_CTL_ADD, eventFd, &ev);
+    }
+    // Return epollFd as the "native pointer" (Looper stores this)
+    return (jlong)((((long long)epollFd) << 32) | (eventFd & 0xFFFFFFFFL));
+}
+static void MessageQueue_nativeDestroy(JNIEnv* env, jobject obj, jlong ptr) {
+    int epollFd = (int)(ptr >> 32);
+    int eventFd = (int)(ptr & 0xFFFFFFFFL);
+    if (epollFd >= 0) close(epollFd);
+    if (eventFd >= 0) close(eventFd);
+}
+static void MessageQueue_nativePollOnce(JNIEnv* env, jobject obj, jlong ptr, jint timeoutMillis) {
+    int epollFd = (int)(ptr >> 32);
+    struct epoll_event events[8];
+    epoll_wait(epollFd, events, 8, timeoutMillis);
+}
+static void MessageQueue_nativeWake(JNIEnv* env, jobject obj, jlong ptr) {
+    int eventFd = (int)(ptr & 0xFFFFFFFFL);
+    uint64_t val = 1;
+    write(eventFd, &val, sizeof(val));
+}
+static jboolean MessageQueue_nativeIsPolling(JNIEnv* env, jobject obj, jlong ptr) {
+    return JNI_FALSE;
+}
+static void MessageQueue_nativeSetFileDescriptorEvents(JNIEnv* env, jobject obj,
+    jlong ptr, jint fd, jint events) {
+    // No-op for now
+}

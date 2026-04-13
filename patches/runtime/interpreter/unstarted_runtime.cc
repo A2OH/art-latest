@@ -2326,7 +2326,12 @@ void UnstartedRuntime::UnstartedJNIFieldGetNameInternal([[maybe_unused]] Thread*
                                                         JValue* result) {
   ObjPtr<mirror::Field> field = ObjPtr<mirror::Field>::DownCast(receiver);
   ArtField* art_field = field->GetArtField();
-  result->SetL(art_field->ResolveNameString());
+  ObjPtr<mirror::String> name = art_field->ResolveNameString();
+  fprintf(stderr, "[UnstartedJni] FieldGetNameInternal: field=%p art=%p name=%p (%s)\n",
+          field.Ptr(), art_field, name.Ptr(),
+          name.Ptr() ? name->ToModifiedUtf8().c_str() : "NULL");
+  fflush(stderr);
+  result->SetL(name);
 }
 
 using InvokeHandler = void(*)(Thread* self,

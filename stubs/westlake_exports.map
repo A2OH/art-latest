@@ -1,0 +1,15 @@
+{
+  global:
+    JNI_OnLoad;
+    Java_com_westlake_engine_*;
+    /* Internal art:: symbols needed by our .so itself.
+       They're still isolated from the phone's ART because
+       dlopen with RTLD_LOCAL (default for System.loadLibrary)
+       doesn't make these visible to other .so files. */
+    _ZN3art*;
+    _ZNK3art*;
+  local:
+    /* Hide everything else (libc++, android-base, etc.) */
+    _ZNSt*;
+    _ZN7android*;
+};

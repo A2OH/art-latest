@@ -228,11 +228,14 @@ RUNTIME_EXCLUDE = %backtrace_helper.cc \
   %runtime/thread.cc \
   %runtime/runtime.cc \
   %interpreter/unstarted_runtime.cc \
+  %interpreter/interpreter.cc \
+  %interpreter/interpreter_common.cc \
   %runtime/art_method.cc \
   %mirror/class.cc \
   %oat/stack_map.cc \
   %oat/image.cc \
   %runtime/hidden_api.cc \
+  %runtime/instrumentation.cc \
   %quick/quick_throw_entrypoints.cc
 
 # Exclude ALL runtime/native/*.cc -- we compile patched copies from patches/runtime/native/
@@ -296,6 +299,14 @@ $(NTERP_PATCH_OBJ): $(NTERP_PATCH_SRC)
 	$(CXX) $(CXXFLAGS) -I$(ART)/runtime/interpreter/mterp -I$(ART)/runtime/interpreter -c $< -o $@ 2>&1 && echo "OK: nterp.cc (patched)" || { echo "FAIL: nterp.cc (patched)"; rm -f $@; }
 RUNTIME_OBJS += $(NTERP_PATCH_OBJ)
 
+# Patched instrumentation.cc (InterpretOnly for native methods)
+INSTR_PATCH_SRC = patches/runtime/instrumentation.cc
+INSTR_PATCH_OBJ = $(BUILDDIR)/runtime/instrumentation.o
+$(INSTR_PATCH_OBJ): $(INSTR_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@ 2>&1 && echo "OK: instrumentation.cc (patched)" || { echo "FAIL: instrumentation.cc"; rm -f $@; }
+RUNTIME_OBJS += $(INSTR_PATCH_OBJ)
+
 # Patched hidden_api.cc
 HIDDENAPI_PATCH_SRC = patches/runtime/hidden_api.cc
 HIDDENAPI_PATCH_OBJ = $(BUILDDIR)/runtime/hidden_api.o
@@ -303,6 +314,22 @@ $(HIDDENAPI_PATCH_OBJ): $(HIDDENAPI_PATCH_SRC)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@ 2>&1 && echo "OK: hidden_api.cc (patched)" || { echo "FAIL: hidden_api.cc (patched)"; rm -f $@; }
 RUNTIME_OBJS += $(HIDDENAPI_PATCH_OBJ)
+
+# Patched interpreter.cc (InterpreterJni shorty patterns)
+INTERP_PATCH_SRC = patches/runtime/interpreter/interpreter.cc
+INTERP_PATCH_OBJ = $(BUILDDIR)/runtime/interpreter/interpreter.o
+$(INTERP_PATCH_OBJ): $(INTERP_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -I$(ART)/runtime/interpreter -c $< -o $@ 2>&1 && echo "OK: interpreter.cc (patched)" || { echo "FAIL: interpreter.cc (patched)"; rm -f $@; }
+RUNTIME_OBJS += $(INTERP_PATCH_OBJ)
+
+# Patched interpreter_common.cc (ShouldStayInSwitchInterpreter)
+INTERP_COMMON_PATCH_SRC = patches/runtime/interpreter/interpreter_common.cc
+INTERP_COMMON_PATCH_OBJ = $(BUILDDIR)/runtime/interpreter/interpreter_common.o
+$(INTERP_COMMON_PATCH_OBJ): $(INTERP_COMMON_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -I$(ART)/runtime/interpreter -c $< -o $@ 2>&1 && echo "OK: interpreter_common.cc (patched)" || { echo "FAIL: interpreter_common.cc (patched)"; rm -f $@; }
+RUNTIME_OBJS += $(INTERP_COMMON_PATCH_OBJ)
 
 # Patched unstarted_runtime.cc
 UNSTARTED_PATCH_SRC = patches/runtime/interpreter/unstarted_runtime.cc
@@ -632,9 +659,14 @@ jni-stubs:
 	    -DJNI_OnLoad=JNI_OnLoad_ohbridge \
 	    -I$(AOSP)/external/webp/include -I$(STUBS) -c $(STUBS)/ohbridge_stub.c \
 	    -o $(BUILDDIR)/jni_stubs/ohbridge_stub.o 2>&1 && echo "OK: ohbridge_stub.c" || echo "FAIL: ohbridge_stub.c"
+	@$(CC) $(TARGET_FLAGS) -fPIC -O2 -w \
+	    -I$(AOSP)/libnativehelper/include_jni \
+	    -c $(STUBS)/framework_native_stubs.c \
+	    -o $(BUILDDIR)/jni_stubs/framework_native_stubs.o 2>&1 && echo "OK: framework_native_stubs.c" || echo "FAIL: framework_native_stubs.c"
 
 # ============ link-runtime (dalvikvm without dex2oat) ============
-link-runtime: all ziparchive sigchain nativehelper dalvikvm-main fault-handler-stubs template-instantiations jni-stubs asm sve-stub metrics-stubs fmtlib tinyxml2
+# 'all' compiles AOSP base, then patched .o targets overwrite specific files
+link-runtime: all ziparchive sigchain nativehelper dalvikvm-main fault-handler-stubs template-instantiations jni-stubs asm sve-stub metrics-stubs fmtlib tinyxml2 $(RUNTIME_OBJS)
 	@echo "=== Linking dalvikvm (ARM64, static) ==="
 	@mkdir -p $(BUILDDIR)/bin
 	$(CXX) -o $(BUILDDIR)/bin/dalvikvm \
@@ -667,6 +699,7 @@ link-runtime: all ziparchive sigchain nativehelper dalvikvm-main fault-handler-s
 	  $(BUILDDIR)/jni_stubs/javacore_stub.o \
 	  $(BUILDDIR)/jni_stubs/openjdk_stub.o \
 	  $(BUILDDIR)/jni_stubs/ohbridge_stub.o \
+	  $(BUILDDIR)/jni_stubs/framework_native_stubs.o \
 	  /home/dspfac/android-sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_static.a \
 	  /home/dspfac/android-sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++abi.a \
 	  /home/dspfac/android-sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libz.a \
@@ -674,6 +707,97 @@ link-runtime: all ziparchive sigchain nativehelper dalvikvm-main fault-handler-s
 	@echo "Built: $(BUILDDIR)/bin/dalvikvm"
 	@ls -lh $(BUILDDIR)/bin/dalvikvm
 	@file $(BUILDDIR)/bin/dalvikvm
+
+# ============ link-dynamic (dalvikvm dynamically linked — can load phone's .so files) ============
+link-dynamic: all ziparchive sigchain nativehelper dalvikvm-main fault-handler-stubs template-instantiations jni-stubs asm sve-stub metrics-stubs fmtlib tinyxml2 $(RUNTIME_OBJS)
+	@echo "=== Linking dalvikvm (ARM64, dynamic) ==="
+	@mkdir -p $(BUILDDIR)/bin
+	$(CXX) -o $(BUILDDIR)/bin/dalvikvm-dynamic \
+	  $(TARGET_FLAGS) \
+	  -stdlib=libc++ \
+	  -Wl,--unresolved-symbols=ignore-in-object-files \
+	  -Wl,--allow-multiple-definition \
+	  $(BUILDDIR)/dalvikvm/dalvikvm.o \
+	  $$(find $(BUILDDIR)/nativehelper -name '*.o') \
+	  $$(find $(BUILDDIR)/runtime -name '*.o') \
+	  $$(find $(BUILDDIR)/libdexfile -name '*.o') \
+	  $$(find $(BUILDDIR)/libartbase -name '*.o') \
+	  $$(find $(BUILDDIR)/libelffile -name '*.o') \
+	  $$(find $(BUILDDIR)/libprofile -name '*.o') \
+	  $$(find $(BUILDDIR)/compiler -name '*.o') \
+	  $$(find $(BUILDDIR)/vixl -name '*.o') \
+	  $$(find $(BUILDDIR)/android-base -name '*.o') \
+	  $$(find $(BUILDDIR)/ziparchive -name '*.o') \
+	  $(BUILDDIR)/sigchain/sigchain.o \
+	  $(ASM_QUICK) $(ASM_JNI) $(ASM_MEMCMP) $(ASM_STUBS) \
+	  $(STUBS_OBJ) \
+	  $(SVE_STUB_OBJ) \
+	  $(BUILDDIR)/stubs/fault_handler_stubs.o \
+	  $(BUILDDIR)/stubs/template_instantiations.o \
+	  $(BUILDDIR)/fmtlib/format.o \
+	  $(BUILDDIR)/tinyxml2/tinyxml2.o \
+	  $(METRICS_STUBS_OBJ) $(BUILDDIR)/stubs/thread_cpu_stub.o $(BUILDDIR)/stubs/exact_stubs.o \
+	  $(BUILDDIR)/jni_stubs/icu_jni_stub.o \
+	  $(BUILDDIR)/jni_stubs/javacore_stub.o \
+	  $(BUILDDIR)/jni_stubs/openjdk_stub.o \
+	  $(BUILDDIR)/jni_stubs/ohbridge_stub.o \
+	  $(BUILDDIR)/jni_stubs/framework_native_stubs.o \
+	  $(BUILDDIR)/stubs/missing_stubs.o \
+	  -lc++_shared -lz -ldl -lm -llog
+	@echo "Built: $(BUILDDIR)/bin/dalvikvm-dynamic"
+	@ls -lh $(BUILDDIR)/bin/dalvikvm-dynamic
+	@file $(BUILDDIR)/bin/dalvikvm-dynamic
+
+# ============ link-shared (libwestlake_art.so for in-app loading) ============
+WESTLAKE_JNI_OBJ = $(BUILDDIR)/stubs/westlake_jni.o
+$(WESTLAKE_JNI_OBJ): stubs/westlake_jni.cc
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@ 2>&1 && echo "OK: westlake_jni.cc" || { echo "FAIL: westlake_jni.cc"; rm -f $@; }
+
+link-shared: all $(RUNTIME_OBJS) $(WESTLAKE_JNI_OBJ) ziparchive sigchain nativehelper fault-handler-stubs template-instantiations jni-stubs asm sve-stub metrics-stubs fmtlib tinyxml2
+	@echo "=== Linking libwestlake_art.so (ARM64, shared) ==="
+	@mkdir -p $(BUILDDIR)/lib
+	$(CXX) -o $(BUILDDIR)/lib/libwestlake_art.so \
+	  $(TARGET_FLAGS) -shared -fPIC \
+	  -stdlib=libc++ \
+	  -Wl,--unresolved-symbols=ignore-all \
+	  -Wl,--allow-multiple-definition \
+	  -Wl,--allow-shlib-undefined \
+	  -Wl,-soname,libwestlake_art.so \
+	  -Wl,--version-script=$(CURDIR)/stubs/westlake_exports.map \
+	  -Wl,--exclude-libs,ALL \
+	  $(WESTLAKE_JNI_OBJ) \
+	  $$(find $(BUILDDIR)/nativehelper -name '*.o') \
+	  $$(find $(BUILDDIR)/runtime -name '*.o') \
+	  $$(find $(BUILDDIR)/libdexfile -name '*.o') \
+	  $$(find $(BUILDDIR)/libartbase -name '*.o') \
+	  $$(find $(BUILDDIR)/libelffile -name '*.o') \
+	  $$(find $(BUILDDIR)/libprofile -name '*.o') \
+	  $$(find $(BUILDDIR)/compiler -name '*.o') \
+	  $$(find $(BUILDDIR)/vixl -name '*.o') \
+	  $$(find $(BUILDDIR)/android-base -name '*.o') \
+	  $$(find $(BUILDDIR)/ziparchive -name '*.o') \
+	  $(BUILDDIR)/sigchain/sigchain.o \
+	  $(ASM_QUICK) $(ASM_JNI) $(ASM_MEMCMP) $(ASM_STUBS) \
+	  $(STUBS_OBJ) \
+	  $(SVE_STUB_OBJ) \
+	  $(BUILDDIR)/stubs/fault_handler_stubs.o \
+	  $(BUILDDIR)/stubs/template_instantiations.o \
+	  $(BUILDDIR)/fmtlib/format.o \
+	  $(BUILDDIR)/tinyxml2/tinyxml2.o \
+	  $(METRICS_STUBS_OBJ) $(BUILDDIR)/stubs/thread_cpu_stub.o $(BUILDDIR)/stubs/exact_stubs.o \
+	  $(BUILDDIR)/jni_stubs/icu_jni_stub.o \
+	  $(BUILDDIR)/jni_stubs/javacore_stub.o \
+	  $(BUILDDIR)/jni_stubs/openjdk_stub.o \
+	  $(BUILDDIR)/jni_stubs/ohbridge_stub.o \
+	  $(BUILDDIR)/jni_stubs/framework_native_stubs.o \
+	  $(BUILDDIR)/stubs/missing_stubs.o \
+	  /home/dspfac/android-sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_static.a \
+	  /home/dspfac/android-sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++abi.a \
+	  /home/dspfac/android-sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libz.a \
+	   -ldl -lm -llog
+	@echo "Built: $(BUILDDIR)/lib/libwestlake_art.so"
+	@ls -lh $(BUILDDIR)/lib/libwestlake_art.so
 
 status:
 	@echo "=== Bionic ARM64 Build Status (Android 15 ART) ==="
@@ -791,7 +915,7 @@ $(OW_PATCH_OBJ): patches/dex2oat/linker/oat_writer.cc
 
 dex2oat-build: $(DEX2OAT_OBJS) $(CD_PATCH_OBJ) $(IW_PATCH_OBJ) $(OW_PATCH_OBJ)
 	@echo "dex2oat objects: $$(echo $(DEX2OAT_OBJS) $(CD_PATCH_OBJ) $(IW_PATCH_OBJ) $(OW_PATCH_OBJ) | wc -w)"
-link-dex2oat: all dex2oat-build ziparchive sigchain nativehelper fault-handler-stubs template-instantiations jni-stubs asm sve-stub metrics-stubs fmtlib tinyxml2
+link-dex2oat: all dex2oat-build ziparchive sigchain nativehelper fault-handler-stubs template-instantiations jni-stubs asm sve-stub metrics-stubs fmtlib tinyxml2 $(RUNTIME_OBJS)
 	@echo "=== Linking dex2oat (ARM64, static) ==="
 	@mkdir -p $(BUILDDIR)/bin
 	$(CXX) -o $(BUILDDIR)/bin/dex2oat \
@@ -828,6 +952,7 @@ link-dex2oat: all dex2oat-build ziparchive sigchain nativehelper fault-handler-s
 	  $(BUILDDIR)/jni_stubs/javacore_stub.o \
 	  $(BUILDDIR)/jni_stubs/openjdk_stub.o \
 	  $(BUILDDIR)/jni_stubs/ohbridge_stub.o \
+	  $(BUILDDIR)/jni_stubs/framework_native_stubs.o \
 	  /home/dspfac/android-sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_static.a \
 	  /home/dspfac/android-sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++abi.a \
 	  /home/dspfac/android-sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libz.a \

@@ -386,21 +386,13 @@ void ArtMethod::Invoke(Thread* self, uint32_t* args, uint32_t args_size, JValue*
   // Invocation by the interpreter, explicitly forcing interpretation over JIT to prevent
   // cycling around the various JIT/Interpreter methods that handle method invocation.
 
-  // Force interpreter in two cases:
-  // 1. AOT compiler (dex2oat): Nterp stubs don't execute, so class init needs interpreter.
-  //    For native methods, route through UnstartedRuntime::Jni which has Unsafe handlers.
-  // 2. Imageless runtime (dalvikvm without boot image): app methods need interpreter
+  // Force interpreter for ALL non-native Java methods.
+  // Without AOT compilation or JIT, there is no compiled code to execute.
+  // Entry points may contain Nterp stubs (just 'ret') or uninitialized values,
+  // causing SIGBUS when the invoke stub jumps to them.
   bool force_interpreter_path = false;
   if (!IsNative() && IsInvokable() && !IsProxyMethod()) {
-    if (runtime->IsAotCompiler()) {
-      // dex2oat: force interpreter for class initialization
-      force_interpreter_path = true;
-    } else if (!runtime->GetHeap()->HasBootImageSpace()) {
-      const std::vector<const DexFile*>& bcp = runtime->GetClassLinker()->GetBootClassPath();
-      if (!bcp.empty() && GetDexFile() == bcp.back()) {
-        force_interpreter_path = true;
-      }
-    }
+    force_interpreter_path = true;
   }
 
   if (UNLIKELY(!runtime->IsStarted() || force_interpreter_path ||
@@ -420,27 +412,15 @@ void ArtMethod::Invoke(Thread* self, uint32_t* args, uint32_t args_size, JValue*
     constexpr bool kLogInvocationStartAndReturn = false;
     bool have_quick_code = GetEntryPointFromQuickCompiledCode() != nullptr;
     if (LIKELY(have_quick_code)) {
-      if (kLogInvocationStartAndReturn) {
-        LOG(INFO) << StringPrintf(
-            "Invoking '%s' quick code=%p static=%d", PrettyMethod().c_str(),
-            GetEntryPointFromQuickCompiledCode(), static_cast<int>(IsStatic() ? 1 : 0));
-      }
-
-      // Ensure that we won't be accidentally calling quick compiled code when -Xint.
-      if (kIsDebugBuild && runtime->GetInstrumentation()->IsForcedInterpretOnly()) {
-        CHECK(!runtime->UseJitCompilation());
-        const void* oat_quick_code =
-            (IsNative() || !IsInvokable() || IsProxyMethod() || IsObsolete())
-            ? nullptr
-            : GetOatMethodQuickCode(runtime->GetClassLinker()->GetImagePointerSize());
-        CHECK(oat_quick_code == nullptr || oat_quick_code != GetEntryPointFromQuickCompiledCode())
-            << "Don't call compiled code when -Xint " << PrettyMethod();
-      }
-
-      if (!IsStatic()) {
-        (*art_quick_invoke_stub)(this, args, args_size, self, result, shorty);
-      } else {
-        (*art_quick_invoke_static_stub)(this, args, args_size, self, result, shorty);
+      // Route ALL methods through EnterInterpreterFromInvoke — bypasses assembly
+      // stubs entirely. The assembly stubs dispatch through entry_point which may
+      // point to DEX data or Nterp 'ret' stubs, causing SIGBUS.
+      // Native methods are handled by InterpreterJni (pure C++ function call).
+      {
+        ObjPtr<mirror::Object> receiver = IsStatic() ? nullptr :
+            reinterpret_cast<StackReference<mirror::Object>*>(args)->AsMirrorPtr();
+        interpreter::EnterInterpreterFromInvoke(
+            self, this, receiver, args + (IsStatic() ? 0 : 1), result, /*stay_in_interpreter=*/true);
       }
       if (UNLIKELY(self->GetException() == Thread::GetDeoptimizationException())) {
         // Unusual case where we were running generated code and an
