@@ -180,6 +180,87 @@ static void* engine_thread(void* arg) {
     }
   }
 
+  // Pre-force critical framework classes to "initialized" status
+  // This prevents clinit cascades that cause StackOverflow
+  {
+    art::ScopedObjectAccess soa(art::Thread::Current());
+    const char* forceInitClasses[] = {
+      "Landroid/os/Build;",
+      "Landroid/os/Build$VERSION;",
+      "Landroid/os/Build$VERSION_CODES;",
+      "Landroid/os/LocaleList;",
+      "Landroid/content/res/Configuration;",
+      "Landroid/app/Activity;",
+      "Landroid/app/ContextImpl;",
+      "Landroid/app/ActivityThread;",
+      "Landroid/app/LoadedApk;",
+      "Landroid/app/Instrumentation;",
+      "Landroid/app/Application;",
+      "Landroid/os/Handler;",
+      "Landroid/os/Looper;",
+      "Landroid/os/Bundle;",
+      "Landroid/os/Parcel;",
+      "Landroid/content/Intent;",
+      "Landroid/content/Context;",
+      "Landroid/content/ContextWrapper;",
+      "Landroid/view/ContextThemeWrapper;",
+      "Landroid/content/res/Resources;",
+      "Landroid/content/pm/ApplicationInfo;",
+      "Landroid/content/pm/PackageManager;",
+      "Landroid/view/Window;",
+      "Landroid/view/WindowManager;",
+      "Landroid/app/ResourcesManager;",
+      "Landroid/text/TextUtils;",
+      "Lsun/misc/Unsafe;",
+      "Ljdk/internal/misc/Unsafe;",
+      "Landroid/os/SystemProperties;",
+      "Landroid/util/Log;",
+      "Landroid/os/Parcelable;",
+      "Landroid/app/WindowConfiguration;",
+      "Landroid/graphics/Rect;",
+      nullptr
+    };
+    int forced = 0;
+    for (int i = 0; forceInitClasses[i]; i++) {
+      art::ObjPtr<art::mirror::Class> cls =
+          runtime->GetClassLinker()->FindSystemClass(soa.Self(), forceInitClasses[i]);
+      if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
+      if (cls != nullptr && !cls->IsInitialized()) {
+        // Force class to initialized via EnsureInitialized (runs clinit but tolerance catches failures)
+        art::StackHandleScope<1> hs(soa.Self());
+        art::Handle<art::mirror::Class> h = hs.NewHandle(cls);
+        runtime->GetClassLinker()->EnsureInitialized(soa.Self(), h, true, true);
+        if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
+        forced++;
+      }
+    }
+    WLOG("[WestlakeART] Force-initialized %d framework classes\n", forced);
+  }
+
+  // Register helper natives for McdLoader
+  {
+    jclass loaderCls = env->FindClass("McdLoader");
+    if (loaderCls) {
+      static auto allocInstance = +[](JNIEnv* e, jclass, jclass target) -> jobject {
+        return e->AllocObject(target);
+      };
+      static auto nativeLog = +[](JNIEnv* e, jclass, jstring msg) {
+        if (!msg) return;
+        const char* s = e->GetStringUTFChars(msg, nullptr);
+        if (s) { write(STDERR_FILENO, s, strlen(s)); write(STDERR_FILENO, "\n", 1); e->ReleaseStringUTFChars(msg, s); }
+      };
+      JNINativeMethod nm1 = {"nativeAllocInstance", "(Ljava/lang/Class;)Ljava/lang/Object;", (void*)+allocInstance};
+      JNINativeMethod nm2 = {"nativeLog", "(Ljava/lang/String;)V", (void*)+nativeLog};
+      int rc1 = env->RegisterNatives(loaderCls, &nm1, 1);
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      WLOG("[WestlakeART] RegisterNatives allocInstance: %d\n", rc1);
+      int rc2 = env->RegisterNatives(loaderCls, &nm2, 1);
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      WLOG("[WestlakeART] RegisterNatives nativeLog: %d\n", rc2);
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
+
   // Find and call the main class
   std::string jniName = ea->mainClass;
   for (char& c : jniName) if (c == '.') c = '/';
