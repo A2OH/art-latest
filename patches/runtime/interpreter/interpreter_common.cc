@@ -1165,6 +1165,22 @@ static inline bool DoCallCommon(ArtMethod* called_method,
   // Depth guard disabled — was corrupting caller's ShadowFrame vregs
   // TODO: investigate alloca interaction with thread_local + RAII
 
+  // TRACE at DoCallCommon entry
+  {
+    static thread_local int trace_count = 0;
+    ArtMethod* cm = shadow_frame.GetMethod();
+    if (cm && shadow_frame.NumberOfVRegs() <= 4) {
+      const char* cn = cm->GetName();
+      if (cn && strcmp(cn, "lastIndexOf") == 0 && trace_count < 5) {
+        trace_count++;
+        int nr = shadow_frame.NumberOfVRegs();
+        fprintf(stderr, "[VREG-ENTRY] DoCallCommon from %s → %s: ",
+                cm->PrettyMethod().c_str(), called_method->PrettyMethod().c_str());
+        for (int i = 0; i < nr; i++) fprintf(stderr, "v%d=0x%x ", i, shadow_frame.GetVReg(i));
+        fprintf(stderr, "\n"); fflush(stderr);
+      }
+    }
+  }
   // Compute method information.
   CodeItemDataAccessor accessor(called_method->DexInstructionData());
   // Number of registers for the callee's call frame.
@@ -1341,16 +1357,25 @@ static inline bool DoCallCommon(ArtMethod* called_method,
     if (!EnsureInitialized(self, new_shadow_frame)) {
       return false;
     }
-    self->PushShadowFrame(new_shadow_frame);
-    // Save/restore caller vregs around native calls for small frames
-    // (workaround for interpreter vreg corruption when calling native methods)
-    uint32_t caller_vregs_backup[8];
-    int caller_nregs = shadow_frame.NumberOfVRegs();
-    bool do_backup = (caller_nregs <= 8);
-    if (do_backup) {
-      memcpy(caller_vregs_backup, shadow_frame.GetVRegArgs(0), caller_nregs * sizeof(uint32_t));
+
+    // TRACE: detect caller=String.lastIndexOf(I) calling ANY method
+    bool trace_li = false;
+    ArtMethod* caller_method = shadow_frame.GetMethod();
+    if (caller_method && shadow_frame.NumberOfVRegs() <= 4) {
+      const char* cname = caller_method->GetName();
+      if (cname && strcmp(cname, "lastIndexOf") == 0) {
+        int nr = shadow_frame.NumberOfVRegs();
+        trace_li = true;
+        fprintf(stderr, "[VREG-TRACE] BEFORE %s calling %s (native=%d): ",
+                caller_method->PrettyMethod().c_str(),
+                called_method->PrettyMethod().c_str(),
+                called_method->IsNative());
+        for (int i = 0; i < nr; i++) fprintf(stderr, "v%d=%u ", i, shadow_frame.GetVReg(i));
+        fprintf(stderr, "\n"); fflush(stderr);
+      }
     }
 
+    self->PushShadowFrame(new_shadow_frame);
     uint32_t* invoke_args = new_shadow_frame->GetVRegArgs(0);
     uint32_t invoke_size = new_shadow_frame->NumberOfVRegs() * sizeof(uint32_t);
     const char* invoke_shorty = called_method->GetInterfaceMethodIfProxy(
@@ -1358,10 +1383,19 @@ static inline bool DoCallCommon(ArtMethod* called_method,
     called_method->Invoke(self, invoke_args, invoke_size, result, invoke_shorty);
     self->PopShadowFrame();
 
-    if (do_backup) {
-      memcpy(shadow_frame.GetVRegArgs(0), caller_vregs_backup, caller_nregs * sizeof(uint32_t));
+    if (trace_li) {
+      fprintf(stderr, "[VREG-TRACE] AFTER: v0=%u v1=%u v2=%u\n",
+              shadow_frame.GetVReg(0), shadow_frame.GetVReg(1), shadow_frame.GetVReg(2));
+      fflush(stderr);
     }
   } else {
+    // Save/restore caller vregs for non-native calls too
+    uint32_t nonnative_backup[8];
+    int nn_nregs = shadow_frame.NumberOfVRegs();
+    bool nn_do_backup = (nn_nregs <= 8);
+    if (nn_do_backup) {
+      memcpy(nonnative_backup, shadow_frame.GetVRegArgs(0), nn_nregs * sizeof(uint32_t));
+    }
     PerformCall(self,
                 accessor,
                 shadow_frame.GetMethod(),
@@ -1369,6 +1403,9 @@ static inline bool DoCallCommon(ArtMethod* called_method,
                 new_shadow_frame,
                 result,
                 use_interpreter_entrypoint);
+    if (nn_do_backup) {
+      memcpy(shadow_frame.GetVRegArgs(0), nonnative_backup, nn_nregs * sizeof(uint32_t));
+    }
   }
 
   if (string_init && !self->IsExceptionPending()) {
@@ -1387,6 +1424,22 @@ bool DoCall(ArtMethod* called_method,
             uint16_t inst_data,
             bool is_string_init,
             JValue* result) {
+  // TRACE: log all calls from lastIndexOf
+  {
+    static thread_local int dc_trace = 0;
+    ArtMethod* cm = shadow_frame.GetMethod();
+    if (cm && dc_trace < 5) {
+      const char* cn = cm->GetName();
+      if (cn && strcmp(cn, "lastIndexOf") == 0) {
+        dc_trace++;
+        int nr = shadow_frame.NumberOfVRegs();
+        fprintf(stderr, "[DoCall-TRACE] %s → %s: ", cm->PrettyMethod().c_str(),
+                called_method->PrettyMethod().c_str());
+        for (int i = 0; i < nr && i < 4; i++) fprintf(stderr, "v%d=0x%x ", i, shadow_frame.GetVReg(i));
+        fprintf(stderr, "\n"); fflush(stderr);
+      }
+    }
+  }
   // Argument word count.
   const uint16_t number_of_inputs =
       (is_range) ? inst->VRegA_3rc(inst_data) : inst->VRegA_35c(inst_data);
