@@ -226,11 +226,11 @@ static void* engine_thread(void* arg) {
           runtime->GetClassLinker()->FindSystemClass(soa.Self(), forceInitClasses[i]);
       if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
       if (cls != nullptr && !cls->IsInitialized()) {
-        // Force class to initialized via EnsureInitialized (runs clinit but tolerance catches failures)
-        art::StackHandleScope<1> hs(soa.Self());
-        art::Handle<art::mirror::Class> h = hs.NewHandle(cls);
-        runtime->GetClassLinker()->EnsureInitialized(soa.Self(), h, true, true);
-        if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
+        // Force class status to kInitialized WITHOUT running clinit.
+        // This prevents StackOverflow from clinit cascades.
+        // ClassStatus::kInitialized = 14
+        cls->SetField32<false>(art::mirror::Class::StatusOffset(),
+                               static_cast<uint32_t>(art::ClassStatus::kInitialized));
         forced++;
       }
     }

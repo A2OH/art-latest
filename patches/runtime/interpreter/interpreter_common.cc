@@ -1162,16 +1162,8 @@ static inline bool DoCallCommon(ArtMethod* called_method,
                                 uint32_t (&arg)[Instruction::kMaxVarArgRegs],
                                 uint32_t vregC,
                                 bool string_init) {
-  // Recursion depth guard — prevents infinite loops from exception handling
-  // cascades (e.g. NPE → toString → getName → class init → NPE → ...)
-  static thread_local int call_depth = 0;
-  call_depth++;
-  if (call_depth > 50) {
-    // Don't decrement — RAII guard handles it
-    self->ThrowNewException("Ljava/lang/StackOverflowError;", "Westlake: interpreter depth limit");
-    return false;
-  }
-  struct DepthGuard { ~DepthGuard() { call_depth--; } } depth_guard;
+  // Depth guard disabled — was corrupting caller's ShadowFrame vregs
+  // TODO: investigate alloca interaction with thread_local + RAII
 
   // Compute method information.
   CodeItemDataAccessor accessor(called_method->DexInstructionData());
@@ -1350,12 +1342,25 @@ static inline bool DoCallCommon(ArtMethod* called_method,
       return false;
     }
     self->PushShadowFrame(new_shadow_frame);
+    // Save/restore caller vregs around native calls for small frames
+    // (workaround for interpreter vreg corruption when calling native methods)
+    uint32_t caller_vregs_backup[8];
+    int caller_nregs = shadow_frame.NumberOfVRegs();
+    bool do_backup = (caller_nregs <= 8);
+    if (do_backup) {
+      memcpy(caller_vregs_backup, shadow_frame.GetVRegArgs(0), caller_nregs * sizeof(uint32_t));
+    }
+
     uint32_t* invoke_args = new_shadow_frame->GetVRegArgs(0);
     uint32_t invoke_size = new_shadow_frame->NumberOfVRegs() * sizeof(uint32_t);
     const char* invoke_shorty = called_method->GetInterfaceMethodIfProxy(
         kRuntimePointerSize)->GetShorty();
     called_method->Invoke(self, invoke_args, invoke_size, result, invoke_shorty);
     self->PopShadowFrame();
+
+    if (do_backup) {
+      memcpy(shadow_frame.GetVRegArgs(0), caller_vregs_backup, caller_nregs * sizeof(uint32_t));
+    }
   } else {
     PerformCall(self,
                 accessor,

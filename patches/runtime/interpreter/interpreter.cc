@@ -913,6 +913,13 @@ void EnterInterpreterFromInvoke(Thread* self,
   }
   uint32_t shorty_len = 0;
   const char* shorty = method->GetShorty(&shorty_len);
+  // DEBUG: trace shorty for non-boot-image methods
+  if (method->IsNative()) {
+    fprintf(stderr, "[InterpJni] %s shorty='%s' len=%u dexIdx=%u\n",
+            method->PrettyMethod().c_str(), shorty ? shorty : "NULL", shorty_len,
+            method->GetDexMethodIndex());
+    fflush(stderr);
+  }
   for (size_t shorty_pos = 0, arg_pos = 0; cur_reg < num_regs; ++shorty_pos, ++arg_pos, cur_reg++) {
     DCHECK_LT(shorty_pos + 1, shorty_len);
     switch (shorty[shorty_pos + 1]) {

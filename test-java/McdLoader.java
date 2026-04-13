@@ -1,206 +1,180 @@
-import java.io.FileDescriptor;
-import java.io.FileOutputStream;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Constructor;
 
-/**
- * McdLoader — executes real MCD app bytecode through Westlake ART v118 interpreter.
- * Not just class loading — actually instantiates objects and calls MCD methods.
- */
 public class McdLoader {
-    // Log via native — registered by westlake_jni.cc
     static native void nativeLog(String msg);
-    static void log(String msg) {
-        try { nativeLog(msg); } catch (Throwable t) {}
-    }
-    static String shortName(String cls) {
-        int dot = -1;
-        for (int i = cls.length() - 1; i >= 0; i--) {
-            if (cls.charAt(i) == '.') { dot = i; break; }
-        }
-        return dot >= 0 ? cls.substring(dot + 1) : cls;
-    }
-
-    // Native allocator — registered by westlake_jni.cc engine thread
     static native Object nativeAllocInstance(Class<?> cls);
 
-    static Object theUnsafe;
-    static Method unsafePutObject, unsafePutInt, unsafePutBoolean, unsafeStaticFieldOffset;
-    static void initUnsafe() {
-        if (theUnsafe != null) return;
+    static void log(String msg) {
+        try { nativeLog(msg); return; } catch (Throwable t) {}
         try {
-            Class<?> u = Class.forName("sun.misc.Unsafe");
-            Field f = u.getDeclaredField("theUnsafe"); f.setAccessible(true);
-            theUnsafe = f.get(null);
-            unsafePutObject = u.getMethod("putObject", Object.class, long.class, Object.class);
-            unsafePutInt = u.getMethod("putInt", Object.class, long.class, int.class);
-            unsafePutBoolean = u.getMethod("putBoolean", Object.class, long.class, boolean.class);
-            unsafeStaticFieldOffset = u.getMethod("staticFieldOffset", Field.class);
-        } catch (Throwable t) { log("[WARN] Unsafe init: " + t.getClass().getName()); }
-    }
-    static void unsafeSet(Class<?> cls, String name, Object value) {
-        try {
-            Field f = cls.getDeclaredField(name); f.setAccessible(true);
-            long offset = (Long) unsafeStaticFieldOffset.invoke(theUnsafe, f);
-            if (value instanceof Integer) unsafePutInt.invoke(theUnsafe, cls, offset, ((Integer)value).intValue());
-            else if (value instanceof Boolean) unsafePutBoolean.invoke(theUnsafe, cls, offset, ((Boolean)value).booleanValue());
-            else unsafePutObject.invoke(theUnsafe, cls, offset, value);
-        } catch (Throwable t) {}
+            java.io.FileOutputStream f = new java.io.FileOutputStream(java.io.FileDescriptor.err);
+            byte[] b = new byte[msg.length() + 1];
+            for (int i = 0; i < msg.length(); i++) b[i] = (byte)(msg.charAt(i) & 0x7f);
+            b[msg.length()] = (byte)'\n';
+            f.write(b, 0, b.length);
+        } catch (Throwable t2) {}
     }
 
     public static void main(String[] args) {
-        log("=== Westlake ART v118: Executing MCD Code ===");
-        log("");
-
-        initUnsafe();
-
-        // Patch Build via Unsafe (no clinit)
-        try {
-            Class<?> b = Class.forName("android.os.Build", false, null);
-            unsafeSet(b, "MODEL", "Westlake-OHOS");
-            unsafeSet(b, "SUPPORTED_ABIS", new String[]{"arm64-v8a"});
-            unsafeSet(b, "SUPPORTED_32_BIT_ABIS", new String[]{});
-            unsafeSet(b, "SUPPORTED_64_BIT_ABIS", new String[]{"arm64-v8a"});
-            Class<?> v = Class.forName("android.os.Build$VERSION", false, null);
-            unsafeSet(v, "SDK_INT", 35); unsafeSet(v, "RELEASE", "15");
-            unsafeSet(v, "CODENAME", "REL"); unsafeSet(v, "SDK", "35");
-        } catch (Throwable t) {}
-        log("[OK] Build patched");
+        log("=== Westlake ART v118: MCD onCreate ===");
 
         ClassLoader cl = McdLoader.class.getClassLoader();
 
-        // Load MCD classes
-        Class<?> splashClass = null, presenterClass = null;
-        try {
-            splashClass = Class.forName("com.mcdonalds.mcdcoreapp.common.activity.SplashActivity", false, cl);
-            log("[OK] SplashActivity loaded");
-        } catch (Throwable t) { log("[FAIL] SplashActivity"); }
-        try {
-            presenterClass = Class.forName("com.mcdonalds.mcdcoreapp.presenter.SplashPresenterImpl", false, cl);
-            log("[OK] SplashPresenterImpl loaded");
-        } catch (Throwable t) { log("[FAIL] SplashPresenterImpl"); }
+        // Locale.ROOT/ENGLISH/US pre-set by JNI_OnLoad_framework (C code via AllocObject)
 
-        // === Instantiate MCD objects (Unsafe — no constructor, no Context needed) ===
-        log("");
-        // Skip instance allocation — triggers clinit cascades.
-        // Execute static methods and class-level bytecode instead.
-
-        // === Execute MCD bytecode through Westlake interpreter ===
-        log("");
-        log("--- Executing MCD bytecode (Westlake interpreter) ---");
-        // Call MCD methods that don't trigger deep clinit cascades.
-        // Each invoke() runs MCD bytecode through Westlake's switch interpreter.
-
-        // 1. Kotlin companion accessor C1() — safe, returns Class object
+        // Step 1: Load SplashActivity
+        log("[1] Loading SplashActivity...");
+        Class<?> splashClass = null;
         try {
-            Method c1 = splashClass.getDeclaredMethod("C1");
-            c1.setAccessible(true);
-            Object r = c1.invoke(null);
-            log("[EXEC] SplashActivity.C1() = " + r);
-        } catch (Throwable t) { log("[EXEC] C1: " + shortName(t.getClass().getName())); }
+            splashClass = Class.forName(
+                "com.mcdonalds.mcdcoreapp.common.activity.SplashActivity", false, cl);
+            log("[OK] SplashActivity loaded (" + splashClass.getDeclaredMethods().length + " methods)");
+        } catch (Throwable t) {
+            log("[FAIL] " + t.getClass().getName());
+            return;
+        }
 
-        // 2. Class hierarchy operations — interpreter executes these
+        // Step 2: Allocate SplashActivity instance (no constructor)
+        log("[2] Allocating SplashActivity...");
+        Object splash = null;
         try {
-            boolean isAct = Class.forName("android.app.Activity").isAssignableFrom(splashClass);
-            log("[EXEC] isAssignableFrom(Activity) = " + isAct);
-        } catch (Throwable t) { log("[EXEC] isAssign: " + shortName(t.getClass().getName())); }
-        try {
-            Class<?>[] ifaces = splashClass.getInterfaces();
-            log("[EXEC] implements " + ifaces.length + " interfaces");
-            for (Class<?> i : ifaces) log("[EXEC]   " + i.getName());
-        } catch (Throwable t) { log("[EXEC] interfaces: " + shortName(t.getClass().getName())); }
-        try {
-            java.lang.annotation.Annotation[] a = splashClass.getDeclaredAnnotations();
-            log("[EXEC] " + a.length + " annotations");
-            for (java.lang.annotation.Annotation an : a) log("[EXEC]   @" + shortName(an.annotationType().getName()));
-        } catch (Throwable t) { log("[EXEC] annotations: " + shortName(t.getClass().getName())); }
-
-        // 3. Presenter C1()
-        try {
-            Method c1 = presenterClass.getDeclaredMethod("C1");
-            c1.setAccessible(true);
-            Object r = c1.invoke(null);
-            log("[EXEC] Presenter.C1() = " + r);
-        } catch (Throwable t) { log("[EXEC] Presenter.C1: " + shortName(t.getClass().getName())); }
-
-        // 4. Method listing (no invocation — just reflection bytecode)
-        log("");
-        log("--- SplashActivity method signatures ---");
-        for (Method m : splashClass.getDeclaredMethods()) {
-            String n = m.getName();
-            if (n.contains("onCreate") || n.contains("navigate") || n.contains("onResume")
-                || n.contains("onStart") || n.contains("inject") || n.contains("bind")
-                || n.contains("lambda")) {
-                Class<?>[] p = m.getParameterTypes();
-                StringBuilder sb = new StringBuilder("  ");
-                sb.append(m.getReturnType().getSimpleName()).append(" ").append(n).append("(");
-                for (int i = 0; i < p.length; i++) {
-                    if (i > 0) sb.append(", ");
-                    sb.append(shortName(p[i].getName()));
+            splash = nativeAllocInstance(splashClass);
+            log("[OK] Instance via nativeAlloc");
+        } catch (Throwable t) {
+            // Fallback: JNI AllocObject via env
+            log("[WARN] nativeAlloc failed, trying JNI newInstance...");
+            try {
+                // Use reflection to call JNI AllocObject indirectly
+                // Actually just use the default constructor
+                Constructor<?> ctor = splashClass.getDeclaredConstructor();
+                ctor.setAccessible(true);
+                splash = ctor.newInstance();
+                log("[OK] Instance via constructor");
+            } catch (Throwable t2) {
+                log("[WARN] constructor failed: " + t2.getClass().getName());
+                // Last resort: allocate parent class
+                try {
+                    Class<?> actClass = Class.forName("android.app.Activity");
+                    Constructor<?> actCtor = actClass.getDeclaredConstructor();
+                    actCtor.setAccessible(true);
+                    splash = actCtor.newInstance();
+                    log("[OK] Activity instance (not SplashActivity)");
+                } catch (Throwable t3) {
+                    log("[FAIL] All allocation methods failed");
+                    return;
                 }
-                sb.append(")");
-                log(sb.toString());
+            }
+        }
+
+        // Step 3: Create mock Context chain
+        log("[3] Creating mock Context...");
+        Object mockContext = null;
+        try {
+            // ContextImpl — allocate without constructor
+            Class<?> ctxImpl = Class.forName("android.app.ContextImpl", false, cl);
+            mockContext = nativeAllocInstance(ctxImpl);
+            log("[OK] ContextImpl allocated");
+
+            // Set mPackageName on ContextImpl
+            try {
+                Field pkgField = ctxImpl.getDeclaredField("mPackageName");
+                pkgField.setAccessible(true);
+                pkgField.set(mockContext, "com.mcdonalds.app");
+                log("[OK] mPackageName = com.mcdonalds.app");
+            } catch (Throwable t) {
+                log("[WARN] mPackageName: " + t.getClass().getName());
+            }
+        } catch (Throwable t) {
+            log("[FAIL] Context: " + t.getClass().getName());
+        }
+
+        // Step 4: Create mock Instrumentation + Application
+        log("[4] Creating Instrumentation + Application...");
+        Object instr = null, app = null;
+        try {
+            instr = nativeAllocInstance(Class.forName("android.app.Instrumentation", false, cl));
+            log("[OK] Instrumentation allocated");
+        } catch (Throwable t) { log("[WARN] Instrumentation: " + t.getClass().getName()); }
+        try {
+            app = nativeAllocInstance(Class.forName("android.app.Application", false, cl));
+            log("[OK] Application allocated");
+        } catch (Throwable t) { log("[WARN] Application: " + t.getClass().getName()); }
+
+        // Step 5: Set Activity fields directly (bypass attach())
+        log("[5] Setting Activity fields...");
+        try {
+            // Activity inherits from ContextThemeWrapper → ContextWrapper → Context
+            // ContextWrapper has mBase field
+            Class<?> cwClass = Class.forName("android.content.ContextWrapper");
+            Field mBase = cwClass.getDeclaredField("mBase");
+            mBase.setAccessible(true);
+            mBase.set(splash, mockContext);
+            log("[OK] mBase = ContextImpl");
+
+            // Activity fields
+            Class<?> actClass = Class.forName("android.app.Activity");
+
+            // mInstrumentation
+            try {
+                Field f = actClass.getDeclaredField("mInstrumentation");
+                f.setAccessible(true); f.set(splash, instr);
+                log("[OK] mInstrumentation set");
+            } catch (Throwable t) { log("[WARN] mInstrumentation: " + t.getClass().getName()); }
+
+            // mApplication
+            try {
+                Field f = actClass.getDeclaredField("mApplication");
+                f.setAccessible(true); f.set(splash, app);
+                log("[OK] mApplication set");
+            } catch (Throwable t) { log("[WARN] mApplication: " + t.getClass().getName()); }
+
+            // mCalled (must be false before onCreate)
+            try {
+                Field f = actClass.getDeclaredField("mCalled");
+                f.setAccessible(true); f.set(splash, false);
+            } catch (Throwable t) {}
+
+            // mComponent
+            try {
+                Class<?> cnClass = Class.forName("android.content.ComponentName");
+                Constructor<?> cnCtor = cnClass.getConstructor(String.class, String.class);
+                Object cn = cnCtor.newInstance("com.mcdonalds.app",
+                    "com.mcdonalds.mcdcoreapp.common.activity.SplashActivity");
+                Field f = actClass.getDeclaredField("mComponent");
+                f.setAccessible(true); f.set(splash, cn);
+                log("[OK] mComponent set");
+            } catch (Throwable t) { log("[WARN] mComponent: " + t.getClass().getName()); }
+
+        } catch (Throwable t) {
+            log("[FAIL] fields: " + t.getClass().getName());
+        }
+
+        // Step 6: CALL onCreate(null) !!!
+        log("[6] Calling SplashActivity.onCreate(null)...");
+        log("    (all bytecode runs through Westlake interpreter)");
+        try {
+            Method onCreate = splashClass.getDeclaredMethod("onCreate", Class.forName("android.os.Bundle"));
+            onCreate.setAccessible(true);
+            onCreate.invoke(splash, (Object) null);
+            log("[OK] onCreate returned!");
+        } catch (Throwable t) {
+            Throwable cause = t;
+            while (cause.getCause() != null) cause = cause.getCause();
+            log("[EXEC] onCreate threw: " + cause.getClass().getName());
+            String msg = cause.getMessage();
+            if (msg != null && msg.length() > 80) msg = msg.substring(0, 80);
+            log("[EXEC] message: " + (msg != null ? msg : "null"));
+
+            // Print partial stack trace
+            StackTraceElement[] stack = cause.getStackTrace();
+            int show = Math.min(stack.length, 10);
+            for (int i = 0; i < show; i++) {
+                log("[EXEC]   at " + stack[i].toString());
             }
         }
 
-        // === Phase 5: Try creating Context ===
-        log("");
-        log("--- Context creation ---");
-
-        // Pre-stub LocaleList to prevent clinit cascade
-        try {
-            Class<?> ll = Class.forName("android.os.LocaleList", false, cl);
-            // Set sEmptyLocaleList (empty list)
-            Object emptyLL = nativeAllocInstance(ll);
-            unsafeSet(ll, "sEmptyLocaleList", emptyLL);
-            // Set sLastExplicitlySetLocaleList and sDefaultLocaleList
-            java.util.Locale us = java.util.Locale.US;
-            if (us == null) us = new java.util.Locale("en", "US");
-            unsafeSet(ll, "sLastExplicitlySetLocaleList", emptyLL);
-            unsafeSet(ll, "sDefaultLocaleList", emptyLL);
-            unsafeSet(ll, "sDefaultAdjustedLocaleList", emptyLL);
-            log("[OK] LocaleList pre-stubbed");
-        } catch (Throwable t) {
-            log("[WARN] LocaleList stub: " + shortName(t.getClass().getName()));
-        }
-
-        // Pre-stub Configuration
-        try {
-            Class<?> cfg = Class.forName("android.content.res.Configuration", false, cl);
-            Object emptyCfg = nativeAllocInstance(cfg);
-            unsafeSet(cfg, "EMPTY", emptyCfg);
-            log("[OK] Configuration pre-stubbed");
-        } catch (Throwable t) {
-            log("[WARN] Configuration stub: " + shortName(t.getClass().getName()));
-        }
-
-        try {
-            Class<?> ci = Class.forName("android.app.ContextImpl", false, cl);
-            Method[] methods = ci.getDeclaredMethods();
-            Method createSys = null;
-            for (Method m : methods) {
-                if (m.getName().equals("createSystemContext") && m.getParameterTypes().length == 1) {
-                    createSys = m; break;
-                }
-            }
-            if (createSys != null) {
-                createSys.setAccessible(true);
-                log("[INFO] Calling ContextImpl.createSystemContext(null)...");
-                Object ctx = createSys.invoke(null, (Object) null);
-                log("[EXEC] Context created: " + (ctx != null ? ctx.getClass().getName() : "null"));
-                if (ctx != null) {
-                    // Try getPackageName
-                    Method gpn = ctx.getClass().getMethod("getPackageName");
-                    Object pkg = gpn.invoke(ctx);
-                    log("[EXEC] getPackageName() = " + pkg);
-                }
-            }
-        } catch (Throwable t) {
-            Throwable c = t.getCause() != null ? t.getCause() : t;
-            log("[FAIL] Context: " + shortName(c.getClass().getName()) + ": " + c.getMessage());
-        }
-
-        log("");
-        log("=== Westlake: MCD bytecode execution complete ===");
+        log("=== Westlake: onCreate execution complete ===");
     }
 }

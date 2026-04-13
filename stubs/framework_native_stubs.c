@@ -249,6 +249,111 @@ jint JNI_OnLoad_framework(void* vm, void* reserved) {
         fprintf(stderr, "[fw_stubs] android.sysprop.TelephonyProperties: %d/1\n", ok);
     }
 
+    /* Pre-set Locale.ROOT/ENGLISH/US using AllocObject (no constructor call) */
+    {
+        jclass locCls = (*env)->FindClass(env, "java/util/Locale");
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        if (locCls) {
+            /* AllocObject creates the Java object without calling <init> */
+            jobject root = (*env)->AllocObject(env, locCls);
+            if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+            jobject english = (*env)->AllocObject(env, locCls);
+            if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+            jobject us = (*env)->AllocObject(env, locCls);
+            if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+
+            /* Set the languageTag field directly (Locale stores a cached tag) */
+            /* Locale has: private transient String languageTag;
+               private transient BaseLocale baseLocale; */
+            /* For ROOT: baseLocale has empty language/country/variant */
+            /* We need to also create BaseLocale objects — or just set languageTag */
+            /* Actually, many Locale methods check baseLocale first.
+               Let's set languageTag which is used by toString()/toLanguageTag() */
+            jfieldID tagF = (*env)->GetFieldID(env, locCls, "languageTag", "Ljava/lang/String;");
+            if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+
+            if (root && tagF) (*env)->SetObjectField(env, root, tagF, (*env)->NewStringUTF(env, "und"));
+            if (english && tagF) (*env)->SetObjectField(env, english, tagF, (*env)->NewStringUTF(env, "en"));
+            if (us && tagF) (*env)->SetObjectField(env, us, tagF, (*env)->NewStringUTF(env, "en-US"));
+
+            /* Create BaseLocale objects for each Locale */
+            jclass blCls = (*env)->FindClass(env, "sun/util/locale/BaseLocale");
+            if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+            if (blCls) {
+                jstring empty = (*env)->NewStringUTF(env, "");
+                jstring en = (*env)->NewStringUTF(env, "en");
+                jstring us_s = (*env)->NewStringUTF(env, "US");
+
+                jobject blRoot = (*env)->AllocObject(env, blCls);
+                if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+                jobject blEn = (*env)->AllocObject(env, blCls);
+                if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+                jobject blUs = (*env)->AllocObject(env, blCls);
+                if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+
+                /* BaseLocale fields: language, script, region, variant */
+                jfieldID langF = (*env)->GetFieldID(env, blCls, "language", "Ljava/lang/String;");
+                if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+                jfieldID regF = (*env)->GetFieldID(env, blCls, "region", "Ljava/lang/String;");
+                if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+                jfieldID scrF = (*env)->GetFieldID(env, blCls, "script", "Ljava/lang/String;");
+                if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+                jfieldID varF = (*env)->GetFieldID(env, blCls, "variant", "Ljava/lang/String;");
+                if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+
+                if (blRoot && langF) {
+                    (*env)->SetObjectField(env, blRoot, langF, empty);
+                    if (regF) (*env)->SetObjectField(env, blRoot, regF, empty);
+                    if (scrF) (*env)->SetObjectField(env, blRoot, scrF, empty);
+                    if (varF) (*env)->SetObjectField(env, blRoot, varF, empty);
+                }
+                if (blEn && langF) {
+                    (*env)->SetObjectField(env, blEn, langF, en);
+                    if (regF) (*env)->SetObjectField(env, blEn, regF, empty);
+                    if (scrF) (*env)->SetObjectField(env, blEn, scrF, empty);
+                    if (varF) (*env)->SetObjectField(env, blEn, varF, empty);
+                }
+                if (blUs && langF) {
+                    (*env)->SetObjectField(env, blUs, langF, en);
+                    if (regF) (*env)->SetObjectField(env, blUs, regF, us_s);
+                    if (scrF) (*env)->SetObjectField(env, blUs, scrF, empty);
+                    if (varF) (*env)->SetObjectField(env, blUs, varF, empty);
+                }
+
+                /* Set baseLocale on each Locale */
+                jfieldID blF = (*env)->GetFieldID(env, locCls, "baseLocale", "Lsun/util/locale/BaseLocale;");
+                if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+                if (blF) {
+                    if (root && blRoot) (*env)->SetObjectField(env, root, blF, blRoot);
+                    if (english && blEn) (*env)->SetObjectField(env, english, blF, blEn);
+                    if (us && blUs) (*env)->SetObjectField(env, us, blF, blUs);
+                }
+                fprintf(stderr, "[fw_stubs] BaseLocale objects set\n");
+            }
+
+            /* Set static fields ROOT, ENGLISH, US */
+            jfieldID rf = (*env)->GetStaticFieldID(env, locCls, "ROOT", "Ljava/util/Locale;");
+            if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+            if (rf && root) (*env)->SetStaticObjectField(env, locCls, rf, root);
+
+            jfieldID ef = (*env)->GetStaticFieldID(env, locCls, "ENGLISH", "Ljava/util/Locale;");
+            if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+            if (ef && english) (*env)->SetStaticObjectField(env, locCls, ef, english);
+
+            jfieldID uf = (*env)->GetStaticFieldID(env, locCls, "US", "Ljava/util/Locale;");
+            if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+            if (uf && us) (*env)->SetStaticObjectField(env, locCls, uf, us);
+
+            /* Also set defaultLocale */
+            jfieldID df = (*env)->GetStaticFieldID(env, locCls, "defaultLocale", "Ljava/util/Locale;");
+            if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+            if (df && us) (*env)->SetStaticObjectField(env, locCls, df, us);
+
+            fprintf(stderr, "[fw_stubs] Locale pre-set via AllocObject: root=%p en=%p us=%p\n", root, english, us);
+            if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        }
+    }
+
     fprintf(stderr, "[fw_stubs] Framework native stubs registered\n");
     return JNI_VERSION_1_6;
 }
