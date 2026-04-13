@@ -1389,13 +1389,27 @@ static inline bool DoCallCommon(ArtMethod* called_method,
       fflush(stderr);
     }
   } else {
-    // Save/restore caller vregs for non-native calls too
-    uint32_t nonnative_backup[8];
+    // TRACE + backup/restore for non-native calls
     int nn_nregs = shadow_frame.NumberOfVRegs();
-    bool nn_do_backup = (nn_nregs <= 8);
-    if (nn_do_backup) {
-      memcpy(nonnative_backup, shadow_frame.GetVRegArgs(0), nn_nregs * sizeof(uint32_t));
+    uint32_t nn_backup[8];
+    bool nn_do = (nn_nregs <= 8);
+    if (nn_do) memcpy(nn_backup, shadow_frame.GetVRegArgs(0), nn_nregs * 4);
+
+    // Trace ALL calls from methods with <=4 vregs (catches lastIndexOf)
+    static thread_local int pc_trace = 0;
+    ArtMethod* _cm = shadow_frame.GetMethod();
+    const char* _cn = _cm ? _cm->GetName() : nullptr;
+    bool do_trace = (_cn && strcmp(_cn, "lastIndexOf") == 0);
+    if (do_trace) {
+      pc_trace++;
+      ArtMethod* cm = shadow_frame.GetMethod();
+      fprintf(stderr, "[PC-TRACE] BEFORE %s → %s: ",
+              cm ? cm->PrettyMethod().c_str() : "?",
+              called_method->PrettyMethod().c_str());
+      for (int i = 0; i < nn_nregs; i++) fprintf(stderr, "v%d=0x%x ", i, shadow_frame.GetVReg(i));
+      fprintf(stderr, "\n"); fflush(stderr);
     }
+
     PerformCall(self,
                 accessor,
                 shadow_frame.GetMethod(),
@@ -1403,9 +1417,14 @@ static inline bool DoCallCommon(ArtMethod* called_method,
                 new_shadow_frame,
                 result,
                 use_interpreter_entrypoint);
-    if (nn_do_backup) {
-      memcpy(shadow_frame.GetVRegArgs(0), nonnative_backup, nn_nregs * sizeof(uint32_t));
+
+    if (do_trace) {
+      fprintf(stderr, "[PC-TRACE] AFTER: ");
+      for (int i = 0; i < nn_nregs; i++) fprintf(stderr, "v%d=0x%x ", i, shadow_frame.GetVReg(i));
+      fprintf(stderr, "\n"); fflush(stderr);
     }
+
+    if (nn_do) memcpy(shadow_frame.GetVRegArgs(0), nn_backup, nn_nregs * 4);
   }
 
   if (string_init && !self->IsExceptionPending()) {

@@ -1322,6 +1322,11 @@ static int InvokeMain(JNIEnv* env, char** argv) {
             patchToNativeBySig("Landroid/sysprop/TelephonyProperties;", "baseband_version",
                 "()Ljava/util/List;", (void*)TelephonyProperties_baseband_version);
 
+            // Stub LocaleUtils.toLowerString — returns input unchanged
+            static auto toLowerStub = +[](JNIEnv* env, jclass, jstring s) -> jstring { return s; };
+            patchToNativeBySig("Lsun/util/locale/LocaleUtils;", "toLowerString",
+                "(Ljava/lang/String;)Ljava/lang/String;", (void*)+toLowerStub);
+
             // Replace TextUtils.formatSimple with String.format delegation.
             // The built-in only handles %s/%d and crashes on %x, %08x, etc.
             // Note: can't use patchToNative because GetShorty() returns wrong value

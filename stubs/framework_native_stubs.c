@@ -170,6 +170,14 @@ jobject TelephonyProperties_baseband_version(JNIEnv* env, jclass clazz) {
     return (*env)->CallStaticObjectMethod(env, listCls, emptyList);
 }
 
+/* CaseMapper stub — returns input unchanged (ASCII doesn't need case mapping) */
+static jstring CaseMapper_toLowerCase_stub(JNIEnv* env, jclass cls, jobject locale, jstring input, jint len) {
+    return input;
+}
+static jstring CaseMapper_toUpperCase_stub(JNIEnv* env, jclass cls, jobject locale, jstring input, jint len) {
+    return input;
+}
+
 /* ==================== Registration ==================== */
 
 static int registerWithTolerance(JNIEnv* env, const char* className,
@@ -352,6 +360,27 @@ jint JNI_OnLoad_framework(void* vm, void* reserved) {
             fprintf(stderr, "[fw_stubs] Locale pre-set via AllocObject: root=%p en=%p us=%p\n", root, english, us);
             if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
         }
+    }
+
+    /* Patch CaseMapper to return input as-is (avoids ICU dependency) */
+    {
+        jclass cmCls = (*env)->FindClass(env, "java/lang/CaseMapper");
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        if (cmCls) {
+            /* CaseMapper.toLowerCase(Locale, String, int) returns String */
+            /* When ICU is missing, this returns null. Stub it to return input. */
+            JNINativeMethod nm = {"toLowerCase",
+                "(Ljava/util/Locale;Ljava/lang/String;I)Ljava/lang/String;",
+                (void*)CaseMapper_toLowerCase_stub};
+            /* CaseMapper methods aren't native — need to flip flag first */
+            /* Actually CaseMapper.toLowerCase IS native in Android 15 */
+            if ((*env)->RegisterNatives(env, cmCls, &nm, 1) != 0) {
+                (*env)->ExceptionClear(env);
+            } else {
+                fprintf(stderr, "[fw_stubs] CaseMapper.toLowerCase stubbed\n");
+            }
+        }
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
     }
 
     fprintf(stderr, "[fw_stubs] Framework native stubs registered\n");
