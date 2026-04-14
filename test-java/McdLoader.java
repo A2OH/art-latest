@@ -1121,19 +1121,28 @@ public class McdLoader {
                                         log("[INFO] setDisplaySurface failed, using show+setLayer");
                                     }
 
+                                    // Set layer stack to 0 (physical display)
+                                    try {
+                                        Method setLS = txClass.getDeclaredMethod("setLayerStack", scClass, int.class);
+                                        setLS.setAccessible(true);
+                                        setLS.invoke(tx, surfaceControl, 0);
+                                        log("[OK] setLayerStack(0) — physical display");
+                                    } catch (Throwable x) {
+                                        log("[WARN] setLayerStack: " + x.getClass().getSimpleName());
+                                    }
                                     Method show = txClass.getDeclaredMethod("show", scClass);
                                     show.setAccessible(true);
                                     show.invoke(tx, surfaceControl);
                                     Method setLayer = txClass.getDeclaredMethod("setLayer", scClass, int.class);
                                     setLayer.setAccessible(true);
-                                    setLayer.invoke(tx, surfaceControl, 0x7FFFFFFF); // MAX_INT layer
+                                    setLayer.invoke(tx, surfaceControl, 0x7FFFFFFF);
                                     Method setPos = txClass.getDeclaredMethod("setPosition", scClass, float.class, float.class);
                                     setPos.setAccessible(true);
                                     setPos.invoke(tx, surfaceControl, 100f, 200f);
                                     Method apply = txClass.getDeclaredMethod("apply");
                                     apply.setAccessible(true);
                                     apply.invoke(tx);
-                                    log("[OK] Transaction.apply()!");
+                                    log("[OK] Transaction.apply() — layer stack 0, shown, layer MAX, pos(100,200)");
                                     // Keep alive for 10 seconds so user can see it
                                     log("[INFO] MCD RED RECTANGLE SHOULD BE VISIBLE ON PHONE SCREEN!");
                                     Thread.sleep(10000);
