@@ -1414,24 +1414,41 @@ static int InvokeMain(JNIEnv* env, char** argv) {
               }
             }
 
-            // Fix ConcurrentHashMap.U (Unsafe) — set via JNI after Unsafe re-init
+            // Fix ConcurrentHashMap.U + field offsets
             {
               jclass chmCls = env->FindClass("java/util/concurrent/ConcurrentHashMap");
               if (env->ExceptionCheck()) env->ExceptionClear();
               jclass unsafeCls = env->FindClass("jdk/internal/misc/Unsafe");
               if (env->ExceptionCheck()) env->ExceptionClear();
               if (chmCls && unsafeCls) {
+                // Set U = Unsafe.theUnsafe
                 jfieldID uField = env->GetStaticFieldID(chmCls, "U", "Ljdk/internal/misc/Unsafe;");
                 if (env->ExceptionCheck()) env->ExceptionClear();
-                if (uField) {
-                  jfieldID theUnsafe = env->GetStaticFieldID(unsafeCls, "theUnsafe", "Ljdk/internal/misc/Unsafe;");
+                jfieldID theUnsafeF = env->GetStaticFieldID(unsafeCls, "theUnsafe", "Ljdk/internal/misc/Unsafe;");
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                jobject u = (theUnsafeF) ? env->GetStaticObjectField(unsafeCls, theUnsafeF) : nullptr;
+                if (uField && u) env->SetStaticObjectField(chmCls, uField, u);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+
+                // Set field offsets using Unsafe.objectFieldOffset
+                if (u) {
+                  jmethodID ofo = env->GetMethodID(unsafeCls, "objectFieldOffset",
+                      "(Ljava/lang/Class;Ljava/lang/String;)J");
                   if (env->ExceptionCheck()) env->ExceptionClear();
-                  if (theUnsafe) {
-                    jobject u = env->GetStaticObjectField(unsafeCls, theUnsafe);
-                    if (u) {
-                      env->SetStaticObjectField(chmCls, uField, u);
-                      fprintf(stderr, "[dalvikvm] Set ConcurrentHashMap.U = Unsafe\n");
-                    }
+                  if (ofo) {
+                    auto setOffset = [&](const char* name, const char* staticName) {
+                      jlong off = env->CallLongMethod(u, ofo, chmCls,
+                          env->NewStringUTF(name));
+                      if (env->ExceptionCheck()) { env->ExceptionClear(); return; }
+                      jfieldID sf = env->GetStaticFieldID(chmCls, staticName, "J");
+                      if (env->ExceptionCheck()) { env->ExceptionClear(); return; }
+                      if (sf) env->SetStaticLongField(chmCls, sf, off);
+                    };
+                    setOffset("sizeCtl", "SIZECTL");
+                    setOffset("transferIndex", "TRANSFERINDEX");
+                    setOffset("baseCount", "BASECOUNT");
+                    setOffset("cellsBusy", "CELLSBUSY");
+                    fprintf(stderr, "[dalvikvm] Set ConcurrentHashMap.U + field offsets\n");
                   }
                 }
               }
