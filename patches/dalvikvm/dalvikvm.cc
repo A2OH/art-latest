@@ -2651,6 +2651,29 @@ static int InvokeMain(JNIEnv* env, char** argv) {
     if (env->ExceptionCheck()) env->ExceptionClear();
   }
 
+  // Stub Trace methods (tracing not available in standalone mode)
+  {
+    jclass traceCls = env->FindClass("android/os/Trace");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (traceCls) {
+      art::ScopedObjectAccess soa(art::Thread::Current());
+      art::ObjPtr<art::mirror::Class> mirror = soa.Decode<art::mirror::Class>(traceCls);
+      if (mirror != nullptr) {
+        for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
+          const char* name = m.GetName();
+          if (!m.IsNative()) continue; // only patch already-native methods
+          std::string sig = m.GetSignature().ToString();
+          if (sig.find(")Z") != std::string::npos) {
+            m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_noop_return_false));
+          } else if (sig.find(")V") != std::string::npos) {
+            m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_java_lang_Throwable_printStackTrace_noop));
+          }
+        }
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
+
   // Patch Activity methods that need Window/WindowController (our mock Window is incomplete)
   {
     jclass actCls = env->FindClass("android/app/Activity");

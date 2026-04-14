@@ -208,6 +208,26 @@ public class McdLoader {
         } catch (Throwable t) { log("[WARN] Instrumentation: " + t.getClass().getName()); }
         try {
             app = nativeAllocInstance(Class.forName("android.app.Application", false, cl));
+            // Set mActivityLifecycleCallbacks (needed for dispatchActivityPreCreated)
+            try {
+                Class<?> appCls = Class.forName("android.app.Application");
+                Field alcF = appCls.getDeclaredField("mActivityLifecycleCallbacks");
+                alcF.setAccessible(true);
+                alcF.set(app, new java.util.ArrayList<>());
+                // Also set mComponentCallbacks
+                try {
+                    Field ccF = appCls.getDeclaredField("mComponentCallbacks");
+                    ccF.setAccessible(true);
+                    ccF.set(app, new java.util.ArrayList<>());
+                } catch (Throwable t2) {}
+                // Set mBase on Application (it's a ContextWrapper)
+                try {
+                    Class<?> cwCls = Class.forName("android.content.ContextWrapper");
+                    Field mbF = cwCls.getDeclaredField("mBase");
+                    mbF.setAccessible(true);
+                    mbF.set(app, mockContext);
+                } catch (Throwable t2) {}
+            } catch (Throwable t2) {}
             log("[OK] Application allocated");
         } catch (Throwable t) { log("[WARN] Application: " + t.getClass().getName()); }
 
@@ -244,6 +264,20 @@ public class McdLoader {
                 Field f = actClass.getDeclaredField("mCalled");
                 f.setAccessible(true); f.set(splash, false);
             } catch (Throwable t) {}
+
+            // mActivityLifecycleCallbacks (needed for dispatchActivityPreCreated)
+            try {
+                Field alcF = actClass.getDeclaredField("mActivityLifecycleCallbacks");
+                alcF.setAccessible(true);
+                alcF.set(splash, new java.util.concurrent.CopyOnWriteArrayList<>());
+            } catch (Throwable t) {
+                // Might be ArrayList instead of CopyOnWriteArrayList
+                try {
+                    Field alcF = actClass.getDeclaredField("mActivityLifecycleCallbacks");
+                    alcF.setAccessible(true);
+                    alcF.set(splash, new java.util.ArrayList<>());
+                } catch (Throwable t2) {}
+            }
 
             // mComponent
             try {

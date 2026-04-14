@@ -463,6 +463,13 @@ static void InterpreterJni(Thread* self,
       ScopedLocalRef<jobject> arg1(soa.Env(), soa.AddLocalReference<jobject>(ObjArg(args[1])));
       ScopedLocalRef<jobject> arg3(soa.Env(), soa.AddLocalReference<jobject>(ObjArg(args[3])));
       result->SetJ(fn(soa.Env(), klass.get(), args[0], arg1.get(), args[2], arg3.get()));
+    } else if (shorty == "I") {
+      // int fn(JNIEnv*, jclass) — VMRuntime.getNotifyNativeInterval etc.
+      using fntype = jint(JNIEnv*, jclass);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jclass> klass(soa.Env(),
+                                   soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
+      result->SetI(fn(soa.Env(), klass.get()));
     } else if (shorty == "ZJ") {
       // boolean fn(JNIEnv*, jclass, long) — Trace.nativeIsTagEnabled
       using fntype = jboolean(JNIEnv*, jclass, jlong);

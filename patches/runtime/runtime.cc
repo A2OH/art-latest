@@ -1495,50 +1495,56 @@ bool Runtime::Start() {
         // Registration function type: int register_xxx(JNIEnv*)
         typedef int (*RegFn)(JNIEnv*);
 
-        // Critical: Binder + Parcel (needed for ALL system service communication)
+        // Register ALL available native methods from libandroid_runtime.so.
+        // Use the bulk registration functions first, then individual ones.
         struct { const char* sym; const char* name; } regs[] = {
-          {"_Z26register_android_os_BinderP7_JNIEnv", "android.os.Binder"},
-          {"_ZN7android26register_android_os_ParcelEP7_JNIEnv", "android.os.Parcel"},
-          {"_ZN7android36register_android_os_SystemPropertiesEP7_JNIEnv", "android.os.SystemProperties"},
-          {"_ZN7android31register_android_os_SystemClockEP7_JNIEnv", "android.os.SystemClock"},
-          {"_Z27register_android_os_ProcessP7_JNIEnv", "android.os.Process"},
-          // MessageQueue for Looper (Handler/message dispatch)
-          {"_ZN7android35register_android_os_MessageQueueImplEP7_JNIEnv", "android.os.MessageQueue"},
-          // HardwareRenderer / Canvas / Surface for rendering
-          {"_ZN7android45register_android_graphics_HardwareRendererObserverEP7_JNIEnv", "HardwareRendererObserver"},
-          {"_ZN7android30register_android_view_SurfaceEP7_JNIEnv", "android.view.Surface"},
-          {"_ZN7android37register_android_view_SurfaceControlEP7_JNIEnv", "SurfaceControl"},
-          {"_ZN7android35register_android_view_SurfaceSessionEP7_JNIEnv", "SurfaceSession"},
-          {"_ZN7android33register_android_view_InputDeviceEP7_JNIEnv", "InputDevice"},
-          {"_ZN7android34register_android_view_InputChannelEP7_JNIEnv", "InputChannel"},
-          // Graphics
-          {"_ZN7android31register_android_graphics_PathEP7_JNIEnv", "graphics.Path"},
-          // Content / Resources / AssetManager (needed for theme + resource loading)
+          // BULK: registers ALL graphics JNI (Canvas, Paint, Bitmap, Typeface, etc.)
+          {"register_android_graphics_classes", "ALL_GRAPHICS"},
+          // BULK: registers many android.* JNI methods
+          {"register_android_functions", "ALL_FUNCTIONS"},
+          // OS core
+          {"_Z26register_android_os_BinderP7_JNIEnv", "Binder"},
+          {"_ZN7android26register_android_os_ParcelEP7_JNIEnv", "Parcel"},
+          {"_ZN7android36register_android_os_SystemPropertiesEP7_JNIEnv", "SystemProperties"},
+          {"_ZN7android31register_android_os_SystemClockEP7_JNIEnv", "SystemClock"},
+          {"_Z27register_android_os_ProcessP7_JNIEnv", "Process"},
+          {"_ZN7android25register_android_os_TraceEP7_JNIEnv", "Trace"},
+          {"_ZN7android25register_android_os_DebugEP7_JNIEnv", "Debug"},
+          {"_ZN7android32register_android_os_MessageQueueEP7_JNIEnv", "MessageQueue"},
+          {"_ZN7android34register_android_os_ServiceManagerEP7_JNIEnv", "ServiceManager"},
+          // Content / Resources
           {"_ZN7android37register_android_content_AssetManagerEP7_JNIEnv", "AssetManager"},
           {"_ZN7android38register_android_content_res_ApkAssetsEP7_JNIEnv", "ApkAssets"},
           {"_ZN7android36register_android_content_StringBlockEP7_JNIEnv", "StringBlock"},
           {"_ZN7android33register_android_content_XmlBlockEP7_JNIEnv", "XmlBlock"},
           {"_ZN7android42register_android_content_res_ConfigurationEP7_JNIEnv", "Configuration"},
-          // Trace (performance tracing)
-          {"_ZN7android25register_android_os_TraceEP7_JNIEnv", "android.os.Trace"},
-          // ActivityManager for process management
-          {"_ZN7android37register_android_app_ActivityManagerEP7_JNIEnv", "ActivityManager"},
-          // Graphics Canvas / Paint / Bitmap (needed for View rendering)
-          {"_ZN7android27register_android_graphics_dEP7_JNIEnv", "graphics"},
-          {"_ZN7android32register_android_graphics_BitmapEP7_JNIEnv", "Bitmap"},
-          {"_ZN7android32register_android_graphics_CanvasEP7_JNIEnv", "Canvas"},
-          {"_ZN7android31register_android_graphics_PaintEP7_JNIEnv", "Paint"},
-          {"_ZN7android34register_android_graphics_TypefaceEP7_JNIEnv", "Typeface"},
-          {"_ZN7android37register_android_graphics_BitmapFactoryEP7_JNIEnv", "BitmapFactory"},
-          {"_ZN7android32register_android_graphics_RegionEP7_JNIEnv", "Region"},
-          {"_ZN7android32register_android_graphics_MatrixEP7_JNIEnv", "Matrix"},
           // View system
-          {"_ZN7android41register_android_view_RenderNodeAnimatorEP7_NIEnv", "RenderNodeAnimator"},
-          {"_ZN7android35register_android_view_TextureLayerEP7_JNIEnv", "TextureLayer"},
-          {"_ZN7android36register_android_view_DisplayListCanvasEP7_JNIEnv", "DisplayListCanvas"},
-          {"_ZN7android48register_android_graphics_HardwareRendererObserverEP7_JNIEnv", "HWRendererObserver"},
-          // Window
-          {"_ZN7android33register_android_view_ThreadedRendererEP7_JNIEnv", "ThreadedRenderer"},
+          {"_ZN7android29register_android_view_SurfaceEP7_JNIEnv", "Surface"},
+          {"_ZN7android36register_android_view_SurfaceControlEP7_JNIEnv", "SurfaceControl"},
+          {"_ZN7android36register_android_view_SurfaceSessionEP7_JNIEnv", "SurfaceSession"},
+          {"_ZN7android33register_android_view_InputDeviceEP7_JNIEnv", "InputDevice"},
+          {"_ZN7android34register_android_view_InputChannelEP7_JNIEnv", "InputChannel"},
+          {"_ZN7android30register_android_view_KeyEventEP7_JNIEnv", "KeyEvent"},
+          {"_ZN7android33register_android_view_MotionEventEP7_JNIEnv", "MotionEvent"},
+          {"_ZN7android32register_android_view_InputQueueEP7_JNIEnv", "InputQueue"},
+          {"_ZN7android41register_android_view_WindowManagerGlobalEP7_JNIEnv", "WindowManagerGlobal"},
+          {"_ZN7android40register_android_view_InputEventReceiverEP7_JNIEnv", "InputEventReceiver"},
+          {"_ZN7android42register_android_view_DisplayEventReceiverEP7_JNIEnv", "DisplayEventReceiver"},
+          // App
+          {"_ZN7android29register_android_app_ActivityEP7_JNIEnv", "Activity"},
+          {"_ZN7android35register_android_app_ActivityThreadEP7_JNIEnv", "ActivityThread"},
+          // Animation
+          {"_ZN7android47register_android_animation_PropertyValuesHolderEP7_JNIEnv", "PropertyValuesHolder"},
+          // Database (SQLite)
+          {"_ZN7android42register_android_database_SQLiteConnectionEP7_JNIEnv", "SQLiteConnection"},
+          {"_ZN7android38register_android_database_SQLiteGlobalEP7_JNIEnv", "SQLiteGlobal"},
+          {"_ZN7android38register_android_database_CursorWindowEP7_JNIEnv", "CursorWindow"},
+          // Text
+          {"_ZN7android32register_android_text_HyphenatorEP7_JNIEnv", "Hyphenator"},
+          {"_ZN7android38register_android_text_AndroidCharacterEP7_JNIEnv", "AndroidCharacter"},
+          // Util
+          {"_ZN7android25register_android_util_LogEP7_JNIEnv", "Log"},
+          {"_ZN7android30register_android_util_EventLogEP7_JNIEnv", "EventLog"},
           {nullptr, nullptr}
         };
         int registered = 0, failed = 0;
