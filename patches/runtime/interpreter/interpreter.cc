@@ -810,6 +810,20 @@ static void InterpreterJni(Thread* self,
       ScopedLocalRef<jobject> rcvr(soa.Env(), soa.AddLocalReference<jobject>(receiver));
       jlong arg0 = *reinterpret_cast<jlong*>(&args[0]);
       fn(soa.Env(), rcvr.get(), arg0);
+    } else if (shorty == "VLF") {
+      // void fn(JNIEnv*, jobject, Object, float) — Field.setFloat
+      using fntype = void(JNIEnv*, jobject, jobject, jfloat);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jobject> rcvr(soa.Env(), soa.AddLocalReference<jobject>(receiver));
+      ScopedLocalRef<jobject> arg0(soa.Env(), soa.AddLocalReference<jobject>(ObjArg(args[0])));
+      fn(soa.Env(), rcvr.get(), arg0.get(), *reinterpret_cast<jfloat*>(&args[1]));
+    } else if (shorty == "VLI") {
+      // void fn(JNIEnv*, jobject, Object, int) — Field.setInt etc.
+      using fntype = void(JNIEnv*, jobject, jobject, jint);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jobject> rcvr(soa.Env(), soa.AddLocalReference<jobject>(receiver));
+      ScopedLocalRef<jobject> arg0(soa.Env(), soa.AddLocalReference<jobject>(ObjArg(args[0])));
+      fn(soa.Env(), rcvr.get(), arg0.get(), args[1]);
     } else if (shorty == "VLIZ") {
       // void fn(JNIEnv*, jobject, Object, int, boolean) — Activity.onApplyThemeResource
       using fntype = void(JNIEnv*, jobject, jobject, jint, jboolean);

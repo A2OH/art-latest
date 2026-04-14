@@ -376,25 +376,47 @@ public class McdLoader {
                     try {
                         Class<?> configClass = Class.forName("android.content.res.Configuration");
                         Object config = nativeAllocInstance(configClass);
+                        // Set windowConfiguration on Configuration
+                        try {
+                            Class<?> wcClass = Class.forName("android.app.WindowConfiguration");
+                            Object wc = nativeAllocInstance(wcClass);
+                            Field wcF = configClass.getDeclaredField("windowConfiguration");
+                            wcF.setAccessible(true);
+                            wcF.set(config, wc);
+                        } catch (Throwable t4) {}
                         Field cfF = resImplClass.getDeclaredField("mConfiguration");
                         cfF.setAccessible(true);
                         cfF.set(resImpl, config);
+                    // Note: NOT setting mAssets (AssetManager) — its clinit crashes.
+                    // Resources.getBoolean etc will NPE on null AssetManager, but
+                    // that's tolerable via the clinit tolerance system.
                     } catch (Throwable t3) {}
                     // Set DisplayMetrics on ResourcesImpl
                     try {
                         Class<?> dmClass = Class.forName("android.util.DisplayMetrics");
                         Object dm = nativeAllocInstance(dmClass);
                         // Set reasonable defaults
-                        try { dmClass.getDeclaredField("density").setFloat(dm, 2.0f); } catch (Throwable x) {}
-                        try { dmClass.getDeclaredField("densityDpi").setInt(dm, 320); } catch (Throwable x) {}
-                        try { dmClass.getDeclaredField("widthPixels").setInt(dm, 1080); } catch (Throwable x) {}
-                        try { dmClass.getDeclaredField("heightPixels").setInt(dm, 2340); } catch (Throwable x) {}
-                        try { dmClass.getDeclaredField("xdpi").setFloat(dm, 420f); } catch (Throwable x) {}
-                        try { dmClass.getDeclaredField("ydpi").setFloat(dm, 420f); } catch (Throwable x) {}
-                        try { dmClass.getDeclaredField("scaledDensity").setFloat(dm, 2.0f); } catch (Throwable x) {}
+                        try { Field f = dmClass.getDeclaredField("density"); f.setAccessible(true); f.setFloat(dm, 2.0f); } catch (Throwable x) {}
+                        try { Field f = dmClass.getDeclaredField("densityDpi"); f.setAccessible(true); f.setInt(dm, 320); } catch (Throwable x) {}
+                        try { Field f = dmClass.getDeclaredField("widthPixels"); f.setAccessible(true); f.setInt(dm, 1080); } catch (Throwable x) {}
+                        try { Field f = dmClass.getDeclaredField("heightPixels"); f.setAccessible(true); f.setInt(dm, 2340); } catch (Throwable x) {}
+                        try { Field f = dmClass.getDeclaredField("xdpi"); f.setAccessible(true); f.setFloat(dm, 420f); } catch (Throwable x) {}
+                        try { Field f = dmClass.getDeclaredField("ydpi"); f.setAccessible(true); f.setFloat(dm, 420f); } catch (Throwable x) {}
+                        try { Field f = dmClass.getDeclaredField("scaledDensity"); f.setAccessible(true); f.setFloat(dm, 2.0f); } catch (Throwable x) {}
                         Field dmF = resImplClass.getDeclaredField("mDisplayMetrics");
                         dmF.setAccessible(true);
                         dmF.set(resImpl, dm);
+                    } catch (Throwable t3) {}
+                    // Set lock objects on Resources (sync-on-null prevention)
+                    try {
+                        Field tlF = resClass.getDeclaredField("mTmpValueLock");
+                        tlF.setAccessible(true);
+                        tlF.set(resources, new Object());
+                    } catch (Throwable t3) {}
+                    try {
+                        Field alF = resClass.getDeclaredField("mAccessLock");
+                        alF.setAccessible(true);
+                        alF.set(resources, new Object());
                     } catch (Throwable t3) {}
                     // Set ResourcesImpl on Resources
                     try {
