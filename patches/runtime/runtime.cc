@@ -1519,6 +1519,8 @@ bool Runtime::Start() {
           {"_ZN7android36register_android_content_StringBlockEP7_JNIEnv", "StringBlock"},
           {"_ZN7android33register_android_content_XmlBlockEP7_JNIEnv", "XmlBlock"},
           {"_ZN7android42register_android_content_res_ConfigurationEP7_JNIEnv", "Configuration"},
+          // Trace (performance tracing)
+          {"_ZN7android25register_android_os_TraceEP7_JNIEnv", "android.os.Trace"},
           // ActivityManager for process management
           {"_ZN7android37register_android_app_ActivityManagerEP7_JNIEnv", "ActivityManager"},
           // Graphics Canvas / Paint / Bitmap (needed for View rendering)

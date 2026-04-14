@@ -446,6 +446,31 @@ static void InterpreterJni(Thread* self,
                                    soa.AddLocalReference<jobject>(ObjArg(args[0])));
       ScopedLocalRef<jobject> jresult(soa.Env(), fn(soa.Env(), klass.get(), arg0.get(), args[1], args[2]));
       result->SetL(soa.Decode<mirror::Object>(jresult.get()));
+    } else if (shorty == "JJ") {
+      // long fn(JNIEnv*, jclass, long) — e.g. ApkAssets.nativeGetStringBlock(long)
+      using fntype = jlong(JNIEnv*, jclass, jlong);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jclass> klass(soa.Env(),
+                                   soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
+      jlong arg0 = *reinterpret_cast<jlong*>(&args[0]);
+      result->SetJ(fn(soa.Env(), klass.get(), arg0));
+    } else if (shorty == "JILIL") {
+      // long fn(JNIEnv*, jclass, int, String, int, Object) — ApkAssets.nativeLoad
+      using fntype = jlong(JNIEnv*, jclass, jint, jobject, jint, jobject);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jclass> klass(soa.Env(),
+                                   soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
+      ScopedLocalRef<jobject> arg1(soa.Env(), soa.AddLocalReference<jobject>(ObjArg(args[1])));
+      ScopedLocalRef<jobject> arg3(soa.Env(), soa.AddLocalReference<jobject>(ObjArg(args[3])));
+      result->SetJ(fn(soa.Env(), klass.get(), args[0], arg1.get(), args[2], arg3.get()));
+    } else if (shorty == "ZJ") {
+      // boolean fn(JNIEnv*, jclass, long) — Trace.nativeIsTagEnabled
+      using fntype = jboolean(JNIEnv*, jclass, jlong);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jclass> klass(soa.Env(),
+                                   soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
+      jlong arg0 = *reinterpret_cast<jlong*>(&args[0]);
+      result->SetZ(fn(soa.Env(), klass.get(), arg0));
     } else {
       LOG(WARNING) << "InterpreterJni: unhandled static shorty '" << shorty << "' for " << method->PrettyMethod();
     }
@@ -758,6 +783,45 @@ static void InterpreterJni(Thread* self,
       ScopedLocalRef<jobject> arg0(soa.Env(), soa.AddLocalReference<jobject>(ObjArg(args[0])));
       jobject jresult = fn(soa.Env(), rcvr.get(), arg0.get(), args[1]);
       result->SetL(soa.Decode<mirror::Object>(jresult));
+    } else if (shorty == "Z") {
+      // boolean fn(JNIEnv*, jobject) — e.g. Activity.isTaskRoot
+      using fntype = jboolean(JNIEnv*, jobject);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jobject> rcvr(soa.Env(), soa.AddLocalReference<jobject>(receiver));
+      result->SetZ(fn(soa.Env(), rcvr.get()));
+    } else if (shorty == "IL") {
+      // int fn(JNIEnv*, jobject, Object) — e.g. Field.getInt(Object)
+      using fntype = jint(JNIEnv*, jobject, jobject);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jobject> rcvr(soa.Env(), soa.AddLocalReference<jobject>(receiver));
+      ScopedLocalRef<jobject> arg0(soa.Env(), soa.AddLocalReference<jobject>(ObjArg(args[0])));
+      result->SetI(fn(soa.Env(), rcvr.get(), arg0.get()));
+    } else if (shorty == "VJ") {
+      // void fn(JNIEnv*, jobject, long) — VMRuntime.registerNativeAllocation
+      using fntype = void(JNIEnv*, jobject, jlong);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jobject> rcvr(soa.Env(), soa.AddLocalReference<jobject>(receiver));
+      jlong arg0 = *reinterpret_cast<jlong*>(&args[0]);
+      fn(soa.Env(), rcvr.get(), arg0);
+    } else if (shorty == "VLIZ") {
+      // void fn(JNIEnv*, jobject, Object, int, boolean) — Activity.onApplyThemeResource
+      using fntype = void(JNIEnv*, jobject, jobject, jint, jboolean);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jobject> rcvr(soa.Env(), soa.AddLocalReference<jobject>(receiver));
+      ScopedLocalRef<jobject> arg0(soa.Env(), soa.AddLocalReference<jobject>(ObjArg(args[0])));
+      fn(soa.Env(), rcvr.get(), arg0.get(), args[1], (jboolean)args[2]);
+    } else if (shorty == "I") {
+      // int fn(JNIEnv*, jobject) — hashCode, etc.
+      using fntype = jint(JNIEnv*, jobject);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jobject> rcvr(soa.Env(), soa.AddLocalReference<jobject>(receiver));
+      result->SetI(fn(soa.Env(), rcvr.get()));
+    } else if (shorty == "J") {
+      // long fn(JNIEnv*, jobject) — e.g. currentTimeMillis on instance
+      using fntype = jlong(JNIEnv*, jobject);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jobject> rcvr(soa.Env(), soa.AddLocalReference<jobject>(receiver));
+      result->SetJ(fn(soa.Env(), rcvr.get()));
     } else {
       LOG(WARNING) << "InterpreterJni: unhandled non-static shorty '" << shorty << "' for " << method->PrettyMethod();
     }

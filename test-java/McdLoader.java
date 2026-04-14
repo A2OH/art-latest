@@ -424,6 +424,39 @@ public class McdLoader {
             }
         }
 
+        // Step 7: Try calling AppCompatActivity.onCreate directly if SplashActivity failed
+        log("[7] Trying AppCompatActivity.onCreate...");
+        try {
+            Class<?> appCompatCls = Class.forName("androidx.appcompat.app.AppCompatActivity");
+            Method acOnCreate = appCompatCls.getDeclaredMethod("onCreate", Class.forName("android.os.Bundle"));
+            acOnCreate.setAccessible(true);
+            acOnCreate.invoke(splash, (Object) null);
+            log("[OK] AppCompatActivity.onCreate returned!");
+        } catch (Throwable t) {
+            try { nativePrintException(t); } catch (Throwable t2) {}
+        }
+
+        // Step 8: Try calling Activity.performCreate directly
+        log("[8] Trying Activity.performCreate...");
+        try {
+            Class<?> actCls = Class.forName("android.app.Activity");
+            // performCreate(Bundle, PersistableBundle)
+            Method perfCreate = null;
+            for (Method m : actCls.getDeclaredMethods()) {
+                if (m.getName().equals("performCreate") && m.getParameterCount() == 1) {
+                    perfCreate = m;
+                    break;
+                }
+            }
+            if (perfCreate != null) {
+                perfCreate.setAccessible(true);
+                perfCreate.invoke(splash, (Object) null);
+                log("[OK] Activity.performCreate returned!");
+            }
+        } catch (Throwable t) {
+            try { nativePrintException(t); } catch (Throwable t2) {}
+        }
+
         log("=== Westlake: onCreate execution complete ===");
     }
 }

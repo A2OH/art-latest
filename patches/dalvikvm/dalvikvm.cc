@@ -2619,6 +2619,38 @@ static int InvokeMain(JNIEnv* env, char** argv) {
     }
   }
 
+  // Patch Resources$Theme methods to no-ops (ThemeImpl is null without real AssetManager)
+  {
+    jclass themeCls = env->FindClass("android/content/res/Resources$Theme");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (themeCls) {
+      art::ScopedObjectAccess soa(art::Thread::Current());
+      art::ObjPtr<art::mirror::Class> mirror = soa.Decode<art::mirror::Class>(themeCls);
+      if (mirror != nullptr) {
+        int patched = 0;
+        for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
+          if (m.IsNative() || m.IsAbstract() || m.IsConstructor()) continue;
+          const char* name = m.GetName();
+          std::string sig = m.GetSignature().ToString();
+          // Patch void methods to no-op
+          if (sig.find(")V") != std::string::npos) {
+            m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+            m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_java_lang_Throwable_printStackTrace_noop));
+            patched++;
+          }
+          // Patch boolean resolveAttribute → return false
+          else if (strcmp(name, "resolveAttribute") == 0 && sig.find(")Z") != std::string::npos) {
+            m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+            m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_noop_return_false));
+            patched++;
+          }
+        }
+        fprintf(stderr, "[dalvikvm] Patched %d Resources$Theme methods → no-op\n", patched);
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
+
   // Patch Activity methods that need Window/WindowController (our mock Window is incomplete)
   {
     jclass actCls = env->FindClass("android/app/Activity");
@@ -2632,6 +2664,10 @@ static int InvokeMain(JNIEnv* env, char** argv) {
           {"isFinishing", "()Z", (void*)Java_noop_return_false},
           {"isDestroyed", "()Z", (void*)Java_noop_return_false},
           {"isChangingConfigurations", "()Z", (void*)Java_noop_return_false},
+          // Skip theme resource application (needs full AssetManager)
+          {"onApplyThemeResource",
+           "(Landroid/content/res/Resources$Theme;IZ)V",
+           (void*)Java_java_lang_Throwable_printStackTrace_noop},
           {nullptr, nullptr, nullptr}
         };
         for (int i = 0; patches[i].name; i++) {
