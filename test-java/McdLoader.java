@@ -266,6 +266,56 @@ public class McdLoader {
                 f.setAccessible(true); f.set(splash, false);
             } catch (Throwable t) {}
 
+            // SavedStateRegistryController (needed for Hilt/AndroidX lifecycle)
+            try {
+                Class<?> ssrcCls = Class.forName("androidx.savedstate.SavedStateRegistryController");
+                // Use SavedStateRegistryController.create(SavedStateRegistryOwner)
+                Method create = ssrcCls.getDeclaredMethod("create", Class.forName("androidx.savedstate.SavedStateRegistryOwner"));
+                create.setAccessible(true);
+                // Activity implements SavedStateRegistryOwner
+                Object ssrc = create.invoke(null, splash);
+                if (ssrc != null) {
+                    // Find and set mSavedStateRegistryController field
+                    // Try both Kotlin-style and Java-style field names
+                    String[] fieldNames = {"savedStateRegistryController", "mSavedStateRegistryController"};
+                    for (Class<?> c = splashClass; c != null; c = c.getSuperclass()) {
+                        for (String fn : fieldNames) {
+                            try {
+                                Field f = c.getDeclaredField(fn);
+                                f.setAccessible(true); f.set(splash, ssrc);
+                                log("[OK] SavedStateRegistryController set (" + c.getSimpleName() + "." + fn + ")");
+                                break;
+                            } catch (Throwable x) {}
+                        }
+                    }
+                }
+            } catch (Throwable t) {
+                // Fallback: allocate directly
+                try {
+                    Class<?> ssrcCls = Class.forName("androidx.savedstate.SavedStateRegistryController");
+                    Object ssrc = nativeAllocInstance(ssrcCls);
+                    // Set SavedStateRegistry
+                    try {
+                        Class<?> ssrCls = Class.forName("androidx.savedstate.SavedStateRegistry");
+                        Object ssr = nativeAllocInstance(ssrCls);
+                        Field rf = ssrcCls.getDeclaredField("mRegistry");
+                        rf.setAccessible(true);
+                        rf.set(ssrc, ssr);
+                    } catch (Throwable x) {}
+                    String[] fn2 = {"savedStateRegistryController", "mSavedStateRegistryController"};
+                    for (Class<?> c = splashClass; c != null; c = c.getSuperclass()) {
+                        for (String fn : fn2) {
+                            try {
+                                Field f = c.getDeclaredField(fn);
+                                f.setAccessible(true); f.set(splash, ssrc);
+                                log("[OK] SavedStateRegistryController set (alloc: " + c.getSimpleName() + ")");
+                                break;
+                            } catch (Throwable x) {}
+                        }
+                    }
+                } catch (Throwable x) {}
+            }
+
             // mActivityLifecycleCallbacks (needed for dispatchActivityPreCreated)
             try {
                 Field alcF = actClass.getDeclaredField("mActivityLifecycleCallbacks");
@@ -488,7 +538,7 @@ public class McdLoader {
                         try { Field f = dmClass.getDeclaredField("xdpi"); f.setAccessible(true); f.setFloat(dm, 420f); } catch (Throwable x) {}
                         try { Field f = dmClass.getDeclaredField("ydpi"); f.setAccessible(true); f.setFloat(dm, 420f); } catch (Throwable x) {}
                         try { Field f = dmClass.getDeclaredField("scaledDensity"); f.setAccessible(true); f.setFloat(dm, 2.0f); } catch (Throwable x) {}
-                        Field dmF = resImplClass.getDeclaredField("mDisplayMetrics");
+                        Field dmF = resImplClass.getDeclaredField("mMetrics");
                         dmF.setAccessible(true);
                         dmF.set(resImpl, dm);
                     } catch (Throwable t3) {}

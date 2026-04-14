@@ -2660,6 +2660,55 @@ static int InvokeMain(JNIEnv* env, char** argv) {
     }
   }
 
+  // Patch Resources.obtainStyledAttributes to handle null attrs
+  // The "inAttrs" NPE comes from Preconditions check in TypedArray.obtain
+  {
+    jclass resCls = env->FindClass("android/content/res/Resources");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (resCls) {
+      art::ScopedObjectAccess soa(art::Thread::Current());
+      art::ObjPtr<art::mirror::Class> mirror = soa.Decode<art::mirror::Class>(resCls);
+      if (mirror != nullptr) {
+        for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
+          if (strcmp(m.GetName(), "obtainStyledAttributes") == 0 && !m.IsNative()) {
+            std::string sig = m.GetSignature().ToString();
+            // Return null (TypedArray) for all obtainStyledAttributes variants
+            m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+            m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_noop_return_null));
+          }
+        }
+        // Also patch obtainAttributes
+        for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
+          if (strcmp(m.GetName(), "obtainAttributes") == 0 && !m.IsNative()) {
+            m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+            m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_noop_return_null));
+          }
+        }
+        fprintf(stderr, "[dalvikvm] Patched Resources.obtainStyledAttributes/obtainAttributes → null\n");
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
+
+  // Also patch Context.obtainStyledAttributes (called from View constructors)
+  {
+    jclass ctxCls = env->FindClass("android/content/Context");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (ctxCls) {
+      art::ScopedObjectAccess soa(art::Thread::Current());
+      art::ObjPtr<art::mirror::Class> mirror = soa.Decode<art::mirror::Class>(ctxCls);
+      if (mirror != nullptr) {
+        for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
+          if (strcmp(m.GetName(), "obtainStyledAttributes") == 0 && !m.IsNative()) {
+            m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+            m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_noop_return_null));
+          }
+        }
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
+
   // Patch Resources$Theme methods to no-ops (ThemeImpl is null without real AssetManager)
   {
     jclass themeCls = env->FindClass("android/content/res/Resources$Theme");
@@ -2689,6 +2738,83 @@ static int InvokeMain(JNIEnv* env, char** argv) {
         fprintf(stderr, "[dalvikvm] Patched %d Resources$Theme methods → no-op\n", patched);
       }
     }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
+
+  // Fix ViewConfiguration — create with default display density
+  {
+    jclass vcCls = env->FindClass("android/view/ViewConfiguration");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (vcCls) {
+      // Patch getDisplayDensity to return 320 (xxhdpi)
+      art::ScopedObjectAccess soa(art::Thread::Current());
+      art::ObjPtr<art::mirror::Class> mirror = soa.Decode<art::mirror::Class>(vcCls);
+      if (mirror != nullptr) {
+        for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
+          if (strcmp(m.GetName(), "getDisplayDensity") == 0 && !m.IsNative()) {
+            // Patch to return 320 (xxhdpi density)
+            static auto retDensity = +[](JNIEnv*, jclass, jobject) -> jint { return 320; };
+            m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative | art::kAccStatic);
+            m.SetEntryPointFromJni(reinterpret_cast<void*>(+retDensity));
+            fprintf(stderr, "[dalvikvm] Patched ViewConfiguration.getDisplayDensity → 320\n");
+            break;
+          }
+        }
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
+
+  // Bypass SavedState (AndroidX lifecycle — needs full component init)
+  {
+    jclass ssrcCls = env->FindClass("androidx/savedstate/SavedStateRegistryController");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (ssrcCls) {
+      art::ScopedObjectAccess soa(art::Thread::Current());
+      art::ObjPtr<art::mirror::Class> mirror = soa.Decode<art::mirror::Class>(ssrcCls);
+      if (mirror != nullptr) {
+        for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
+          if (m.IsNative() || m.IsAbstract() || m.IsConstructor()) continue;
+          std::string sig = m.GetSignature().ToString();
+          if (sig.find(")V") != std::string::npos) {
+            m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+            m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_java_lang_Throwable_printStackTrace_noop));
+          }
+        }
+        fprintf(stderr, "[dalvikvm] Patched SavedStateRegistryController → no-op\n");
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
+
+  // Bypass NewRelic tracing (another analytics SDK)
+  {
+    const char* nrClasses[] = {
+      "com/newrelic/agent/android/tracing/TraceMachine",
+      "com/newrelic/agent/android/tracing/Trace",
+      "com/newrelic/agent/android/NewRelic",
+      nullptr
+    };
+    int totalPatched = 0;
+    for (int ci = 0; nrClasses[ci]; ci++) {
+      jclass cls = env->FindClass(nrClasses[ci]);
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      if (!cls) continue;
+      art::ScopedObjectAccess soa(art::Thread::Current());
+      art::ObjPtr<art::mirror::Class> mirror = soa.Decode<art::mirror::Class>(cls);
+      if (mirror == nullptr) continue;
+      for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
+        if (m.IsNative() || m.IsAbstract() || m.IsConstructor()) continue;
+        std::string sig = m.GetSignature().ToString();
+        if (sig.find(")V") != std::string::npos) {
+          m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+          m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_java_lang_Throwable_printStackTrace_noop));
+          totalPatched++;
+        }
+      }
+    }
+    if (totalPatched > 0)
+      fprintf(stderr, "[dalvikvm] Patched %d NewRelic methods → no-op\n", totalPatched);
     if (env->ExceptionCheck()) env->ExceptionClear();
   }
 
