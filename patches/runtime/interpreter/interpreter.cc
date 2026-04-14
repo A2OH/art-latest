@@ -90,7 +90,12 @@ static void InterpreterJni(Thread* self,
     // calling convention from libandroid_runtime.so)
     std::string cls_desc;
     const char* desc = method->GetDeclaringClass()->GetDescriptor(&cls_desc);
-    bool isParcelCritical = (desc != nullptr && strcmp(desc, "Landroid/os/Parcel;") == 0);
+    bool isParcelCritical = (desc != nullptr &&
+        (strcmp(desc, "Landroid/os/Parcel;") == 0 ||
+         strcmp(desc, "Landroid/graphics/Canvas;") == 0 ||
+         strstr(desc, "android/graphics/") != nullptr ||
+         strcmp(desc, "Landroid/view/Surface;") == 0 ||
+         strcmp(desc, "Landroid/graphics/RecordingCanvas;") == 0));
     if (!isParcelCritical) {
       // Not a known @CriticalNative — use regular JNI dispatch
       goto regular_jni;
@@ -111,6 +116,10 @@ static void InterpreterJni(Thread* self,
     } else if (shorty == "VJ") {
       reinterpret_cast<void(*)(jlong)>(const_cast<void*>(fn))(
           *reinterpret_cast<jlong*>(&args[0]));
+    } else if (shorty == "VJII") {
+      // void fn(long, int, int) — Canvas.nativeDrawColor(ptr, color, blendMode)
+      reinterpret_cast<void(*)(jlong, jint, jint)>(const_cast<void*>(fn))(
+          *reinterpret_cast<jlong*>(&args[0]), args[2], args[3]);
     } else if (shorty == "VJI") {
       reinterpret_cast<void(*)(jlong, jint)>(const_cast<void*>(fn))(
           *reinterpret_cast<jlong*>(&args[0]), args[2]);
@@ -533,6 +542,14 @@ static void InterpreterJni(Thread* self,
                                    soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
       jlong arg0 = *reinterpret_cast<jlong*>(&args[0]);
       fn(soa.Env(), klass.get(), arg0);
+    } else if (shorty == "VJII") {
+      // void fn(JNIEnv*, jclass, long, int, int) — Canvas.nDrawColor etc.
+      using fntype = void(JNIEnv*, jclass, jlong, jint, jint);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jclass> klass(soa.Env(),
+                                   soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
+      jlong arg0 = *reinterpret_cast<jlong*>(&args[0]);
+      fn(soa.Env(), klass.get(), arg0, args[2], args[3]);
     } else if (shorty == "VJL") {
       // void fn(JNIEnv*, jclass, long, Object) — Parcel.nativeMarkForBinder etc.
       using fntype = void(JNIEnv*, jclass, jlong, jobject);
