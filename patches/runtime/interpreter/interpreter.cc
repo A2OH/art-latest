@@ -613,6 +613,17 @@ static void InterpreterJni(Thread* self,
       jlong arg0 = *reinterpret_cast<jlong*>(&args[0]);
       jlong arg1 = *reinterpret_cast<jlong*>(&args[2]);
       fn(soa.Env(), klass.get(), arg0, arg1);
+    } else if (shorty == "JLLIIIIJL") {
+      // long fn(JNIEnv*, jclass, Object, Object, int, int, int, int, long, Object)
+      // SurfaceControl.nativeCreate(Session, name, w, h, format, flags, parentPtr, metadata)
+      using fntype = jlong(JNIEnv*, jclass, jobject, jobject, jint, jint, jint, jint, jlong, jobject);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jclass> klass(soa.Env(), soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
+      ScopedLocalRef<jobject> a0(soa.Env(), soa.AddLocalReference<jobject>(ObjArg(args[0])));
+      ScopedLocalRef<jobject> a1(soa.Env(), soa.AddLocalReference<jobject>(ObjArg(args[1])));
+      jlong a5 = *reinterpret_cast<jlong*>(&args[6]); // after 4 ints + 2 obj slots = offset 6
+      ScopedLocalRef<jobject> a6(soa.Env(), soa.AddLocalReference<jobject>(ObjArg(args[8])));
+      result->SetJ(fn(soa.Env(), klass.get(), a0.get(), a1.get(), args[2], args[3], args[4], args[5], a5, a6.get()));
     } else if (shorty == "VJLZZ") {
       // void fn(JNIEnv*, jclass, long, Object[], boolean, boolean) — AssetManager.nativeSetApkAssets
       using fntype = void(JNIEnv*, jclass, jlong, jobjectArray, jboolean, jboolean);

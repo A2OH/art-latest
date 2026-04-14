@@ -945,26 +945,86 @@ public class McdLoader {
                             setTitle.invoke(wmLp, "WestlakeMCD");
                         } catch (Throwable x) {}
 
-                        // Try SurfaceControl directly (bypass ViewRootImpl)
+                        // Create a real Surface via SurfaceControl and draw to it!
                         try {
                             Class<?> scClass = Class.forName("android.view.SurfaceControl");
+                            // Use SurfaceControl.Builder to create a surface
                             Class<?> builderClass = Class.forName("android.view.SurfaceControl$Builder");
-                            // Create SurfaceControl.Builder
-                            Object builder = nativeAllocInstance(builderClass);
-                            log("[DEBUG] SurfaceControl.Builder created");
-                            // Try to create a Transaction
-                            Class<?> txClass = Class.forName("android.view.SurfaceControl$Transaction");
-                            Constructor<?> txCtor = txClass.getDeclaredConstructor();
-                            txCtor.setAccessible(true);
-                            Object tx = txCtor.newInstance();
-                            log("[OK] SurfaceControl.Transaction created!");
-                            // Transaction.close (cleanup)
+                            // SurfaceSession for communication with SurfaceFlinger
+                            Class<?> ssClass = Class.forName("android.view.SurfaceSession");
+                            Object session = ssClass.getDeclaredConstructor().newInstance();
+                            log("[OK] SurfaceSession created (SurfaceFlinger connection)");
+
+                            // Build a SurfaceControl
+                            // Create SurfaceControl via nativeCreate directly
+                            Object surfaceControl = nativeAllocInstance(scClass);
+                            // Call SurfaceControl.nativeCreate
+                            Method nc = scClass.getDeclaredMethod("nativeCreate",
+                                ssClass, String.class, int.class, int.class, int.class, int.class,
+                                long.class, Class.forName("android.os.Parcel"));
+                            nc.setAccessible(true);
+                            long scPtr = (Long)nc.invoke(null, session, "WestlakeMCD",
+                                500, 300, 1 /*RGBA_8888*/, 0x00000004 /*HIDDEN*/, 0L, null);
+                            log("[OK] SurfaceControl nativeCreate ptr=" + scPtr);
+                            // Set native pointer on SurfaceControl
                             try {
-                                Method close = txClass.getDeclaredMethod("close");
-                                close.setAccessible(true);
-                                close.invoke(tx);
-                                log("[OK] Transaction.close() called");
+                                Field npF = scClass.getDeclaredField("mNativeObject");
+                                npF.setAccessible(true);
+                                npF.setLong(surfaceControl, scPtr);
                             } catch (Throwable x) {}
+                            try {
+                                Field nameF = scClass.getDeclaredField("mName");
+                                nameF.setAccessible(true);
+                                nameF.set(surfaceControl, "WestlakeMCD");
+                            } catch (Throwable x) {}
+
+                            // Create a Surface from the SurfaceControl
+                            Class<?> surfClass = Class.forName("android.view.Surface");
+                            Constructor<?> surfCtor = surfClass.getDeclaredConstructor(scClass);
+                            surfCtor.setAccessible(true);
+                            Object surface = surfCtor.newInstance(surfaceControl);
+                            log("[OK] Surface CREATED from SurfaceControl!");
+
+                            // Get a Canvas and draw!
+                            try {
+                                Method lockCanvas = surfClass.getDeclaredMethod("lockCanvas", Class.forName("android.graphics.Rect"));
+                                lockCanvas.setAccessible(true);
+                                Object canvas = lockCanvas.invoke(surface, (Object)null);
+                                if (canvas != null) {
+                                    log("[OK] Canvas LOCKED — drawing!");
+                                    // Draw red background
+                                    Class<?> canvasClass = Class.forName("android.graphics.Canvas");
+                                    Method drawColor = canvasClass.getDeclaredMethod("drawColor", int.class);
+                                    drawColor.invoke(canvas, 0xFFDA291C); // MCD Red
+                                    log("[OK] drawColor(MCD_RED) called!");
+                                    // Unlock and post
+                                    Method unlockAndPost = surfClass.getDeclaredMethod("unlockCanvasAndPost", canvasClass);
+                                    unlockAndPost.invoke(surface, canvas);
+                                    log("[OK] unlockCanvasAndPost — FRAME SUBMITTED TO SURFACEFLINGER!");
+                                    // Make visible via Transaction
+                                    Class<?> txClass = Class.forName("android.view.SurfaceControl$Transaction");
+                                    Object tx = txClass.getDeclaredConstructor().newInstance();
+                                    Method show = txClass.getDeclaredMethod("show", scClass);
+                                    show.setAccessible(true);
+                                    show.invoke(tx, surfaceControl);
+                                    Method setLayer = txClass.getDeclaredMethod("setLayer", scClass, int.class);
+                                    setLayer.setAccessible(true);
+                                    setLayer.invoke(tx, surfaceControl, 999999);
+                                    Method setPos = txClass.getDeclaredMethod("setPosition", scClass, float.class, float.class);
+                                    setPos.setAccessible(true);
+                                    setPos.invoke(tx, surfaceControl, 100f, 100f);
+                                    Method apply = txClass.getDeclaredMethod("apply");
+                                    apply.setAccessible(true);
+                                    apply.invoke(tx);
+                                    log("[OK] Transaction.apply() — SURFACE VISIBLE ON SCREEN!");
+                                    // Keep alive for 10 seconds so user can see it
+                                    log("[INFO] MCD RED RECTANGLE SHOULD BE VISIBLE ON PHONE SCREEN!");
+                                    Thread.sleep(10000);
+                                }
+                            } catch (Throwable x) {
+                                log("[WARN] Canvas: " + x.getClass().getSimpleName());
+                                try { nativePrintException(x); } catch (Throwable x2) {}
+                            }
                         } catch (Throwable t2) {
                             log("[WARN] SurfaceControl: " + t2.getClass().getSimpleName());
                             try { nativePrintException(t2); } catch (Throwable t3) {}
