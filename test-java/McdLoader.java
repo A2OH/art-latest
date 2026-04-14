@@ -945,6 +945,26 @@ public class McdLoader {
                             setTitle.invoke(wmLp, "WestlakeMCD");
                         } catch (Throwable x) {}
 
+                        // Create a visible overlay via VirtualDisplay + SurfaceControl
+                        // First try: create SurfaceControl as child of display root
+                        try {
+                            Class<?> scClass2 = Class.forName("android.view.SurfaceControl");
+                            // Create a virtual display that mirrors to the real display
+                            Class<?> dmClass2 = Class.forName("android.hardware.display.DisplayManager");
+                            // Get DisplayManager from Context
+                            Method getSvc = splash.getClass().getMethod("getSystemService", String.class);
+                            Object dispMgr = getSvc.invoke(splash, "display");
+                            if (dispMgr != null) {
+                                // createVirtualDisplay(name, width, height, densityDpi, surface, flags)
+                                Method createVD = dmClass2.getDeclaredMethod("createVirtualDisplay",
+                                    String.class, int.class, int.class, int.class,
+                                    Class.forName("android.view.Surface"), int.class);
+                                createVD.setAccessible(true);
+                                // Create a Surface first, then give it to the virtual display
+                                log("[INFO] Trying VirtualDisplay...");
+                            }
+                        } catch (Throwable x) {}
+
                         // Create a real Surface via SurfaceControl and draw to it!
                         try {
                             Class<?> scClass = Class.forName("android.view.SurfaceControl");
@@ -963,8 +983,31 @@ public class McdLoader {
                                 ssClass, String.class, int.class, int.class, int.class, int.class,
                                 long.class, Class.forName("android.os.Parcel"));
                             nc.setAccessible(true);
+                            // Get the default display token for parenting
+                            long displayToken = 0;
+                            try {
+                                Method getDisplay = scClass.getDeclaredMethod("getInternalDisplayToken");
+                                getDisplay.setAccessible(true);
+                                Object token = getDisplay.invoke(null);
+                                if (token != null) {
+                                    // IBinder token → native handle
+                                    displayToken = 0; // Can't easily convert IBinder to native handle
+                                }
+                            } catch (Throwable x) {}
+                            // Create a DISPLAY via SurfaceControl.createDisplay — this gives us
+                            // a display-level surface that SurfaceFlinger WILL composite
+                            Object westlakeDisplayToken = null;
+                            try {
+                                Method createDisp = scClass.getDeclaredMethod("createDisplay", String.class, boolean.class);
+                                createDisp.setAccessible(true);
+                                westlakeDisplayToken = createDisp.invoke(null, "WestlakeMCD", false);
+                                log("[OK] SurfaceControl.createDisplay('WestlakeMCD') → " + (westlakeDisplayToken != null ? "token" : "null"));
+                            } catch (Throwable x) {
+                                log("[WARN] createDisplay: " + x.getClass().getSimpleName());
+                            }
+                            // Create surface
                             long scPtr = (Long)nc.invoke(null, session, "WestlakeMCD",
-                                500, 300, 1 /*RGBA_8888*/, 0x00000004 /*HIDDEN*/, 0L, null);
+                                500, 300, 1 /*RGBA_8888*/, 0, 0L, null);
                             log("[OK] SurfaceControl nativeCreate ptr=" + scPtr);
                             // Set native pointer on SurfaceControl
                             try {
@@ -1032,22 +1075,65 @@ public class McdLoader {
                                     Method unlockAndPost = surfClass.getDeclaredMethod("unlockCanvasAndPost", canvasClass);
                                     unlockAndPost.invoke(surface, canvas);
                                     log("[OK] unlockCanvasAndPost — FRAME SUBMITTED TO SURFACEFLINGER!");
-                                    // Make visible via Transaction
+                                    // Make visible via Transaction — must reparent to default display
                                     Class<?> txClass = Class.forName("android.view.SurfaceControl$Transaction");
                                     Object tx = txClass.getDeclaredConstructor().newInstance();
+
+                                    // Reparent to default display root layer
+                                    try {
+                                        // Use our created display token
+                                        Object dispTok = westlakeDisplayToken;
+                                        log("[DEBUG] Display token: " + (dispTok != null ? "got" : "null"));
+
+                                        if (dispTok != null) {
+                                            Method setDisplay = txClass.getDeclaredMethod("setDisplaySurface",
+                                                Class.forName("android.os.IBinder"), surfClass);
+                                            setDisplay.setAccessible(true);
+                                            setDisplay.invoke(tx, dispTok, surface);
+                                            // Set display size
+                                            try {
+                                                Method setSize = txClass.getDeclaredMethod("setDisplaySize",
+                                                    Class.forName("android.os.IBinder"), int.class, int.class);
+                                                setSize.setAccessible(true);
+                                                setSize.invoke(tx, dispTok, 500, 300);
+                                            } catch (Throwable x2) {}
+                                            // Set display layer stack to 0 (default display)
+                                            try {
+                                                Method setLS = txClass.getDeclaredMethod("setDisplayLayerStack",
+                                                    Class.forName("android.os.IBinder"), int.class);
+                                                setLS.setAccessible(true);
+                                                setLS.invoke(tx, dispTok, 0);
+                                            } catch (Throwable x2) {}
+                                            // Set display projection
+                                            try {
+                                                Class<?> rectClass = Class.forName("android.graphics.Rect");
+                                                Object srcRect = rectClass.getConstructor(int.class,int.class,int.class,int.class).newInstance(0,0,500,300);
+                                                Object dstRect = rectClass.getConstructor(int.class,int.class,int.class,int.class).newInstance(100,200,600,500);
+                                                Method setProj = txClass.getDeclaredMethod("setDisplayProjection",
+                                                    Class.forName("android.os.IBinder"), int.class, rectClass, rectClass);
+                                                setProj.setAccessible(true);
+                                                setProj.invoke(tx, dispTok, 0, srcRect, dstRect);
+                                            } catch (Throwable x2) {}
+                                            log("[OK] setDisplaySurface called!");
+                                        }
+                                    } catch (Throwable x) {
+                                        // Try creating a virtual display instead
+                                        log("[INFO] setDisplaySurface failed, using show+setLayer");
+                                    }
+
                                     Method show = txClass.getDeclaredMethod("show", scClass);
                                     show.setAccessible(true);
                                     show.invoke(tx, surfaceControl);
                                     Method setLayer = txClass.getDeclaredMethod("setLayer", scClass, int.class);
                                     setLayer.setAccessible(true);
-                                    setLayer.invoke(tx, surfaceControl, 999999);
+                                    setLayer.invoke(tx, surfaceControl, 0x7FFFFFFF); // MAX_INT layer
                                     Method setPos = txClass.getDeclaredMethod("setPosition", scClass, float.class, float.class);
                                     setPos.setAccessible(true);
-                                    setPos.invoke(tx, surfaceControl, 100f, 100f);
+                                    setPos.invoke(tx, surfaceControl, 100f, 200f);
                                     Method apply = txClass.getDeclaredMethod("apply");
                                     apply.setAccessible(true);
                                     apply.invoke(tx);
-                                    log("[OK] Transaction.apply() — SURFACE VISIBLE ON SCREEN!");
+                                    log("[OK] Transaction.apply()!");
                                     // Keep alive for 10 seconds so user can see it
                                     log("[INFO] MCD RED RECTANGLE SHOULD BE VISIBLE ON PHONE SCREEN!");
                                     Thread.sleep(10000);
