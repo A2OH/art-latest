@@ -2601,6 +2601,37 @@ static int InvokeMain(JNIEnv* env, char** argv) {
     }
   }
 
+  // Patch MCD analytics methods to no-ops (they cause NPE from null config strings)
+  // PerfAnalyticsInteractor.h() and PerfAnalyticsInteractor.u() are performance tracking —
+  // not needed for UI rendering. Patching them lets onCreate reach super.onCreate().
+  {
+    jclass perfCls = env->FindClass("com/mcdonalds/mcdcoreapp/performanalytics/PerfAnalyticsInteractor");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (perfCls) {
+      art::ScopedObjectAccess soa(art::Thread::Current());
+      art::ObjPtr<art::mirror::Class> cls = soa.Decode<art::mirror::Class>(perfCls);
+      if (cls != nullptr) {
+        int patched = 0;
+        for (art::ArtMethod& m : cls->GetDeclaredMethods(art::kRuntimePointerSize)) {
+          const char* name = m.GetName();
+          // Patch all non-static void methods to no-op (analytics tracking)
+          if (!m.IsNative() && !m.IsStatic() && !m.IsConstructor()) {
+            std::string sig = m.GetSignature().ToString();
+            if (sig.find(")V") != std::string::npos) {
+              // void method — make it return immediately via native no-op
+              m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+              m.SetEntryPointFromJni(
+                  reinterpret_cast<void*>(Java_java_lang_Throwable_printStackTrace_noop));
+              patched++;
+            }
+          }
+        }
+        fprintf(stderr, "[dalvikvm] Patched %d PerfAnalyticsInteractor void methods → no-op\n", patched);
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
+
   // FINAL FIXUP: re-set ConcurrentHashMap.U right before main()
   // Earlier setting might have been overwritten by class loading/init during pre-init phase.
   {

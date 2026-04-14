@@ -435,12 +435,21 @@ static void ThrowNullPointerExceptionForMethodAccessImpl(uint32_t method_idx,
   std::ostringstream msg;
   msg << "Attempt to invoke " << type << " method '"
       << dex_file.PrettyMethod(method_idx, true) << "' on a null object reference";
-  // PATCH: Log caller for NPE debugging
-  ArtMethod* caller = Thread::Current()->GetCurrentMethod(nullptr);
-  if (caller != nullptr) {
-    fprintf(stderr, "[NPE] %s → called from %s\n",
-            dex_file.PrettyMethod(method_idx, true).c_str(),
-            caller->PrettyMethod().c_str());
+  // PATCH: Log caller + stack for NPE debugging
+  {
+    Thread* self = Thread::Current();
+    // Walk shadow frames to get the actual caller chain
+    fprintf(stderr, "[NPE] %s\n", dex_file.PrettyMethod(method_idx, true).c_str());
+    int depth = 0;
+    for (auto* frame = self->GetManagedStack()->GetTopShadowFrame();
+         frame != nullptr && depth < 8;
+         frame = frame->GetLink(), depth++) {
+      ArtMethod* m = frame->GetMethod();
+      if (m != nullptr) {
+        fprintf(stderr, "[NPE]   #%d %s (dex_pc=%u)\n", depth, m->PrettyMethod().c_str(),
+                frame->GetDexPC());
+      }
+    }
     fflush(stderr);
   }
   ThrowException("Ljava/lang/NullPointerException;", nullptr, msg.str().c_str());
