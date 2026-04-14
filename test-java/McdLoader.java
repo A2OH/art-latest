@@ -79,10 +79,10 @@ public class McdLoader {
 
             // Set mPackageName on ContextImpl
             try {
-                Field pkgField = ctxImpl.getDeclaredField("mPackageName");
+                Field pkgField = ctxImpl.getDeclaredField("mBasePackageName");
                 pkgField.setAccessible(true);
                 pkgField.set(mockContext, "com.mcdonalds.app");
-                log("[OK] mPackageName = com.mcdonalds.app");
+                log("[OK] mBasePackageName = com.mcdonalds.app");
             } catch (Throwable t) {
                 log("[WARN] mPackageName: " + t.getClass().getName());
             }

@@ -344,6 +344,39 @@ static int InvokeMain(JNIEnv* env, char** argv) {
   }
   fprintf(stderr, "[dalvikvm] Class found: %p\n", klass.get());
 
+  // Register McdLoader helper natives (nativeAllocInstance, nativeLog)
+  {
+    static auto allocInstance = +[](JNIEnv* e, jclass, jclass target) -> jobject {
+      jobject obj = e->AllocObject(target);
+      if (e->ExceptionCheck()) {
+        // Log and clear — caller will catch
+        jthrowable ex = e->ExceptionOccurred();
+        e->ExceptionClear();
+        jclass exCls = e->GetObjectClass(ex);
+        jmethodID getName = e->GetMethodID(e->FindClass("java/lang/Class"), "getName", "()Ljava/lang/String;");
+        jstring name = (jstring)e->CallObjectMethod(exCls, getName);
+        const char* nameStr = e->GetStringUTFChars(name, nullptr);
+        fprintf(stderr, "[nativeAllocInstance] AllocObject failed: %s\n", nameStr);
+        e->ReleaseStringUTFChars(name, nameStr);
+        e->Throw(ex); // re-throw for Java catch
+      }
+      return obj;
+    };
+    static auto nativeLog = +[](JNIEnv* e, jclass, jstring msg) {
+      if (!msg) return;
+      const char* s = e->GetStringUTFChars(msg, nullptr);
+      if (s) { write(STDERR_FILENO, s, strlen(s)); write(STDERR_FILENO, "\n", 1); e->ReleaseStringUTFChars(msg, s); }
+    };
+    JNINativeMethod methods[] = {
+      {"nativeAllocInstance", "(Ljava/lang/Class;)Ljava/lang/Object;", (void*)+allocInstance},
+      {"nativeLog", "(Ljava/lang/String;)V", (void*)+nativeLog},
+    };
+    int rc = env->RegisterNatives(klass.get(), methods, 2);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    fprintf(stderr, "[dalvikvm] RegisterNatives for %s: %s\n", class_name.c_str(),
+            rc == 0 ? "OK" : "FAILED");
+  }
+
   jmethodID method = env->GetStaticMethodID(klass.get(), "main", "([Ljava/lang/String;)V");
   if (method == nullptr) {
     fprintf(stderr, "Unable to find static main(String[]) in '%s'\n", class_name.c_str());
@@ -1384,53 +1417,58 @@ static int InvokeMain(JNIEnv* env, char** argv) {
             patchToNativeBySig("Lsun/util/locale/LocaleUtils;", "toUpperString",
                 "(Ljava/lang/String;)Ljava/lang/String;", (void*)+toLowerStub);
 
-            // Re-run clinits that failed before our stubs were applied
+            // Re-run clinits — PHASE 1: Unsafe + ConcurrentHashMap
+            // Must fix ConcurrentHashMap.U BEFORE re-initing Locale (which triggers LocaleList)
             {
-              const char* reinitClasses[] = {
+              const char* phase1[] = {
                 "Ljdk/internal/misc/Unsafe;",
-                "Lsun/util/locale/BaseLocale;",
-                "Lsun/util/locale/BaseLocale$Cache;",
-                "Ljava/util/Locale;",
-                "Landroid/os/LocaleList;",
-                "Landroid/content/res/Configuration;",
+                "Ljava/util/concurrent/ConcurrentHashMap;",
                 nullptr
               };
-              for (int i = 0; reinitClasses[i]; i++) {
+              for (int i = 0; phase1[i]; i++) {
                 art::StackHandleScope<1> rhs(soa.Self());
                 art::Handle<art::mirror::Class> rc = rhs.NewHandle(
                     art::Runtime::Current()->GetClassLinker()->FindSystemClass(
-                        soa.Self(), reinitClasses[i]));
+                        soa.Self(), phase1[i]));
                 if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
                 if (rc != nullptr && rc->IsInitialized()) {
-                  // Reset to "verified" status so clinit re-runs
                   rc->SetStatusForPrimitiveOrArray(art::ClassStatus::kVerified);
-                  // Now re-init
                   bool ok = art::Runtime::Current()->GetClassLinker()->EnsureInitialized(
                       soa.Self(), rc, true, true);
                   if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
-                  fprintf(stderr, "[dalvikvm] Re-init %s: %s\n", reinitClasses[i],
-                          ok ? "OK" : "FAILED");
+                  fprintf(stderr, "[dalvikvm] Re-init %s: %s\n", phase1[i],
+                          ok ? "OK" : "FAILED (tolerated)");
                 }
               }
             }
 
-            // Fix ConcurrentHashMap.U + field offsets
+            // Fix ConcurrentHashMap.U + field offsets BEFORE Locale re-init
             {
               jclass chmCls = env->FindClass("java/util/concurrent/ConcurrentHashMap");
               if (env->ExceptionCheck()) env->ExceptionClear();
               jclass unsafeCls = env->FindClass("jdk/internal/misc/Unsafe");
               if (env->ExceptionCheck()) env->ExceptionClear();
               if (chmCls && unsafeCls) {
-                // Set U = Unsafe.theUnsafe
                 jfieldID uField = env->GetStaticFieldID(chmCls, "U", "Ljdk/internal/misc/Unsafe;");
                 if (env->ExceptionCheck()) env->ExceptionClear();
                 jfieldID theUnsafeF = env->GetStaticFieldID(unsafeCls, "theUnsafe", "Ljdk/internal/misc/Unsafe;");
                 if (env->ExceptionCheck()) env->ExceptionClear();
                 jobject u = (theUnsafeF) ? env->GetStaticObjectField(unsafeCls, theUnsafeF) : nullptr;
-                if (uField && u) env->SetStaticObjectField(chmCls, uField, u);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                if (!u) {
+                  u = env->AllocObject(unsafeCls);
+                  if (env->ExceptionCheck()) env->ExceptionClear();
+                  if (u && theUnsafeF) {
+                    env->SetStaticObjectField(unsafeCls, theUnsafeF, u);
+                    fprintf(stderr, "[dalvikvm] Created Unsafe.theUnsafe via AllocObject\n");
+                  }
+                }
+                if (uField && u) {
+                  env->SetStaticObjectField(chmCls, uField, u);
+                  fprintf(stderr, "[dalvikvm] Set ConcurrentHashMap.U (early, before Locale re-init)\n");
+                }
                 if (env->ExceptionCheck()) env->ExceptionClear();
 
-                // Set field offsets using Unsafe.objectFieldOffset
                 if (u) {
                   jmethodID ofo = env->GetMethodID(unsafeCls, "objectFieldOffset",
                       "(Ljava/lang/Class;Ljava/lang/String;)J");
@@ -1449,7 +1487,6 @@ static int InvokeMain(JNIEnv* env, char** argv) {
                     setOffset("baseCount", "BASECOUNT");
                     setOffset("cellsBusy", "CELLSBUSY");
 
-                    // Also set ABASE and ASHIFT for Node[] array access
                     jmethodID aboM = env->GetMethodID(unsafeCls, "arrayBaseOffset",
                         "(Ljava/lang/Class;)I");
                     jmethodID aisM = env->GetMethodID(unsafeCls, "arrayIndexScale",
@@ -1475,11 +1512,111 @@ static int InvokeMain(JNIEnv* env, char** argv) {
                         if (ashiftF) env->SetStaticIntField(chmCls, ashiftF, ashift);
                       }
                     }
-                    fprintf(stderr, "[dalvikvm] Set ConcurrentHashMap.U + field offsets\n");
+                    fprintf(stderr, "[dalvikvm] Set ConcurrentHashMap field offsets (early)\n");
                   }
                 }
               }
               if (env->ExceptionCheck()) env->ExceptionClear();
+            }
+
+            // Re-run clinits — PHASE 2: Locale helpers + Configuration
+            // SKIP Locale itself — our JNI_OnLoad_framework pre-sets ROOT/US/ENGLISH,
+            // and re-init via SetStatusForPrimitiveOrArray leaves internal state inconsistent
+            // (causes FATAL "Unexpected change back of class status" later).
+            {
+              const char* phase2[] = {
+                "Lsun/util/locale/LocaleObjectCache;",
+                "Lsun/util/locale/BaseLocale;",
+                "Lsun/util/locale/BaseLocale$Cache;",
+                // "Ljava/util/Locale;",  — DO NOT re-init (causes FATAL later)
+                "Landroid/content/res/Configuration;",
+                nullptr
+              };
+              for (int i = 0; phase2[i]; i++) {
+                art::StackHandleScope<1> rhs(soa.Self());
+                art::Handle<art::mirror::Class> rc = rhs.NewHandle(
+                    art::Runtime::Current()->GetClassLinker()->FindSystemClass(
+                        soa.Self(), phase2[i]));
+                if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
+                if (rc != nullptr && rc->IsInitialized()) {
+                  rc->SetStatusForPrimitiveOrArray(art::ClassStatus::kVerified);
+                  bool ok = art::Runtime::Current()->GetClassLinker()->EnsureInitialized(
+                      soa.Self(), rc, true, true);
+                  if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
+                  fprintf(stderr, "[dalvikvm] Re-init %s: %s\n", phase2[i],
+                          ok ? "OK" : "FAILED (tolerated)");
+                }
+              }
+            }
+
+            // Pre-set LocaleList static fields to bypass broken clinit
+            {
+              jclass llCls = env->FindClass("android/os/LocaleList");
+              if (env->ExceptionCheck()) env->ExceptionClear();
+              if (llCls) {
+                // Create empty LocaleList via AllocObject
+                jobject emptyLL = env->AllocObject(llCls);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                // Create US LocaleList
+                jobject usLL = env->AllocObject(llCls);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                if (emptyLL && usLL) {
+                  jfieldID emptyF = env->GetStaticFieldID(llCls, "sEmptyLocaleList", "Landroid/os/LocaleList;");
+                  if (env->ExceptionCheck()) env->ExceptionClear();
+                  if (emptyF) env->SetStaticObjectField(llCls, emptyF, emptyLL);
+
+                  jfieldID defF = env->GetStaticFieldID(llCls, "sDefaultLocaleList", "Landroid/os/LocaleList;");
+                  if (env->ExceptionCheck()) env->ExceptionClear();
+                  if (defF) env->SetStaticObjectField(llCls, defF, usLL);
+
+                  jfieldID adjF = env->GetStaticFieldID(llCls, "sDefaultAdjustedLocaleList", "Landroid/os/LocaleList;");
+                  if (env->ExceptionCheck()) env->ExceptionClear();
+                  if (adjF) env->SetStaticObjectField(llCls, adjF, usLL);
+
+                  jfieldID lastF = env->GetStaticFieldID(llCls, "sLastExplicitlySetLocaleList", "Landroid/os/LocaleList;");
+                  if (env->ExceptionCheck()) env->ExceptionClear();
+                  if (lastF) env->SetStaticObjectField(llCls, lastF, usLL);
+
+                  // Set mList arrays so instances are usable
+                  jfieldID mListF = env->GetFieldID(llCls, "mList", "[Ljava/util/Locale;");
+                  if (env->ExceptionCheck()) env->ExceptionClear();
+                  if (mListF) {
+                    jclass localeCls = env->FindClass("java/util/Locale");
+                    if (env->ExceptionCheck()) env->ExceptionClear();
+                    if (localeCls) {
+                      // Empty array for sEmptyLocaleList
+                      jobjectArray emptyArr = env->NewObjectArray(0, localeCls, nullptr);
+                      if (env->ExceptionCheck()) env->ExceptionClear();
+                      if (emptyArr) env->SetObjectField(emptyLL, mListF, emptyArr);
+
+                      // [Locale.US] array for default lists
+                      jfieldID usLocF = env->GetStaticFieldID(localeCls, "US", "Ljava/util/Locale;");
+                      if (env->ExceptionCheck()) env->ExceptionClear();
+                      jobject locUS = usLocF ? env->GetStaticObjectField(localeCls, usLocF) : nullptr;
+                      if (env->ExceptionCheck()) env->ExceptionClear();
+                      if (locUS) {
+                        jobjectArray usArr = env->NewObjectArray(1, localeCls, locUS);
+                        if (env->ExceptionCheck()) env->ExceptionClear();
+                        if (usArr) env->SetObjectField(usLL, mListF, usArr);
+                      }
+                    }
+                  }
+                  fprintf(stderr, "[dalvikvm] Pre-set LocaleList static fields + mList\n");
+                }
+              }
+              if (env->ExceptionCheck()) env->ExceptionClear();
+
+              // Mark LocaleList as initialized so its broken clinit never runs
+              {
+                art::ObjPtr<art::mirror::Class> llMirror =
+                    art::Runtime::Current()->GetClassLinker()->FindSystemClass(
+                        soa.Self(), "Landroid/os/LocaleList;");
+                if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
+                if (llMirror != nullptr) {
+                  llMirror->SetStatusForPrimitiveOrArray(art::ClassStatus::kInitialized);
+                  fprintf(stderr, "[dalvikvm] Force-marked LocaleList as kInitialized\n");
+                }
+              }
             }
 
             // Replace TextUtils.formatSimple with String.format delegation.
