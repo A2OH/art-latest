@@ -2692,6 +2692,29 @@ static int InvokeMain(JNIEnv* env, char** argv) {
     if (env->ExceptionCheck()) env->ExceptionClear();
   }
 
+  // Fix StrictMode.sVmPolicy (null causes NPE in View constructors)
+  {
+    jclass smCls = env->FindClass("android/os/StrictMode");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (smCls) {
+      jclass vpCls = env->FindClass("android/os/StrictMode$VmPolicy");
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      if (vpCls) {
+        jfieldID vpF = env->GetStaticFieldID(smCls, "sVmPolicy", "Landroid/os/StrictMode$VmPolicy;");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (vpF && !env->GetStaticObjectField(smCls, vpF)) {
+          jobject vp = env->AllocObject(vpCls);
+          if (env->ExceptionCheck()) env->ExceptionClear();
+          if (vp) {
+            env->SetStaticObjectField(smCls, vpF, vp);
+            fprintf(stderr, "[dalvikvm] Set StrictMode.sVmPolicy\n");
+          }
+        }
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
+
   // Stub Trace methods (tracing not available in standalone mode)
   {
     jclass traceCls = env->FindClass("android/os/Trace");

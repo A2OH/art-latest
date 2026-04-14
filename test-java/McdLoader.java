@@ -617,7 +617,7 @@ public class McdLoader {
         log("[6] Calling SplashActivity.onCreate(null)...");
         log("    (all bytecode runs through Westlake interpreter)");
         try {
-            Method onCreate = splashClass.getDeclaredMethod("onCreate", Class.forName("android.os.Bundle"));
+            Method onCreate = splashClass.getDeclaredMethod("onCreate", Class.forName("android.os.Bundle", false, cl));
             onCreate.setAccessible(true);
             onCreate.invoke(splash, (Object) null);
             log("[OK] onCreate returned!");
@@ -633,7 +633,7 @@ public class McdLoader {
         log("[7] Trying AppCompatActivity.onCreate...");
         try {
             Class<?> appCompatCls = Class.forName("androidx.appcompat.app.AppCompatActivity");
-            Method acOnCreate = appCompatCls.getDeclaredMethod("onCreate", Class.forName("android.os.Bundle"));
+            Method acOnCreate = appCompatCls.getDeclaredMethod("onCreate", Class.forName("android.os.Bundle", false, cl));
             acOnCreate.setAccessible(true);
             acOnCreate.invoke(splash, (Object) null);
             log("[OK] AppCompatActivity.onCreate returned!");
@@ -641,14 +641,44 @@ public class McdLoader {
             try { nativePrintException(t); } catch (Throwable t2) {}
         }
 
-        // Step 8: Try calling Activity.onCreate directly (skip performCreate scaffolding)
-        log("[8] Trying Activity.onCreate(null) directly...");
+        // Step 8: Set mCalled=true (what Activity.onCreate does) and try setContentView
+        // Cannot call any onCreate via reflection — virtual dispatch causes infinite recursion
+        // (Method.invoke always dispatches to SplashActivity.onCreate, not Activity.onCreate)
+        log("[8] Setting mCalled=true + trying setContentView...");
         try {
             Class<?> actCls = Class.forName("android.app.Activity");
-            Method actOnCreate = actCls.getDeclaredMethod("onCreate", Class.forName("android.os.Bundle"));
-            actOnCreate.setAccessible(true);
-            actOnCreate.invoke(splash, (Object) null);
-            log("[OK] Activity.onCreate returned!");
+            Field calledF = actCls.getDeclaredField("mCalled");
+            calledF.setAccessible(true);
+            calledF.set(splash, true);
+            log("[OK] mCalled = true (Activity lifecycle marker)");
+
+            // Try to load MCD's main layout via setContentView
+            // SplashActivity likely calls setContentView(R.layout.activity_splash)
+            // We can find the layout ID from the MCD resources
+            try {
+                // Try a simple View creation to test rendering pipeline
+                Class<?> tvClass = Class.forName("android.widget.TextView");
+                Object tv = tvClass.getConstructor(Class.forName("android.content.Context")).newInstance(splash);
+                log("[OK] TextView created via constructor!");
+
+                // Try setText
+                try {
+                    Method setText = tvClass.getMethod("setText", CharSequence.class);
+                    setText.invoke(tv, "Westlake MCD Running!");
+                    log("[OK] TextView.setText('Westlake MCD Running!')");
+                } catch (Throwable t2) {}
+
+                // Try setContentView with the TextView
+                try {
+                    Method scv = actCls.getMethod("setContentView", Class.forName("android.view.View"));
+                    scv.invoke(splash, tv);
+                    log("[OK] Activity.setContentView(TextView) called!");
+                } catch (Throwable t2) {
+                    try { nativePrintException(t2); } catch (Throwable t3) {}
+                }
+            } catch (Throwable t) {
+                try { nativePrintException(t); } catch (Throwable t2) {}
+            }
         } catch (Throwable t) {
             try { nativePrintException(t); } catch (Throwable t2) {}
         }
