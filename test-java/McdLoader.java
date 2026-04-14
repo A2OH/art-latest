@@ -562,6 +562,42 @@ public class McdLoader {
                 } catch (Throwable t2) { log("[WARN] mResources: " + t2.getClass().getName()); }
             } catch (Throwable t) { log("[WARN] theme: " + t.getClass().getName()); }
 
+            // Create AppCompatDelegate (needed for AppCompatActivity lifecycle)
+            try {
+                Class<?> acdClass = Class.forName("androidx.appcompat.app.AppCompatDelegateImpl");
+                Object delegate = nativeAllocInstance(acdClass);
+                // Set mHost on delegate (the Activity)
+                try {
+                    for (Class<?> c = acdClass; c != null; c = c.getSuperclass()) {
+                        try {
+                            Field hf = c.getDeclaredField("mHost");
+                            hf.setAccessible(true);
+                            hf.set(delegate, splash);
+                            break;
+                        } catch (Throwable x) {}
+                    }
+                } catch (Throwable x) {}
+                // Set the delegate on the Activity
+                try {
+                    Class<?> acaCls = Class.forName("androidx.appcompat.app.AppCompatActivity");
+                    Field dF = acaCls.getDeclaredField("mDelegate");
+                    dF.setAccessible(true);
+                    dF.set(splash, delegate);
+                    log("[OK] AppCompatDelegate set");
+                } catch (Throwable x) {
+                    // Try superclass
+                    for (Class<?> c = splash.getClass(); c != null; c = c.getSuperclass()) {
+                        try {
+                            Field dF = c.getDeclaredField("mDelegate");
+                            dF.setAccessible(true);
+                            dF.set(splash, delegate);
+                            log("[OK] AppCompatDelegate set (on " + c.getSimpleName() + ")");
+                            break;
+                        } catch (Throwable x2) {}
+                    }
+                }
+            } catch (Throwable t) { log("[WARN] AppCompatDelegate: " + t.getClass().getName()); }
+
             // mToken — needed for window operations
             try {
                 Class<?> binderClass = Class.forName("android.os.Binder");
@@ -605,23 +641,14 @@ public class McdLoader {
             try { nativePrintException(t); } catch (Throwable t2) {}
         }
 
-        // Step 8: Try calling Activity.performCreate directly
-        log("[8] Trying Activity.performCreate...");
+        // Step 8: Try calling Activity.onCreate directly (skip performCreate scaffolding)
+        log("[8] Trying Activity.onCreate(null) directly...");
         try {
             Class<?> actCls = Class.forName("android.app.Activity");
-            // performCreate(Bundle, PersistableBundle)
-            Method perfCreate = null;
-            for (Method m : actCls.getDeclaredMethods()) {
-                if (m.getName().equals("performCreate") && m.getParameterCount() == 1) {
-                    perfCreate = m;
-                    break;
-                }
-            }
-            if (perfCreate != null) {
-                perfCreate.setAccessible(true);
-                perfCreate.invoke(splash, (Object) null);
-                log("[OK] Activity.performCreate returned!");
-            }
+            Method actOnCreate = actCls.getDeclaredMethod("onCreate", Class.forName("android.os.Bundle"));
+            actOnCreate.setAccessible(true);
+            actOnCreate.invoke(splash, (Object) null);
+            log("[OK] Activity.onCreate returned!");
         } catch (Throwable t) {
             try { nativePrintException(t); } catch (Throwable t2) {}
         }

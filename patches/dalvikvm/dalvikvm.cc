@@ -70,6 +70,13 @@ Java_noop_return_false(JNIEnv*, jobject) {
   return JNI_FALSE;
 }
 
+// Static no-op that returns the second object argument (pass-through)
+// For Phrase.d(Activity, Delegate) → returns Delegate unchanged
+extern "C" JNIEXPORT jobject JNICALL
+Java_noop_return_arg2(JNIEnv*, jclass, jobject, jobject arg2) {
+  return arg2;
+}
+
 // String.lastIndexOf(int) native replacement — the interpreted version has a
 // register corruption bug where length() return clobbers the ch parameter.
 // Implementation: pure JNI, no callbacks into Java to avoid re-entrancy issues.
@@ -2708,6 +2715,61 @@ static int InvokeMain(JNIEnv* env, char** argv) {
     if (env->ExceptionCheck()) env->ExceptionClear();
   }
 
+  // Patch AppCompatActivity.onCreate to call Activity.onCreate directly (skip delegate)
+  {
+    jclass acaCls = env->FindClass("androidx/appcompat/app/AppCompatActivity");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    fprintf(stderr, "[dalvikvm] AppCompatActivity FindClass: %p\n", acaCls);
+    if (acaCls) {
+      art::ScopedObjectAccess soa(art::Thread::Current());
+      art::ObjPtr<art::mirror::Class> mirror = soa.Decode<art::mirror::Class>(acaCls);
+      if (mirror != nullptr) {
+        int count = 0;
+        for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
+          if (strcmp(m.GetName(), "onCreate") == 0) {
+            fprintf(stderr, "[dalvikvm]   found: %s sig=%s native=%d\n",
+                    m.GetName(), m.GetSignature().ToString().c_str(), m.IsNative());
+            if (m.GetSignature().ToString() == "(Landroid/os/Bundle;)V" && !m.IsNative()) {
+              m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+              m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_java_lang_Throwable_printStackTrace_noop));
+              fprintf(stderr, "[dalvikvm] Patched AppCompatActivity.onCreate → no-op\n");
+            }
+          }
+          count++;
+        }
+        fprintf(stderr, "[dalvikvm] AppCompatActivity: %d methods total\n", count);
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
+
+  // Patch AppCompatDelegateImpl void methods to prevent infinite recursion
+  // (setTheme → delegate.Q → setTheme → ...)
+  {
+    jclass adCls = env->FindClass("androidx/appcompat/app/AppCompatDelegateImpl");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (adCls) {
+      art::ScopedObjectAccess soa(art::Thread::Current());
+      art::ObjPtr<art::mirror::Class> mirror = soa.Decode<art::mirror::Class>(adCls);
+      if (mirror != nullptr) {
+        int patched = 0;
+        for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
+          if (m.IsNative() || m.IsAbstract() || m.IsConstructor()) continue;
+          std::string sig = m.GetSignature().ToString();
+          const char* name = m.GetName();
+          // Patch void methods that take int (like Q, setTheme)
+          if (sig == "(I)V" || (sig.find(")V") != std::string::npos && strlen(name) <= 2)) {
+            m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+            m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_java_lang_Throwable_printStackTrace_noop));
+            patched++;
+          }
+        }
+        fprintf(stderr, "[dalvikvm] Patched %d AppCompatDelegateImpl short void methods\n", patched);
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
+
   // Patch Activity methods that need Window/WindowController (our mock Window is incomplete)
   {
     jclass actCls = env->FindClass("android/app/Activity");
@@ -2725,6 +2787,8 @@ static int InvokeMain(JNIEnv* env, char** argv) {
           {"onApplyThemeResource",
            "(Landroid/content/res/Resources$Theme;IZ)V",
            (void*)Java_java_lang_Throwable_printStackTrace_noop},
+          // Skip setTheme to prevent AppCompat recursion
+          {"setTheme", "(I)V", (void*)Java_java_lang_Throwable_printStackTrace_noop},
           {nullptr, nullptr, nullptr}
         };
         for (int i = 0; patches[i].name; i++) {
@@ -2779,6 +2843,79 @@ static int InvokeMain(JNIEnv* env, char** argv) {
       }
     }
     fprintf(stderr, "[dalvikvm] Patched %d SplashScreen methods → no-op\n", totalPatched);
+  }
+
+  // Patch Phrase SDK (localization) to no-ops (Severity enum has null values)
+  {
+    const char* phraseClasses[] = {
+      "com/phrase/android/sdk/PhraseContextWrapper",
+      "com/phrase/android/sdk/PhraseLog",
+      "com/phrase/android/sdk/Severity",
+      nullptr
+    };
+    int totalPatched = 0;
+    for (int ci = 0; phraseClasses[ci]; ci++) {
+      jclass cls = env->FindClass(phraseClasses[ci]);
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      if (!cls) continue;
+      art::ScopedObjectAccess soa(art::Thread::Current());
+      art::ObjPtr<art::mirror::Class> mirror = soa.Decode<art::mirror::Class>(cls);
+      if (mirror == nullptr) continue;
+      for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
+        if (m.IsNative() || m.IsAbstract() || m.IsConstructor()) continue;
+        std::string sig = m.GetSignature().ToString();
+        if (sig.find(")V") != std::string::npos) {
+          m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+          m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_java_lang_Throwable_printStackTrace_noop));
+          totalPatched++;
+        } else if (sig.find(")L") != std::string::npos) {
+          m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+          m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_noop_return_null));
+          totalPatched++;
+        } else if (sig.find(")Z") != std::string::npos) {
+          m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+          m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_noop_return_false));
+          totalPatched++;
+        }
+      }
+    }
+    if (totalPatched > 0)
+      fprintf(stderr, "[dalvikvm] Patched %d Phrase SDK methods → no-op\n", totalPatched);
+    // Special: Phrase.d(Activity, Delegate) → return delegate (pass-through)
+    jclass phraseCls = env->FindClass("com/phrase/android/sdk/Phrase");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (phraseCls) {
+      art::ScopedObjectAccess soa(art::Thread::Current());
+      art::ObjPtr<art::mirror::Class> pm = soa.Decode<art::mirror::Class>(phraseCls);
+      if (pm != nullptr) {
+        for (art::ArtMethod& m : pm->GetDeclaredMethods(art::kRuntimePointerSize)) {
+          if (m.IsNative() || m.IsAbstract() || m.IsConstructor()) continue;
+          const char* name = m.GetName();
+          std::string sig = m.GetSignature().ToString();
+          if (sig.find(")V") != std::string::npos) {
+            m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+            m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_java_lang_Throwable_printStackTrace_noop));
+            totalPatched++;
+          } else if (sig.find("AppCompatDelegate") != std::string::npos &&
+                     sig.find(")L") != std::string::npos) {
+            // d(Activity, Delegate) → return delegate
+            m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative | art::kAccStatic);
+            m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_noop_return_arg2));
+            fprintf(stderr, "[dalvikvm] Patched Phrase.%s → pass-through delegate\n", name);
+            totalPatched++;
+          } else if (sig.find(")L") != std::string::npos) {
+            m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+            m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_noop_return_null));
+            totalPatched++;
+          } else if (sig.find(")Z") != std::string::npos) {
+            m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+            m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_noop_return_false));
+            totalPatched++;
+          }
+        }
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
   }
 
   // Patch MCD analytics methods to no-ops (they cause NPE from null config strings)
