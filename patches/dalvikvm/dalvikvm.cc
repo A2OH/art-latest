@@ -2858,8 +2858,32 @@ static int InvokeMain(JNIEnv* env, char** argv) {
     if (env->ExceptionCheck()) env->ExceptionClear();
   }
 
-  // @CriticalNative Parcel methods are now handled by the interpreter's
-  // CriticalNative dispatch (no manual entry point fix needed)
+  // Re-register Parcel natives in final fixup — entry points were cleared
+  // by VisitPackedArtMethods and @CriticalNative methods can't be resolved
+  // via FindCodeForNativeMethod (JNI name lookup doesn't work for them)
+  {
+    void* librt = dlopen("libandroid_runtime.so", RTLD_NOW);
+    if (librt) {
+      typedef int (*RegFn)(JNIEnv*);
+      RegFn regParcel = (RegFn)dlsym(librt, "_ZN7android26register_android_os_ParcelEP7_JNIEnv");
+      if (regParcel) {
+        env->PushLocalFrame(128);
+        regParcel(env);
+        env->PopLocalFrame(nullptr);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        fprintf(stderr, "[dalvikvm] FINAL: Re-registered Parcel natives\n");
+      }
+      // Also re-register Binder for good measure
+      RegFn regBinder = (RegFn)dlsym(librt, "_Z26register_android_os_BinderP7_JNIEnv");
+      if (regBinder) {
+        env->PushLocalFrame(128);
+        regBinder(env);
+        env->PopLocalFrame(nullptr);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
 
   // Patch LoadedApk.updateApplicationInfo → no-op (avoids null context chain NPEs)
   {
