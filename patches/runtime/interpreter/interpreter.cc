@@ -77,8 +77,63 @@ static void InterpreterJni(Thread* self,
     }
   }
 
-  // TODO: The following enters JNI code using a typedef-ed function rather than the JNI compiler,
-  //       it should be removed and JNI compiled stubs used instead.
+  // @CriticalNative dispatch: raw C call, no JNIEnv/jclass
+  // Check: method has @CriticalNative flag AND was resolved from libandroid_runtime
+  // (not our manual patches which use JNI calling convention)
+  if (method->IsCriticalNative()) {
+    // Only use CriticalNative if the function was registered from an external .so
+    // (libandroid_runtime.so). Our manual patches use JNI calling convention.
+    // Heuristic: check if the name starts with "android.os.Parcel.native" or similar
+    // known @CriticalNative methods from the framework.
+    // Only dispatch as @CriticalNative for methods on android.os.Parcel
+    // (the only class where we know the registration used @CriticalNative
+    // calling convention from libandroid_runtime.so)
+    std::string cls_desc;
+    const char* desc = method->GetDeclaringClass()->GetDescriptor(&cls_desc);
+    bool isParcelCritical = (desc != nullptr && strcmp(desc, "Landroid/os/Parcel;") == 0);
+    if (!isParcelCritical) {
+      // Not a known @CriticalNative — use regular JNI dispatch
+      goto regular_jni;
+    }
+    const void* fn = method->GetEntryPointFromJni();
+    // @CriticalNative shorty patterns — direct C call with raw args
+    if (shorty == "IJ") {
+      result->SetI(reinterpret_cast<jint(*)(jlong)>(const_cast<void*>(fn))(
+          *reinterpret_cast<jlong*>(&args[0])));
+    } else if (shorty == "LJ") {
+      ScopedObjectAccessUnchecked soa(self);
+      jobject r = reinterpret_cast<jobject(*)(jlong)>(const_cast<void*>(fn))(
+          *reinterpret_cast<jlong*>(&args[0]));
+      result->SetL(soa.Decode<mirror::Object>(r));
+    } else if (shorty == "JJ") {
+      result->SetJ(reinterpret_cast<jlong(*)(jlong)>(const_cast<void*>(fn))(
+          *reinterpret_cast<jlong*>(&args[0])));
+    } else if (shorty == "VJ") {
+      reinterpret_cast<void(*)(jlong)>(const_cast<void*>(fn))(
+          *reinterpret_cast<jlong*>(&args[0]));
+    } else if (shorty == "VJI") {
+      reinterpret_cast<void(*)(jlong, jint)>(const_cast<void*>(fn))(
+          *reinterpret_cast<jlong*>(&args[0]), args[2]);
+    } else if (shorty == "VJL") {
+      ScopedObjectAccessUnchecked soa(self);
+      ScopedLocalRef<jobject> a1(soa.Env(), soa.AddLocalReference<jobject>(
+          reinterpret_cast<StackReference<mirror::Object>*>(&args[2])->AsMirrorPtr()));
+      reinterpret_cast<void(*)(jlong, jobject)>(const_cast<void*>(fn))(
+          *reinterpret_cast<jlong*>(&args[0]), a1.get());
+    } else if (shorty == "VJJ") {
+      reinterpret_cast<void(*)(jlong, jlong)>(const_cast<void*>(fn))(
+          *reinterpret_cast<jlong*>(&args[0]), *reinterpret_cast<jlong*>(&args[2]));
+    } else if (shorty == "J") {
+      result->SetJ(reinterpret_cast<jlong(*)()>(const_cast<void*>(fn))());
+    } else {
+      LOG(WARNING) << "InterpreterJni: unhandled @CriticalNative shorty '" << shorty
+                   << "' for " << method->PrettyMethod();
+    }
+    return;
+  }
+
+  // Regular JNI dispatch (JNIEnv + jclass/jobject)
+  regular_jni:
   ScopedObjectAccessUnchecked soa(self);
   if (method->IsStatic()) {
     if (shorty == "L") {
