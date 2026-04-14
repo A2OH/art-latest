@@ -2817,6 +2817,36 @@ static int InvokeMain(JNIEnv* env, char** argv) {
     if (env->ExceptionCheck()) env->ExceptionClear();
   }
 
+  // Patch StatLogger + WindowManagerGlobal (null from failed clinit)
+  {
+    // Patch all WindowManagerGlobal void/long methods that touch StatLogger
+    jclass wmgCls = env->FindClass("android/view/WindowManagerGlobal");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    // Patch StatLogger methods to return 0
+    jclass slCls = env->FindClass("com/android/internal/util/StatLogger");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (slCls) {
+      art::ScopedObjectAccess soa(art::Thread::Current());
+      art::ObjPtr<art::mirror::Class> mirror = soa.Decode<art::mirror::Class>(slCls);
+      if (mirror != nullptr) {
+        static auto ret0Long = +[](JNIEnv*, jobject) -> jlong { return 0; };
+        for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
+          if (m.IsNative() || m.IsAbstract() || m.IsConstructor()) continue;
+          std::string sig = m.GetSignature().ToString();
+          if (sig.find(")J") != std::string::npos) {
+            m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+            m.SetEntryPointFromJni(reinterpret_cast<void*>(+ret0Long));
+          } else if (sig.find(")V") != std::string::npos) {
+            m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+            m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_java_lang_Throwable_printStackTrace_noop));
+          }
+        }
+        fprintf(stderr, "[dalvikvm] Patched StatLogger methods → 0/no-op\n");
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
+
   // Patch LoadedApk.updateApplicationInfo → no-op (avoids null context chain NPEs)
   {
     jclass lapCls = env->FindClass("android/app/LoadedApk");
