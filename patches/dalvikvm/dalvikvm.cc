@@ -52,6 +52,24 @@ Java_java_lang_Throwable_printStackTrace_noop(JNIEnv*, jobject) {
   // Intentionally empty — prevents cascading exception handling loops
 }
 
+// Generic no-op that returns null (for Object-returning methods patched to native)
+extern "C" JNIEXPORT jobject JNICALL
+Java_noop_return_null(JNIEnv*, jobject) {
+  return nullptr;
+}
+
+// Generic no-op that returns true (for boolean-returning methods)
+extern "C" JNIEXPORT jboolean JNICALL
+Java_noop_return_true(JNIEnv*, jobject) {
+  return JNI_TRUE;
+}
+
+// Generic no-op that returns false
+extern "C" JNIEXPORT jboolean JNICALL
+Java_noop_return_false(JNIEnv*, jobject) {
+  return JNI_FALSE;
+}
+
 // String.lastIndexOf(int) native replacement — the interpreted version has a
 // register corruption bug where length() return clobbers the ch parameter.
 // Implementation: pure JNI, no callbacks into Java to avoid re-entrancy issues.
@@ -1673,7 +1691,7 @@ static int InvokeMain(JNIEnv* env, char** argv) {
                 "Lsun/util/locale/BaseLocale;",
                 "Lsun/util/locale/BaseLocale$Cache;",
                 // "Ljava/util/Locale;",  — DO NOT re-init (causes FATAL later)
-                "Landroid/content/res/Configuration;",
+                // "Landroid/content/res/Configuration;",  — DO NOT re-init (same FATAL)
                 nullptr
               };
               for (int i = 0; phase2[i]; i++) {
@@ -2599,6 +2617,75 @@ static int InvokeMain(JNIEnv* env, char** argv) {
         fprintf(stderr, "[dalvikvm] Looper.prepareMainLooper() called\n");
       }
     }
+  }
+
+  // Patch Activity methods that need Window/WindowController (our mock Window is incomplete)
+  {
+    jclass actCls = env->FindClass("android/app/Activity");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (actCls) {
+      art::ScopedObjectAccess soa(art::Thread::Current());
+      art::ObjPtr<art::mirror::Class> mirror = soa.Decode<art::mirror::Class>(actCls);
+      if (mirror != nullptr) {
+        struct { const char* name; const char* sig; void* fn; } patches[] = {
+          {"isTaskRoot", "()Z", (void*)Java_noop_return_true},
+          {"isFinishing", "()Z", (void*)Java_noop_return_false},
+          {"isDestroyed", "()Z", (void*)Java_noop_return_false},
+          {"isChangingConfigurations", "()Z", (void*)Java_noop_return_false},
+          {nullptr, nullptr, nullptr}
+        };
+        for (int i = 0; patches[i].name; i++) {
+          for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
+            if (strcmp(m.GetName(), patches[i].name) == 0 &&
+                m.GetSignature().ToString() == patches[i].sig && !m.IsNative()) {
+              m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+              m.SetEntryPointFromJni(reinterpret_cast<void*>(patches[i].fn));
+              break;
+            }
+          }
+        }
+        fprintf(stderr, "[dalvikvm] Patched Activity boolean methods\n");
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
+
+  // Patch SplashScreen to no-ops (needs fully working Resources/Theme which we don't have)
+  {
+    const char* splashClasses[] = {
+      "androidx/core/splashscreen/SplashScreen",
+      "androidx/core/splashscreen/SplashScreen$Companion",
+      "androidx/core/splashscreen/SplashScreen$Impl",
+      "androidx/core/splashscreen/SplashScreen$Impl31",
+      nullptr
+    };
+    int totalPatched = 0;
+    for (int ci = 0; splashClasses[ci]; ci++) {
+      jclass cls = env->FindClass(splashClasses[ci]);
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      if (!cls) continue;
+      art::ScopedObjectAccess soa(art::Thread::Current());
+      art::ObjPtr<art::mirror::Class> mirror = soa.Decode<art::mirror::Class>(cls);
+      if (mirror == nullptr) continue;
+      for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
+        if (!m.IsNative() && !m.IsAbstract() && !m.IsConstructor()) {
+          std::string sig = m.GetSignature().ToString();
+          if (sig.find(")V") != std::string::npos) {
+            m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+            m.SetEntryPointFromJni(
+                reinterpret_cast<void*>(Java_java_lang_Throwable_printStackTrace_noop));
+            totalPatched++;
+          } else if (sig.find(")L") != std::string::npos) {
+            // Object-returning method → return null
+            m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+            m.SetEntryPointFromJni(
+                reinterpret_cast<void*>(Java_noop_return_null));
+            totalPatched++;
+          }
+        }
+      }
+    }
+    fprintf(stderr, "[dalvikvm] Patched %d SplashScreen methods → no-op\n", totalPatched);
   }
 
   // Patch MCD analytics methods to no-ops (they cause NPE from null config strings)

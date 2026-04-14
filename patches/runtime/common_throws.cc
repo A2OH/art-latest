@@ -664,6 +664,22 @@ void ThrowNullPointerExceptionFromDexPC(bool check_address, uintptr_t addr) {
     }
     case Instruction::MONITOR_ENTER:
     case Instruction::MONITOR_EXIT: {
+      // PATCH: Log the method + shadow frame for sync-on-null debugging
+      {
+        Thread* self = Thread::Current();
+        fprintf(stderr, "[NPE-SYNC] synchronized(null) in %s\n", method->PrettyMethod().c_str());
+        int depth = 0;
+        for (auto* frame = self->GetManagedStack()->GetTopShadowFrame();
+             frame != nullptr && depth < 8;
+             frame = frame->GetLink(), depth++) {
+          ArtMethod* m = frame->GetMethod();
+          if (m != nullptr) {
+            fprintf(stderr, "[NPE-SYNC]   #%d %s (dex_pc=%u)\n", depth, m->PrettyMethod().c_str(),
+                    frame->GetDexPC());
+          }
+        }
+        fflush(stderr);
+      }
       ThrowException("Ljava/lang/NullPointerException;", nullptr,
                      "Attempt to do a synchronize operation on a null object");
       break;

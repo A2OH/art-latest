@@ -269,9 +269,27 @@ public class McdLoader {
             try {
                 Class<?> windowClass = Class.forName("com.android.internal.policy.PhoneWindow");
                 Object window = nativeAllocInstance(windowClass);
+                // Set Window.mCallback = the Activity (Activity implements Window.Callback)
+                try {
+                    Class<?> winCls = Class.forName("android.view.Window");
+                    Field cbF = winCls.getDeclaredField("mCallback");
+                    cbF.setAccessible(true);
+                    cbF.set(window, splash); // Activity implements Window.Callback
+                    // Also set mWindowControllerCallback
+                    Field wcbF = winCls.getDeclaredField("mWindowControllerCallback");
+                    wcbF.setAccessible(true);
+                    wcbF.set(window, splash); // Activity also implements this
+                } catch (Throwable t2) {}
+                // Set mContext on Window
+                try {
+                    Class<?> winCls = Class.forName("android.view.Window");
+                    Field ctxF = winCls.getDeclaredField("mContext");
+                    ctxF.setAccessible(true);
+                    ctxF.set(window, splash); // Activity IS the context
+                } catch (Throwable t2) {}
                 Field f = actClass.getDeclaredField("mWindow");
                 f.setAccessible(true); f.set(splash, window);
-                log("[OK] mWindow set");
+                log("[OK] mWindow set (with callbacks)");
             } catch (Throwable t) { log("[WARN] mWindow: " + t.getClass().getName()); }
 
             // mActivityInfo — Activity needs this for theming
@@ -313,24 +331,66 @@ public class McdLoader {
                     trF.setAccessible(true);
                     trF.setInt(splash, 0x01030005); // android.R.style.Theme
                 } catch (Throwable t2) {}
-                // Set mResources (needed for theme creation)
+                // Set mResources — create directly via AllocObject to bypass getSystem()
                 try {
                     Class<?> resClass = Class.forName("android.content.res.Resources");
-                    // Get system resources
-                    Method getSysRes = resClass.getDeclaredMethod("getSystem");
-                    Object sysRes = getSysRes.invoke(null);
-                    if (sysRes != null) {
+                    Object resources = null;
+                    // First try getSystem()
+                    try {
+                        Method getSysRes = resClass.getDeclaredMethod("getSystem");
+                        resources = getSysRes.invoke(null);
+                    } catch (Throwable t3) {}
+                    // Fallback: allocate directly
+                    if (resources == null) {
+                        resources = nativeAllocInstance(resClass);
+                        log("[INFO] Resources created via AllocObject (no getSystem)");
+                    }
+                    if (resources != null) {
                         Field resF = ctwClass.getDeclaredField("mResources");
                         resF.setAccessible(true);
-                        resF.set(splash, sysRes);
-                        log("[OK] mResources = Resources.getSystem()");
+                        resF.set(splash, resources);
+                        log("[OK] mResources set");
                         // Also set on ContextImpl
                         try {
                             Class<?> ciClass = Class.forName("android.app.ContextImpl");
                             Field ciResF = ciClass.getDeclaredField("mResources");
                             ciResF.setAccessible(true);
-                            ciResF.set(mockContext, sysRes);
+                            ciResF.set(mockContext, resources);
                         } catch (Throwable t3) {}
+                        // Create a Theme object directly
+                        try {
+                            Class<?> themeClass = Class.forName("android.content.res.Resources$Theme");
+                            Object theme = nativeAllocInstance(themeClass);
+                            // Set mLock (used for synchronization in resolveAttribute)
+                            try {
+                                Field lockF = themeClass.getDeclaredField("mLock");
+                                lockF.setAccessible(true);
+                                lockF.set(theme, new Object());
+                            } catch (Throwable t4) {
+                                // Try 'mKey' or any Object field used as lock
+                                for (Field f : themeClass.getDeclaredFields()) {
+                                    if (f.getType() == Object.class) {
+                                        f.setAccessible(true);
+                                        if (f.get(theme) == null) {
+                                            f.set(theme, new Object());
+                                        }
+                                    }
+                                }
+                            }
+                            // Link Theme to Resources
+                            try {
+                                Field ownerF = themeClass.getDeclaredField("mResources");
+                                ownerF.setAccessible(true);
+                                ownerF.set(theme, resources);
+                            } catch (Throwable t4) {}
+                            // Set mTheme on Activity
+                            Field mThemeF = ctwClass.getDeclaredField("mTheme");
+                            mThemeF.setAccessible(true);
+                            mThemeF.set(splash, theme);
+                            log("[OK] mTheme pre-set (with mLock)");
+                        } catch (Throwable t3) {
+                            log("[WARN] mTheme: " + t3.getClass().getName());
+                        }
                     }
                 } catch (Throwable t2) { log("[WARN] mResources: " + t2.getClass().getName()); }
             } catch (Throwable t) { log("[WARN] theme: " + t.getClass().getName()); }

@@ -1513,8 +1513,30 @@ bool Runtime::Start() {
           {"_ZN7android34register_android_view_InputChannelEP7_JNIEnv", "InputChannel"},
           // Graphics
           {"_ZN7android31register_android_graphics_PathEP7_JNIEnv", "graphics.Path"},
+          // Content / Resources / AssetManager (needed for theme + resource loading)
+          {"_ZN7android37register_android_content_AssetManagerEP7_JNIEnv", "AssetManager"},
+          {"_ZN7android38register_android_content_res_ApkAssetsEP7_JNIEnv", "ApkAssets"},
+          {"_ZN7android36register_android_content_StringBlockEP7_JNIEnv", "StringBlock"},
+          {"_ZN7android33register_android_content_XmlBlockEP7_JNIEnv", "XmlBlock"},
+          {"_ZN7android42register_android_content_res_ConfigurationEP7_JNIEnv", "Configuration"},
           // ActivityManager for process management
           {"_ZN7android37register_android_app_ActivityManagerEP7_JNIEnv", "ActivityManager"},
+          // Graphics Canvas / Paint / Bitmap (needed for View rendering)
+          {"_ZN7android27register_android_graphics_dEP7_JNIEnv", "graphics"},
+          {"_ZN7android32register_android_graphics_BitmapEP7_JNIEnv", "Bitmap"},
+          {"_ZN7android32register_android_graphics_CanvasEP7_JNIEnv", "Canvas"},
+          {"_ZN7android31register_android_graphics_PaintEP7_JNIEnv", "Paint"},
+          {"_ZN7android34register_android_graphics_TypefaceEP7_JNIEnv", "Typeface"},
+          {"_ZN7android37register_android_graphics_BitmapFactoryEP7_JNIEnv", "BitmapFactory"},
+          {"_ZN7android32register_android_graphics_RegionEP7_JNIEnv", "Region"},
+          {"_ZN7android32register_android_graphics_MatrixEP7_JNIEnv", "Matrix"},
+          // View system
+          {"_ZN7android41register_android_view_RenderNodeAnimatorEP7_NIEnv", "RenderNodeAnimator"},
+          {"_ZN7android35register_android_view_TextureLayerEP7_JNIEnv", "TextureLayer"},
+          {"_ZN7android36register_android_view_DisplayListCanvasEP7_JNIEnv", "DisplayListCanvas"},
+          {"_ZN7android48register_android_graphics_HardwareRendererObserverEP7_JNIEnv", "HWRendererObserver"},
+          // Window
+          {"_ZN7android33register_android_view_ThreadedRendererEP7_JNIEnv", "ThreadedRenderer"},
           {nullptr, nullptr}
         };
         int registered = 0, failed = 0;
