@@ -6,6 +6,7 @@ public class McdLoader {
     static native void nativeLog(String msg);
     static native Object nativeAllocInstance(Class<?> cls);
     static native void nativePrintException(Throwable t);
+    static native void nativeSetApkAssets(Object assetMgr, Object[] apkAssets, long nativePtr);
 
     static void log(String msg) {
         try { nativeLog(msg); return; } catch (Throwable t) {}
@@ -388,13 +389,16 @@ public class McdLoader {
                         cfF.setAccessible(true);
                         cfF.set(resImpl, config);
                     // Set AssetManager with real native resources
+                    Object assetMgr = null;
+                    long ptr = 0;
+                    java.util.List<Object> apkList = new java.util.ArrayList<>();
                     try {
                         Class<?> amClass = Class.forName("android.content.res.AssetManager");
-                        Object assetMgr = nativeAllocInstance(amClass);
+                        assetMgr = nativeAllocInstance(amClass);
                         // Create native AssetManager2 object
                         Method nc = amClass.getDeclaredMethod("nativeCreate");
                         nc.setAccessible(true);
-                        long ptr = (Long) nc.invoke(null);
+                        ptr = (Long) nc.invoke(null);
                         Field moF = amClass.getDeclaredField("mObject");
                         moF.setAccessible(true);
                         moF.setLong(assetMgr, ptr);
@@ -407,6 +411,7 @@ public class McdLoader {
                         Method loadFrom = null;
                         for (Method m : apkClass.getDeclaredMethods())
                             if (m.getName().equals("loadFromPath")) { loadFrom = m; break; }
+                        log("[DEBUG] loadFromPath method: " + (loadFrom != null ? loadFrom.toString() : "null"));
                         if (loadFrom != null) {
                             loadFrom.setAccessible(true);
                             Object fwApk = null, mcdApk = null;
@@ -425,47 +430,52 @@ public class McdLoader {
                                 if (mcdApk != null) log("[OK] mcd.apk loaded");
                             } catch (Throwable x) {}
                             // Build ApkAssets array and set on native AM
-                            java.util.List<Object> apkList = new java.util.ArrayList<>();
                             if (fwApk != null) apkList.add(fwApk);
                             if (mcdApk != null) apkList.add(mcdApk);
+                            log("[DEBUG] apkList.size()=" + apkList.size());
                             if (!apkList.isEmpty()) {
-                                Object arr = java.lang.reflect.Array.newInstance(apkClass, apkList.size());
-                                for (int ai = 0; ai < apkList.size(); ai++)
-                                    java.lang.reflect.Array.set(arr, ai, apkList.get(ai));
+                                Object arr = null;
+                                // Use the actual runtime class of loaded ApkAssets for array type
+                                Class<?> actualClass = apkList.get(0).getClass();
+                                try {
+                                    arr = java.lang.reflect.Array.newInstance(actualClass, apkList.size());
+                                    for (int ai = 0; ai < apkList.size(); ai++)
+                                        java.lang.reflect.Array.set(arr, ai, apkList.get(ai));
+                                } catch (Throwable x) {
+                                    // Try with the declared ApkAssets class
+                                    try {
+                                        arr = java.lang.reflect.Array.newInstance(apkClass, apkList.size());
+                                        for (int ai = 0; ai < apkList.size(); ai++)
+                                            java.lang.reflect.Array.set(arr, ai, apkList.get(ai));
+                                    } catch (Throwable x2) {
+                                        arr = apkList.toArray();
+                                    }
+                                }
+                                log("[DEBUG] ApkAssets array: " + (arr != null ? "ok, len=" + java.lang.reflect.Array.getLength(arr) : "null"));
+                                if (arr != null) {
                                 try { Field af = amClass.getDeclaredField("mApkAssets"); af.setAccessible(true);
                                       af.set(assetMgr, arr); } catch (Throwable x) {}
-                                // Get native ApkAsset pointers and set via nativeSetApkAssets
-                                try {
-                                    long[] nativePtrs = new long[apkList.size()];
-                                    Field npF = apkClass.getDeclaredField("mNativePtr");
-                                    npF.setAccessible(true);
-                                    for (int ai = 0; ai < apkList.size(); ai++)
-                                        nativePtrs[ai] = npF.getLong(apkList.get(ai));
-                                    // nativeSetApkAssets(long amPtr, long[] apkAssetPtrs, boolean invalidateCaches)
-                                    // Find the right method
-                                    for (Method m : amClass.getDeclaredMethods()) {
-                                        if (m.getName().equals("nativeSetApkAssets")) {
-                                            m.setAccessible(true);
-                                            Class<?>[] pt = m.getParameterTypes();
-                                            if (pt.length == 3 && pt[0] == long.class && pt[1] == long[].class)  {
-                                                m.invoke(null, ptr, nativePtrs, false);
-                                                log("[OK] nativeSetApkAssets(" + nativePtrs.length + " ptrs)");
-                                                break;
-                                            }
-                                        }
-                                    }
-                                } catch (Throwable x) {
-                                    log("[WARN] nativeSetApkAssets: " + x.getClass().getSimpleName());
-                                }
+                                } // end if arr != null
+                            }
+                            }
+                        } catch (Throwable t4) {
+                            log("[WARN] AssetManager setup: " + t4.getClass().getSimpleName());
+                        }
+                        // Set mAssets and call nativeSetApkAssets inside inner scope
+                        try {
+                            Field amF = resImplClass.getDeclaredField("mAssets");
+                            amF.setAccessible(true);
+                            amF.set(resImpl, assetMgr);
+                            log("[OK] mAssets = AssetManager");
+                        } catch (Throwable t4) {}
+                        if (!apkList.isEmpty()) {
+                            try {
+                                nativeSetApkAssets(assetMgr, apkList.toArray(), ptr);
+                                log("[OK] RESOURCES CONNECTED!");
+                            } catch (Throwable x) {
+                                log("[WARN] nativeSetApkAssets: " + x.getClass().getSimpleName());
                             }
                         }
-                        Field amF = resImplClass.getDeclaredField("mAssets");
-                        amF.setAccessible(true);
-                        amF.set(resImpl, assetMgr);
-                    } catch (Throwable t4) {
-                        log("[WARN] AssetManager: " + t4.getClass().getSimpleName());
-                    }
-                    } catch (Throwable t3) {}
                     // Set DisplayMetrics on ResourcesImpl
                     try {
                         Class<?> dmClass = Class.forName("android.util.DisplayMetrics");
@@ -560,6 +570,8 @@ public class McdLoader {
                 f.setAccessible(true); f.set(splash, token);
                 log("[OK] mToken set");
             } catch (Throwable t) { log("[WARN] mToken: " + t.getClass().getName()); }
+
+            } catch (Throwable t) { log("[WARN] theme block: " + t.getClass().getName()); }
 
         } catch (Throwable t) {
             log("[FAIL] fields: " + t.getClass().getName());

@@ -470,6 +470,16 @@ static void InterpreterJni(Thread* self,
       ScopedLocalRef<jclass> klass(soa.Env(),
                                    soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
       result->SetI(fn(soa.Env(), klass.get()));
+    } else if (shorty == "VJLZZ") {
+      // void fn(JNIEnv*, jclass, long, Object[], boolean, boolean) — AssetManager.nativeSetApkAssets
+      using fntype = void(JNIEnv*, jclass, jlong, jobjectArray, jboolean, jboolean);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jclass> klass(soa.Env(),
+                                   soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
+      jlong arg0 = *reinterpret_cast<jlong*>(&args[0]);
+      ScopedLocalRef<jobject> arg1(soa.Env(),
+                                   soa.AddLocalReference<jobject>(ObjArg(args[2]))); // after long (2 slots)
+      fn(soa.Env(), klass.get(), arg0, (jobjectArray)arg1.get(), (jboolean)args[3], (jboolean)args[4]);
     } else if (shorty == "ZJ") {
       // boolean fn(JNIEnv*, jclass, long) — Trace.nativeIsTagEnabled
       using fntype = jboolean(JNIEnv*, jclass, jlong);

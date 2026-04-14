@@ -443,6 +443,39 @@ static int InvokeMain(JNIEnv* env, char** argv) {
       const char* s = e->GetStringUTFChars(msg, nullptr);
       if (s) { write(STDERR_FILENO, s, strlen(s)); write(STDERR_FILENO, "\n", 1); e->ReleaseStringUTFChars(msg, s); }
     };
+    static auto setApkAssetsNative = +[](JNIEnv* e, jclass, jobject assetMgr, jobjectArray apkArr, jlong nativePtr) {
+      // Call AssetManager.nativeSetApkAssets(long, ApkAssets[], boolean, boolean) from C
+      // This bypasses Java's Method.invoke type checking
+      jclass amCls = e->GetObjectClass(assetMgr);
+      // Find nativeSetApkAssets
+      jclass apkCls = e->FindClass("android/content/res/ApkAssets");
+      if (e->ExceptionCheck()) e->ExceptionClear();
+      if (!apkCls) { fprintf(stderr, "[setApkAssets] ApkAssets class not found\n"); return; }
+      // Create properly typed ApkAssets[] from Object[]
+      jint len = e->GetArrayLength(apkArr);
+      jobjectArray typedArr = e->NewObjectArray(len, apkCls, nullptr);
+      if (e->ExceptionCheck()) { e->ExceptionClear(); fprintf(stderr, "[setApkAssets] NewObjectArray failed\n"); return; }
+      for (int i = 0; i < len; i++) {
+        jobject elem = e->GetObjectArrayElement(apkArr, i);
+        e->SetObjectArrayElement(typedArr, i, elem);
+        if (e->ExceptionCheck()) { e->ExceptionClear(); break; }
+      }
+      // Find and call nativeSetApkAssets
+      jmethodID setM = e->GetStaticMethodID(amCls, "nativeSetApkAssets",
+          "(J[Landroid/content/res/ApkAssets;ZZ)V");
+      if (e->ExceptionCheck()) e->ExceptionClear();
+      if (setM) {
+        e->CallStaticVoidMethod(amCls, setM, nativePtr, typedArr, (jboolean)false, (jboolean)false);
+        if (e->ExceptionCheck()) {
+          fprintf(stderr, "[setApkAssets] nativeSetApkAssets threw exception\n");
+          e->ExceptionClear();
+        } else {
+          fprintf(stderr, "[setApkAssets] RESOURCES CONNECTED! %d ApkAssets on AM ptr=%ld\n", len, (long)nativePtr);
+        }
+      } else {
+        fprintf(stderr, "[setApkAssets] nativeSetApkAssets method not found\n");
+      }
+    };
     static auto printException = +[](JNIEnv* e, jclass, jthrowable t) {
       if (!t) { fprintf(stderr, "[EXEC] null exception\n"); return; }
       // Walk cause chain, get details via field access (no Java string ops)
@@ -532,8 +565,9 @@ static int InvokeMain(JNIEnv* env, char** argv) {
       {"nativeAllocInstance", "(Ljava/lang/Class;)Ljava/lang/Object;", (void*)+allocInstance},
       {"nativeLog", "(Ljava/lang/String;)V", (void*)+nativeLog},
       {"nativePrintException", "(Ljava/lang/Throwable;)V", (void*)+printException},
+      {"nativeSetApkAssets", "(Ljava/lang/Object;[Ljava/lang/Object;J)V", (void*)+setApkAssetsNative},
     };
-    int rc = env->RegisterNatives(klass.get(), methods, 3);
+    int rc = env->RegisterNatives(klass.get(), methods, 4);
     if (env->ExceptionCheck()) env->ExceptionClear();
     fprintf(stderr, "[dalvikvm] RegisterNatives for %s: %s\n", class_name.c_str(),
             rc == 0 ? "OK" : "FAILED");
