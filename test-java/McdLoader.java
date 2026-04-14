@@ -945,6 +945,31 @@ public class McdLoader {
                             setTitle.invoke(wmLp, "WestlakeMCD");
                         } catch (Throwable x) {}
 
+                        // Try SurfaceControl directly (bypass ViewRootImpl)
+                        try {
+                            Class<?> scClass = Class.forName("android.view.SurfaceControl");
+                            Class<?> builderClass = Class.forName("android.view.SurfaceControl$Builder");
+                            // Create SurfaceControl.Builder
+                            Object builder = nativeAllocInstance(builderClass);
+                            log("[DEBUG] SurfaceControl.Builder created");
+                            // Try to create a Transaction
+                            Class<?> txClass = Class.forName("android.view.SurfaceControl$Transaction");
+                            Constructor<?> txCtor = txClass.getDeclaredConstructor();
+                            txCtor.setAccessible(true);
+                            Object tx = txCtor.newInstance();
+                            log("[OK] SurfaceControl.Transaction created!");
+                            // Transaction.close (cleanup)
+                            try {
+                                Method close = txClass.getDeclaredMethod("close");
+                                close.setAccessible(true);
+                                close.invoke(tx);
+                                log("[OK] Transaction.close() called");
+                            } catch (Throwable x) {}
+                        } catch (Throwable t2) {
+                            log("[WARN] SurfaceControl: " + t2.getClass().getSimpleName());
+                            try { nativePrintException(t2); } catch (Throwable t3) {}
+                        }
+
                         // Call WindowManagerGlobal.addView directly
                         try {
                             Class<?> wmgClass = Class.forName("android.view.WindowManagerGlobal");

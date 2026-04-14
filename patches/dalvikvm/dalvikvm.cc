@@ -2817,15 +2817,13 @@ static int InvokeMain(JNIEnv* env, char** argv) {
     if (env->ExceptionCheck()) env->ExceptionClear();
   }
 
-  // Patch StatLogger + WindowManagerGlobal (null from failed clinit)
+  // Fix StatLogger: create instance and set on WindowManagerGlobal.sStatLogger
+  // The clinit fails but we need a valid instance for addView to work
   {
-    // Patch all WindowManagerGlobal void/long methods that touch StatLogger
-    jclass wmgCls = env->FindClass("android/view/WindowManagerGlobal");
-    if (env->ExceptionCheck()) env->ExceptionClear();
-    // Patch StatLogger methods to return 0
     jclass slCls = env->FindClass("com/android/internal/util/StatLogger");
     if (env->ExceptionCheck()) env->ExceptionClear();
     if (slCls) {
+      // Patch methods to return 0/no-op
       art::ScopedObjectAccess soa(art::Thread::Current());
       art::ObjPtr<art::mirror::Class> mirror = soa.Decode<art::mirror::Class>(slCls);
       if (mirror != nullptr) {
@@ -2841,7 +2839,19 @@ static int InvokeMain(JNIEnv* env, char** argv) {
             m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_java_lang_Throwable_printStackTrace_noop));
           }
         }
-        fprintf(stderr, "[dalvikvm] Patched StatLogger methods → 0/no-op\n");
+      }
+      // Create instance and set on WindowManagerGlobal
+      jobject sl = env->AllocObject(slCls);
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      if (sl) {
+        jclass wmgCls = env->FindClass("android/view/WindowManagerGlobal");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (wmgCls) {
+          jfieldID slF = env->GetStaticFieldID(wmgCls, "sStatLogger", "Lcom/android/internal/util/StatLogger;");
+          if (env->ExceptionCheck()) env->ExceptionClear();
+          if (slF) env->SetStaticObjectField(wmgCls, slF, sl);
+        }
+        fprintf(stderr, "[dalvikvm] Created StatLogger + set on WindowManagerGlobal\n");
       }
     }
     if (env->ExceptionCheck()) env->ExceptionClear();
@@ -3302,6 +3312,69 @@ static int InvokeMain(JNIEnv* env, char** argv) {
           setOff("cellsBusy", "CELLSBUSY");
         }
         fprintf(stderr, "[dalvikvm] Final fixup: ConcurrentHashMap.U re-set\n");
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
+
+  // Final fixup: set StatLogger on WindowManagerGlobal (clinit may have reset it)
+  {
+    jclass slCls = env->FindClass("com/android/internal/util/StatLogger");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    jclass wmgCls = env->FindClass("android/view/WindowManagerGlobal");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (slCls && wmgCls) {
+      jfieldID slF = env->GetStaticFieldID(wmgCls, "sStatLogger", "Lcom/android/internal/util/StatLogger;");
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      if (slF) {
+        jobject sl = env->AllocObject(slCls);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (sl) env->SetStaticObjectField(wmgCls, slF, sl);
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    // Stub NativeAllocationRegistry completely (GC cleanup not needed in standalone)
+  {
+    jclass narCls = env->FindClass("libcore/util/NativeAllocationRegistry");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (narCls) {
+      art::ScopedObjectAccess soa(art::Thread::Current());
+      art::ObjPtr<art::mirror::Class> mirror = soa.Decode<art::mirror::Class>(narCls);
+      if (mirror != nullptr) {
+        static auto noopJJ = +[](JNIEnv*, jclass, jlong, jlong) {};
+        // Stub all methods — native and non-native
+        for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
+          if (m.IsAbstract() || m.IsConstructor()) continue;
+          std::string sig = m.GetSignature().ToString();
+          if (strcmp(m.GetName(), "applyFreeFunction") == 0 && m.IsNative()) {
+            m.SetEntryPointFromJni(reinterpret_cast<void*>(+noopJJ));
+          }
+          // registerNativeAllocation → return null Runnable (no cleanup)
+          if (strcmp(m.GetName(), "registerNativeAllocation") == 0 && !m.IsNative()) {
+            m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+            m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_noop_return_null));
+          }
+        }
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
+  // Also fix SystemClock.elapsedRealtime if not registered
+    jclass scCls = env->FindClass("android/os/SystemClock");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (scCls) {
+      art::ScopedObjectAccess soa(art::Thread::Current());
+      art::ObjPtr<art::mirror::Class> mirror = soa.Decode<art::mirror::Class>(scCls);
+      if (mirror != nullptr) {
+        static auto elapsed = +[](JNIEnv*, jclass) -> jlong {
+          struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+          return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+        };
+        for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
+          if (strcmp(m.GetName(), "elapsedRealtime") == 0 && m.IsNative()) {
+            m.SetEntryPointFromJni(reinterpret_cast<void*>(+elapsed));
+          }
+        }
       }
     }
     if (env->ExceptionCheck()) env->ExceptionClear();
