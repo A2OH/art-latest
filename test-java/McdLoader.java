@@ -1136,9 +1136,24 @@ public class McdLoader {
                                     Method setLayer = txClass.getDeclaredMethod("setLayer", scClass, int.class);
                                     setLayer.setAccessible(true);
                                     setLayer.invoke(tx, surfaceControl, 0x7FFFFFFF);
-                                    Method setPos = txClass.getDeclaredMethod("setPosition", scClass, float.class, float.class);
-                                    setPos.setAccessible(true);
-                                    setPos.invoke(tx, surfaceControl, 100f, 200f);
+                                    // Set position using setGeometry for reliable placement
+                                    try {
+                                        Class<?> rectClass = Class.forName("android.graphics.Rect");
+                                        Object srcRect = rectClass.getConstructor(int.class,int.class,int.class,int.class)
+                                            .newInstance(0, 0, 500, 300);
+                                        Object dstRect = rectClass.getConstructor(int.class,int.class,int.class,int.class)
+                                            .newInstance(100, 300, 600, 600);
+                                        Method setGeo = txClass.getDeclaredMethod("setGeometry", scClass,
+                                            rectClass, rectClass, int.class);
+                                        setGeo.setAccessible(true);
+                                        setGeo.invoke(tx, surfaceControl, srcRect, dstRect, 0);
+                                        log("[OK] setGeometry(src=0,0,500,300 dst=100,300,600,600)");
+                                    } catch (Throwable x) {
+                                        // Fallback to setPosition
+                                        Method setPos = txClass.getDeclaredMethod("setPosition", scClass, float.class, float.class);
+                                        setPos.setAccessible(true);
+                                        setPos.invoke(tx, surfaceControl, 100f, 300f);
+                                    }
                                     Method apply = txClass.getDeclaredMethod("apply");
                                     apply.setAccessible(true);
                                     apply.invoke(tx);
