@@ -363,6 +363,14 @@ $(IMGSPACE_PATCH_OBJ): $(IMGSPACE_PATCH_SRC)
 	$(CXX) $(CXXFLAGS) -iquote $(STUBS)/runtime/mirror -iquote $(ART)/runtime/gc/space -c $< -o $@ 2>&1 && echo "OK: image_space.cc (patched)" || { echo "FAIL: image_space.cc (patched)"; rm -f $@; }
 RUNTIME_OBJS += $(IMGSPACE_PATCH_OBJ)
 
+# Patched common_throws.cc (NPE caller logging)
+CTHROWS_PATCH_SRC = patches/runtime/common_throws.cc
+CTHROWS_PATCH_OBJ = $(BUILDDIR)/runtime/common_throws.o
+$(CTHROWS_PATCH_OBJ): $(CTHROWS_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@ 2>&1 && echo "OK: common_throws.cc (patched)" || { echo "FAIL: common_throws.cc (patched)"; rm -f $@; }
+RUNTIME_OBJS += $(CTHROWS_PATCH_OBJ)
+
 # Patched image.cc
 IMAGE_PATCH_SRC = patches/runtime/oat/image.cc
 IMAGE_PATCH_OBJ = $(BUILDDIR)/runtime/oat/image.o

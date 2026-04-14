@@ -2542,6 +2542,50 @@ static int InvokeMain(JNIEnv* env, char** argv) {
       }
     }
 
+    // Fix android.os.Build static fields (clinit fails, leaves all null)
+    {
+      jclass buildCls = env->FindClass("android/os/Build");
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      if (buildCls) {
+        struct { const char* name; const char* val; } fields[] = {
+          {"BOARD", "westlake"}, {"BOOTLOADER", "unknown"}, {"BRAND", "Westlake"},
+          {"DEVICE", "westlake_vm"}, {"DISPLAY", "Westlake-1.0"}, {"FINGERPRINT", "westlake/vm/1.0"},
+          {"HARDWARE", "westlake"}, {"HOST", "localhost"}, {"ID", "WLK.1"},
+          {"MANUFACTURER", "Westlake"}, {"MODEL", "Westlake VM"}, {"PRODUCT", "westlake"},
+          {"TAGS", "release-keys"}, {"TYPE", "userdebug"}, {"USER", "westlake"},
+          {nullptr, nullptr}
+        };
+        for (int i = 0; fields[i].name; i++) {
+          jfieldID f = env->GetStaticFieldID(buildCls, fields[i].name, "Ljava/lang/String;");
+          if (env->ExceptionCheck()) { env->ExceptionClear(); continue; }
+          if (f) env->SetStaticObjectField(buildCls, f, env->NewStringUTF(fields[i].val));
+        }
+        // VERSION fields
+        jclass verCls = env->FindClass("android/os/Build$VERSION");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (verCls) {
+          struct { const char* name; const char* type; const char* sval; int ival; } vfields[] = {
+            {"RELEASE", "Ljava/lang/String;", "15", 0},
+            {"SDK_INT", "I", nullptr, 35},
+            {"CODENAME", "Ljava/lang/String;", "REL", 0},
+            {"BASE_OS", "Ljava/lang/String;", "", 0},
+            {"SECURITY_PATCH", "Ljava/lang/String;", "2025-01-01", 0},
+            {nullptr, nullptr, nullptr, 0}
+          };
+          for (int i = 0; vfields[i].name; i++) {
+            jfieldID f = env->GetStaticFieldID(verCls, vfields[i].name, vfields[i].type);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); continue; }
+            if (f) {
+              if (vfields[i].sval) env->SetStaticObjectField(verCls, f, env->NewStringUTF(vfields[i].sval));
+              else env->SetStaticIntField(verCls, f, vfields[i].ival);
+            }
+          }
+        }
+        fprintf(stderr, "[dalvikvm] Set Build + Build.VERSION fields\n");
+      }
+      if (env->ExceptionCheck()) env->ExceptionClear();
+    }
+
     // Also ensure Looper.sMainLooper is set (many Android APIs need it)
     jclass looperCls = env->FindClass("android/os/Looper");
     if (env->ExceptionCheck()) env->ExceptionClear();
