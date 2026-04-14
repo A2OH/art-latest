@@ -365,19 +365,45 @@ public class McdLoader {
                     trF.setAccessible(true);
                     trF.setInt(splash, 0x01030005); // android.R.style.Theme
                 } catch (Throwable t2) {}
-                // Set mResources — create directly via AllocObject to bypass getSystem()
+                // Set mResources — create Resources + ResourcesImpl with Configuration
                 try {
                     Class<?> resClass = Class.forName("android.content.res.Resources");
-                    Object resources = null;
-                    // First try getSystem()
+                    Object resources = nativeAllocInstance(resClass);
+                    // Create ResourcesImpl with a Configuration
+                    Class<?> resImplClass = Class.forName("android.content.res.ResourcesImpl");
+                    Object resImpl = nativeAllocInstance(resImplClass);
+                    // Set Configuration on ResourcesImpl
                     try {
-                        Method getSysRes = resClass.getDeclaredMethod("getSystem");
-                        resources = getSysRes.invoke(null);
+                        Class<?> configClass = Class.forName("android.content.res.Configuration");
+                        Object config = nativeAllocInstance(configClass);
+                        Field cfF = resImplClass.getDeclaredField("mConfiguration");
+                        cfF.setAccessible(true);
+                        cfF.set(resImpl, config);
                     } catch (Throwable t3) {}
-                    // Fallback: allocate directly
-                    if (resources == null) {
-                        resources = nativeAllocInstance(resClass);
-                        log("[INFO] Resources created via AllocObject (no getSystem)");
+                    // Set DisplayMetrics on ResourcesImpl
+                    try {
+                        Class<?> dmClass = Class.forName("android.util.DisplayMetrics");
+                        Object dm = nativeAllocInstance(dmClass);
+                        // Set reasonable defaults
+                        try { dmClass.getDeclaredField("density").setFloat(dm, 2.0f); } catch (Throwable x) {}
+                        try { dmClass.getDeclaredField("densityDpi").setInt(dm, 320); } catch (Throwable x) {}
+                        try { dmClass.getDeclaredField("widthPixels").setInt(dm, 1080); } catch (Throwable x) {}
+                        try { dmClass.getDeclaredField("heightPixels").setInt(dm, 2340); } catch (Throwable x) {}
+                        try { dmClass.getDeclaredField("xdpi").setFloat(dm, 420f); } catch (Throwable x) {}
+                        try { dmClass.getDeclaredField("ydpi").setFloat(dm, 420f); } catch (Throwable x) {}
+                        try { dmClass.getDeclaredField("scaledDensity").setFloat(dm, 2.0f); } catch (Throwable x) {}
+                        Field dmF = resImplClass.getDeclaredField("mDisplayMetrics");
+                        dmF.setAccessible(true);
+                        dmF.set(resImpl, dm);
+                    } catch (Throwable t3) {}
+                    // Set ResourcesImpl on Resources
+                    try {
+                        Field riF = resClass.getDeclaredField("mResourcesImpl");
+                        riF.setAccessible(true);
+                        riF.set(resources, resImpl);
+                        log("[OK] Resources + ResourcesImpl + Configuration");
+                    } catch (Throwable t3) {
+                        log("[WARN] mResourcesImpl: " + t3.getClass().getSimpleName());
                     }
                     if (resources != null) {
                         Field resF = ctwClass.getDeclaredField("mResources");
