@@ -113,62 +113,33 @@ public class McdLoader {
                     pkgF.setAccessible(true);
                     pkgF.set(loadedApk, "com.mcdonalds.app");
                 } catch (Throwable t2) {}
-                // Set ApplicationInfo
-                try {
+                // Set ApplicationInfo — each field independently wrapped
+                {
                     Class<?> aiClass = Class.forName("android.content.pm.ApplicationInfo");
                     Object appInfo = nativeAllocInstance(aiClass);
-                    // Set fields directly using getDeclaredField on the specific class
-                    // targetSdkVersion is in ApplicationInfo directly
-                    try {
-                        Field tsvF = aiClass.getDeclaredField("targetSdkVersion");
-                        tsvF.setAccessible(true);
-                        tsvF.setInt(appInfo, 35);
-                    } catch (Throwable t3) {}
-                    // packageName is in PackageItemInfo (parent)
-                    try {
-                        Class<?> piiClass = aiClass.getSuperclass(); // PackageItemInfo
-                        if (piiClass != null) {
-                            Field pnF = piiClass.getDeclaredField("packageName");
-                            pnF.setAccessible(true);
-                            pnF.set(appInfo, "com.mcdonalds.app");
-                        }
-                    } catch (Throwable t3) {
-                        // If parent doesn't have it, search all superclasses
-                        for (Class<?> c = aiClass; c != null; c = c.getSuperclass()) {
-                            try {
-                                Field pnF = c.getDeclaredField("packageName");
-                                pnF.setAccessible(true);
-                                pnF.set(appInfo, "com.mcdonalds.app");
-                                break;
-                            } catch (Throwable t4) {}
-                        }
+                    // Set individual fields (never let one failure block others)
+                    try { Field f = aiClass.getDeclaredField("targetSdkVersion"); f.setAccessible(true); f.setInt(appInfo, 35); } catch (Throwable x) {}
+                    try { Field f = aiClass.getDeclaredField("sourceDir"); f.setAccessible(true); f.set(appInfo, "/data/local/tmp/westlake/mcd.apk"); } catch (Throwable x) {}
+                    try { Field f = aiClass.getDeclaredField("publicSourceDir"); f.setAccessible(true); f.set(appInfo, "/data/local/tmp/westlake/mcd.apk"); } catch (Throwable x) {}
+                    try { Field f = aiClass.getDeclaredField("nativeLibraryDir"); f.setAccessible(true); f.set(appInfo, "/data/local/tmp/westlake"); } catch (Throwable x) {}
+                    try { Field f = aiClass.getDeclaredField("processName"); f.setAccessible(true); f.set(appInfo, "com.mcdonalds.app"); } catch (Throwable x) {}
+                    try { Field f = aiClass.getDeclaredField("flags"); f.setAccessible(true); f.setInt(appInfo, 0x80084); } catch (Throwable x) {}
+                    // packageName in parent class hierarchy
+                    for (Class<?> c = aiClass; c != null; c = c.getSuperclass()) {
+                        try { Field f = c.getDeclaredField("packageName"); f.setAccessible(true); f.set(appInfo, "com.mcdonalds.app"); break; } catch (Throwable x) {}
                     }
-                    // name field (in PackageItemInfo)
+                    for (Class<?> c = aiClass; c != null; c = c.getSuperclass()) {
+                        try { Field f = c.getDeclaredField("name"); f.setAccessible(true); f.set(appInfo, "com.mcdonalds.app"); break; } catch (Throwable x) {}
+                    }
+                    // CRITICAL: set mApplicationInfo on LoadedApk (must not be skipped!)
                     try {
-                        Class<?> piiClass = aiClass.getSuperclass();
-                        if (piiClass != null) {
-                            Field nF = piiClass.getDeclaredField("name");
-                            nF.setAccessible(true);
-                            nF.set(appInfo, "com.mcdonalds.app");
-                        }
-                    } catch (Throwable t3) {}
-                    log("[OK] ApplicationInfo fields set");
-                    // Set sourceDir + publicSourceDir
-                    try {
-                        Field sdF = aiClass.getDeclaredField("sourceDir");
-                        sdF.setAccessible(true);
-                        sdF.set(appInfo, "/data/local/tmp/westlake/mcd.apk");
-                        Field psdF = aiClass.getDeclaredField("publicSourceDir");
-                        psdF.setAccessible(true);
-                        psdF.set(appInfo, "/data/local/tmp/westlake/mcd.apk");
-                    } catch (Throwable t3) {}
-                    // Set appInfo on LoadedApk
-                    Field aiF = loadedApkClass.getDeclaredField("mApplicationInfo");
-                    aiF.setAccessible(true);
-                    aiF.set(loadedApk, appInfo);
-                    log("[OK] ApplicationInfo set");
-                } catch (Throwable t2) {
-                    log("[WARN] ApplicationInfo: " + t2.getClass().getName());
+                        Field aiF = loadedApkClass.getDeclaredField("mApplicationInfo");
+                        aiF.setAccessible(true);
+                        aiF.set(loadedApk, appInfo);
+                        log("[OK] ApplicationInfo → LoadedApk");
+                    } catch (Throwable x) {
+                        log("[FAIL] mApplicationInfo: " + x.getClass().getName());
+                    }
                 }
                 // Set mResDir on LoadedApk
                 try {
@@ -182,6 +153,41 @@ public class McdLoader {
                     ddF.setAccessible(true);
                     ddF.set(loadedApk, "/data/local/tmp/westlake");
                 } catch (Throwable t2) {}
+                // Set mActivityThread on LoadedApk (needed for updateApplicationInfo)
+                try {
+                    Class<?> atClass = Class.forName("android.app.ActivityThread");
+                    Object actThread = nativeAllocInstance(atClass);
+                    Field atF = loadedApkClass.getDeclaredField("mActivityThread");
+                    atF.setAccessible(true);
+                    atF.set(loadedApk, actThread);
+                    // Also set currentActivityThread() singleton
+                    try {
+                        Field satF = atClass.getDeclaredField("sCurrentActivityThread");
+                        satF.setAccessible(true);
+                        satF.set(null, actThread);
+                    } catch (Throwable t3) {}
+                    // Set mMainThread on Activity too
+                    try {
+                        Class<?> actCls = Class.forName("android.app.Activity");
+                        Field mtF = actCls.getDeclaredField("mMainThread");
+                        mtF.setAccessible(true);
+                        mtF.set(splash, actThread);
+                    } catch (Throwable t3) {}
+                    log("[OK] ActivityThread set");
+                } catch (Throwable t2) {
+                    log("[WARN] ActivityThread: " + t2.getClass().getName());
+                }
+                // Set mMainThread on ContextImpl (needs ActivityThread too)
+                try {
+                    Field cmtF = ctxImpl.getDeclaredField("mMainThread");
+                    cmtF.setAccessible(true);
+                    // Reuse the ActivityThread from LoadedApk
+                    Field latF = loadedApkClass.getDeclaredField("mActivityThread");
+                    latF.setAccessible(true);
+                    Object at = latF.get(loadedApk);
+                    cmtF.set(mockContext, at);
+                } catch (Throwable t2) {}
+
                 Field piF = ctxImpl.getDeclaredField("mPackageInfo");
                 piF.setAccessible(true);
                 piF.set(mockContext, loadedApk);
