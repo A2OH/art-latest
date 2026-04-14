@@ -981,18 +981,48 @@ public class McdLoader {
                                 Class<?> dispClass = Class.forName("android.view.Display");
                                 Object display = null;
                                 try {
-                                    // DisplayManager.getDisplay(0) for default display
-                                    Class<?> dmClass = Class.forName("android.hardware.display.DisplayManagerGlobal");
-                                    Method dmGetInst = dmClass.getDeclaredMethod("getInstance");
+                                    // Get real display via DisplayManagerGlobal
+                                    Class<?> dmgClass = Class.forName("android.hardware.display.DisplayManagerGlobal");
+                                    Method dmGetInst = dmgClass.getDeclaredMethod("getInstance");
                                     dmGetInst.setAccessible(true);
                                     Object dm = dmGetInst.invoke(null);
                                     if (dm != null) {
-                                        Method getDisp = dmClass.getDeclaredMethod("getCompatibleDisplay", int.class, Class.forName("android.view.DisplayAdjustments"));
-                                        getDisp.setAccessible(true);
-                                        display = getDisp.invoke(dm, 0, (Object)null);
+                                        // Try getRealDisplay first (no adjustments needed)
+                                        try {
+                                            Method getRealDisp = dmgClass.getDeclaredMethod("getRealDisplay", int.class);
+                                            getRealDisp.setAccessible(true);
+                                            display = getRealDisp.invoke(dm, 0); // DEFAULT_DISPLAY = 0
+                                        } catch (Throwable x2) {
+                                            // Try getCompatibleDisplay with DisplayAdjustments
+                                            try {
+                                                Class<?> daClass = Class.forName("android.view.DisplayAdjustments");
+                                                Object da = nativeAllocInstance(daClass);
+                                                Method getDisp = dmgClass.getDeclaredMethod("getCompatibleDisplay", int.class, daClass);
+                                                getDisp.setAccessible(true);
+                                                display = getDisp.invoke(dm, 0, da);
+                                            } catch (Throwable x3) {}
+                                        }
                                     }
                                 } catch (Throwable x) {}
-                                if (display == null) display = nativeAllocInstance(dispClass);
+                                if (display == null) {
+                                    // Create Display with mock DisplayInfo
+                                    display = nativeAllocInstance(dispClass);
+                                    // Set mDisplayInfo with real dimensions
+                                    try {
+                                        Class<?> diClass = Class.forName("android.view.DisplayInfo");
+                                        Object di = nativeAllocInstance(diClass);
+                                        try { diClass.getDeclaredField("logicalWidth").setInt(di, 1080); } catch (Throwable x) {}
+                                        try { diClass.getDeclaredField("logicalHeight").setInt(di, 2340); } catch (Throwable x) {}
+                                        try { diClass.getDeclaredField("logicalDensityDpi").setInt(di, 420); } catch (Throwable x) {}
+                                        try { diClass.getDeclaredField("physicalXDpi").setFloat(di, 420f); } catch (Throwable x) {}
+                                        try { diClass.getDeclaredField("physicalYDpi").setFloat(di, 420f); } catch (Throwable x) {}
+                                        try { diClass.getDeclaredField("appWidth").setInt(di, 1080); } catch (Throwable x) {}
+                                        try { diClass.getDeclaredField("appHeight").setInt(di, 2340); } catch (Throwable x) {}
+                                        Field diF = dispClass.getDeclaredField("mDisplayInfo");
+                                        diF.setAccessible(true);
+                                        diF.set(display, di);
+                                    } catch (Throwable x) {}
+                                }
                                 log("[DEBUG] Display = " + (display != null ? display.getClass().getName() : "null"));
 
                                 // addView(View, LayoutParams, Display, Window, int)

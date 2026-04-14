@@ -2858,6 +2858,30 @@ static int InvokeMain(JNIEnv* env, char** argv) {
     if (env->ExceptionCheck()) env->ExceptionClear();
   }
 
+  // Patch BinderProxy.unlinkToDeath/linkToDeath → no-op (null mObituaries list)
+  {
+    jclass bpCls = env->FindClass("android/os/BinderProxy");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (bpCls) {
+      art::ScopedObjectAccess soa(art::Thread::Current());
+      art::ObjPtr<art::mirror::Class> mirror = soa.Decode<art::mirror::Class>(bpCls);
+      if (mirror != nullptr) {
+        for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
+          const char* n = m.GetName();
+          if ((strcmp(n, "unlinkToDeath") == 0 || strcmp(n, "linkToDeath") == 0) && !m.IsNative()) {
+            std::string sig = m.GetSignature().ToString();
+            m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+            if (sig.find(")Z") != std::string::npos)
+              m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_noop_return_true));
+            else
+              m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_java_lang_Throwable_printStackTrace_noop));
+          }
+        }
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
+
   // Re-register Parcel natives in final fixup — entry points were cleared
   // by VisitPackedArtMethods and @CriticalNative methods can't be resolved
   // via FindCodeForNativeMethod (JNI name lookup doesn't work for them)
