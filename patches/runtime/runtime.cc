@@ -1481,6 +1481,7 @@ bool Runtime::Start() {
           {"_ZN7android25register_android_os_DebugEP7_JNIEnv", "Debug"},
           {"_ZN7android32register_android_os_MessageQueueEP7_JNIEnv", "MessageQueue"},
           {"_ZN7android34register_android_os_ServiceManagerEP7_JNIEnv", "ServiceManager"},
+          {"_ZN7android40register_android_os_ServiceManagerNativeEP7_JNIEnv", "ServiceManagerNative"},
           {"_ZN7android37register_android_content_AssetManagerEP7_JNIEnv", "AssetManager"},
           {"_ZN7android38register_android_content_res_ApkAssetsEP7_JNIEnv", "ApkAssets"},
           {"_ZN7android36register_android_content_StringBlockEP7_JNIEnv", "StringBlock"},

@@ -470,6 +470,58 @@ static void InterpreterJni(Thread* self,
       ScopedLocalRef<jclass> klass(soa.Env(),
                                    soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
       result->SetI(fn(soa.Env(), klass.get()));
+    } else if (shorty == "VJL") {
+      // void fn(JNIEnv*, jclass, long, Object) — Parcel.nativeMarkForBinder etc.
+      using fntype = void(JNIEnv*, jclass, jlong, jobject);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jclass> klass(soa.Env(),
+                                   soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
+      jlong arg0 = *reinterpret_cast<jlong*>(&args[0]);
+      ScopedLocalRef<jobject> arg1(soa.Env(), soa.AddLocalReference<jobject>(ObjArg(args[2])));
+      fn(soa.Env(), klass.get(), arg0, arg1.get());
+    } else if (shorty == "IJL") {
+      // int fn(JNIEnv*, jclass, long, Object) — Parcel.nativeReadInt etc.
+      using fntype = jint(JNIEnv*, jclass, jlong, jobject);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jclass> klass(soa.Env(),
+                                   soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
+      jlong arg0 = *reinterpret_cast<jlong*>(&args[0]);
+      ScopedLocalRef<jobject> arg1(soa.Env(), soa.AddLocalReference<jobject>(ObjArg(args[2])));
+      result->SetI(fn(soa.Env(), klass.get(), arg0, arg1.get()));
+    } else if (shorty == "IJ") {
+      // int fn(JNIEnv*, jclass, long) — Parcel.nativeReadInt(long)
+      using fntype = jint(JNIEnv*, jclass, jlong);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jclass> klass(soa.Env(),
+                                   soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
+      jlong arg0 = *reinterpret_cast<jlong*>(&args[0]);
+      result->SetI(fn(soa.Env(), klass.get(), arg0));
+    } else if (shorty == "LJ") {
+      // Object fn(JNIEnv*, jclass, long) — Parcel.nativeReadString etc.
+      using fntype = jobject(JNIEnv*, jclass, jlong);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jclass> klass(soa.Env(),
+                                   soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
+      jlong arg0 = *reinterpret_cast<jlong*>(&args[0]);
+      ScopedLocalRef<jobject> r(soa.Env(), fn(soa.Env(), klass.get(), arg0));
+      result->SetL(soa.Decode<mirror::Object>(r.get()));
+    } else if (shorty == "VJI") {
+      // void fn(JNIEnv*, jclass, long, int) — Parcel.nativeWriteInt etc.
+      using fntype = void(JNIEnv*, jclass, jlong, jint);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jclass> klass(soa.Env(),
+                                   soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
+      jlong arg0 = *reinterpret_cast<jlong*>(&args[0]);
+      fn(soa.Env(), klass.get(), arg0, args[2]);
+    } else if (shorty == "VJJ") {
+      // void fn(JNIEnv*, jclass, long, long) — NativeAllocationRegistry.applyFreeFunction
+      using fntype = void(JNIEnv*, jclass, jlong, jlong);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jclass> klass(soa.Env(),
+                                   soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
+      jlong arg0 = *reinterpret_cast<jlong*>(&args[0]);
+      jlong arg1 = *reinterpret_cast<jlong*>(&args[2]);
+      fn(soa.Env(), klass.get(), arg0, arg1);
     } else if (shorty == "VJLZZ") {
       // void fn(JNIEnv*, jclass, long, Object[], boolean, boolean) — AssetManager.nativeSetApkAssets
       using fntype = void(JNIEnv*, jclass, jlong, jobjectArray, jboolean, jboolean);

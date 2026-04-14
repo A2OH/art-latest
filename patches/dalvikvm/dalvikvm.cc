@@ -3333,7 +3333,29 @@ static int InvokeMain(JNIEnv* env, char** argv) {
       }
     }
     if (env->ExceptionCheck()) env->ExceptionClear();
-    // Stub NativeAllocationRegistry completely (GC cleanup not needed in standalone)
+    // Patch BinderProxy$ProxyMap.get to return null (avoids null WeakReference NPE)
+  // The null comes from ProxyMap's WeakReference entries not being initialized
+  {
+    jclass pmCls = env->FindClass("android/os/BinderProxy$ProxyMap");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (pmCls) {
+      art::ScopedObjectAccess soa(art::Thread::Current());
+      art::ObjPtr<art::mirror::Class> mirror = soa.Decode<art::mirror::Class>(pmCls);
+      if (mirror != nullptr) {
+        for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
+          if (strcmp(m.GetName(), "get") == 0 && !m.IsNative()) {
+            // Return null — forces BinderProxy.getInstance to create a new proxy
+            m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+            m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_noop_return_null));
+            break;
+          }
+        }
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
+
+  // Stub NativeAllocationRegistry completely (GC cleanup not needed in standalone)
   {
     jclass narCls = env->FindClass("libcore/util/NativeAllocationRegistry");
     if (env->ExceptionCheck()) env->ExceptionClear();
@@ -3349,10 +3371,24 @@ static int InvokeMain(JNIEnv* env, char** argv) {
           if (strcmp(m.GetName(), "applyFreeFunction") == 0 && m.IsNative()) {
             m.SetEntryPointFromJni(reinterpret_cast<void*>(+noopJJ));
           }
-          // registerNativeAllocation → return null Runnable (no cleanup)
+          // registerNativeAllocation → return no-op Runnable (not null!)
           if (strcmp(m.GetName(), "registerNativeAllocation") == 0 && !m.IsNative()) {
+            // Return a Runnable that does nothing
+            static auto retNoopRunnable = +[](JNIEnv* e, jobject, jobject) -> jobject {
+              // Create a no-op Runnable via Proxy
+              // Simpler: just return the object itself (it has run() which won't be called)
+              // Actually simplest: allocate a minimal Runnable
+              jclass runnableCls = e->FindClass("java/lang/Thread");
+              if (e->ExceptionCheck()) e->ExceptionClear();
+              if (runnableCls) {
+                jobject r = e->AllocObject(runnableCls);
+                if (e->ExceptionCheck()) e->ExceptionClear();
+                return r;
+              }
+              return nullptr;
+            };
             m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
-            m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_noop_return_null));
+            m.SetEntryPointFromJni(reinterpret_cast<void*>(+retNoopRunnable));
           }
         }
       }
@@ -3373,6 +3409,57 @@ static int InvokeMain(JNIEnv* env, char** argv) {
         for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
           if (strcmp(m.GetName(), "elapsedRealtime") == 0 && m.IsNative()) {
             m.SetEntryPointFromJni(reinterpret_cast<void*>(+elapsed));
+          }
+        }
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
+
+  // FINAL: Fix AppOpsManager ThreadLocals (MUST be after all clinit tolerance)
+  {
+    jclass aomCls = env->FindClass("android/app/AppOpsManager");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (aomCls) {
+      jclass tlCls = env->FindClass("java/lang/ThreadLocal");
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      jmethodID tlInit = tlCls ? env->GetMethodID(tlCls, "<init>", "()V") : nullptr;
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      if (tlInit) {
+        // Find and set ALL ThreadLocal static fields via JNI
+        jclass clsCls = env->FindClass("java/lang/Class");
+        jmethodID getDeclF = clsCls ? env->GetMethodID(clsCls, "getDeclaredFields", "()[Ljava/lang/reflect/Field;") : nullptr;
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (getDeclF) {
+          jobjectArray fields = (jobjectArray)env->CallObjectMethod(aomCls, getDeclF);
+          if (env->ExceptionCheck()) env->ExceptionClear();
+          if (fields) {
+            jint len = env->GetArrayLength(fields);
+            for (int i = 0; i < len; i++) {
+              jobject field = env->GetObjectArrayElement(fields, i);
+              if (!field) continue;
+              jclass fieldCls = env->GetObjectClass(field);
+              jmethodID getType = env->GetMethodID(fieldCls, "getType", "()Ljava/lang/Class;");
+              jclass fType = (jclass)env->CallObjectMethod(field, getType);
+              if (env->ExceptionCheck()) env->ExceptionClear();
+              if (fType && env->IsAssignableFrom(fType, tlCls)) {
+                jmethodID setAcc = env->GetMethodID(fieldCls, "setAccessible", "(Z)V");
+                env->CallVoidMethod(field, setAcc, JNI_TRUE);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                jmethodID getF = env->GetMethodID(fieldCls, "get", "(Ljava/lang/Object;)Ljava/lang/Object;");
+                jobject val = env->CallObjectMethod(field, getF, (jobject)nullptr);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                if (!val) {
+                  jobject tl = env->NewObject(tlCls, tlInit);
+                  if (env->ExceptionCheck()) env->ExceptionClear();
+                  if (tl) {
+                    jmethodID setF = env->GetMethodID(fieldCls, "set", "(Ljava/lang/Object;Ljava/lang/Object;)V");
+                    env->CallVoidMethod(field, setF, (jobject)nullptr, tl);
+                    if (env->ExceptionCheck()) env->ExceptionClear();
+                  }
+                }
+              }
+            }
           }
         }
       }
