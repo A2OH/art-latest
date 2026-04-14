@@ -3180,6 +3180,28 @@ static int InvokeMain(JNIEnv* env, char** argv) {
     if (env->ExceptionCheck()) env->ExceptionClear();
   }
 
+  // Patch Hilt injection to skip deep DI graph (causes StackOverflow in interpreter)
+  {
+    jclass hiltCls = env->FindClass("com/mcdonalds/mcdcoreapp/common/activity/Hilt_SplashActivity");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (hiltCls) {
+      art::ScopedObjectAccess soa(art::Thread::Current());
+      art::ObjPtr<art::mirror::Class> mirror = soa.Decode<art::mirror::Class>(hiltCls);
+      if (mirror != nullptr) {
+        for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
+          if (strcmp(m.GetName(), "onCreate") == 0 && !m.IsNative()) {
+            // Skip Hilt's onCreate (triggers massive DI graph resolution)
+            m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+            m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_java_lang_Throwable_printStackTrace_noop));
+            fprintf(stderr, "[dalvikvm] Patched Hilt_SplashActivity.onCreate → no-op (skip DI)\n");
+            break;
+          }
+        }
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
+
   // Patch MCD analytics methods to no-ops (they cause NPE from null config strings)
   // PerfAnalyticsInteractor.h() and PerfAnalyticsInteractor.u() are performance tracking —
   // not needed for UI rendering. Patching them lets onCreate reach super.onCreate().

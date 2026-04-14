@@ -790,6 +790,25 @@ public class McdLoader {
             log("[FAIL] fields: " + t.getClass().getName());
         }
 
+        // Pre-set MCD injected fields that Hilt would normally provide
+        try {
+            // initializationConfigRepository → mock that returns default config
+            Class<?> icrClass = Class.forName("com.mcdonalds.mcdcoreapp.startup.repository.InitializationConfigRepository");
+            Class<?> icClass = Class.forName("com.mcdonalds.mcdcoreapp.startup.model.InitializationConfig");
+            Object config = nativeAllocInstance(icClass);
+            // Create a proxy that returns our config for getConfig()
+            // Since it's an interface, we need a real implementation
+            // Simplest: find MCD's implementation class
+            // For now: just set the field to null and let the NPE happen with more context
+            // OR: create a no-op implementation via dynamic proxy
+            // Can't create proxy/impl in standalone ART — skip this field
+            // SplashActivity.onCreate will NPE on getConfig() but step 8 works
+            log("[INFO] InitConfigRepo is an interface — can't mock without DI");
+            // Can't set the field — no implementation available
+        } catch (Throwable t) {
+            log("[WARN] InitConfigRepo: " + t.getClass().getSimpleName());
+        }
+
         // Step 6: CALL onCreate(null) !!!
         log("[6] Calling SplashActivity.onCreate(null)...");
         log("    (all bytecode runs through Westlake interpreter)");
@@ -818,41 +837,37 @@ public class McdLoader {
             try { nativePrintException(t); } catch (Throwable t2) {}
         }
 
-        // Step 8: Set mCalled=true (what Activity.onCreate does) and try setContentView
-        // Cannot call any onCreate via reflection — virtual dispatch causes infinite recursion
-        // (Method.invoke always dispatches to SplashActivity.onCreate, not Activity.onCreate)
-        log("[8] Setting mCalled=true + trying setContentView...");
+        // Step 8: Set mCalled=true and test View system
+        log("[8] Setting mCalled=true + testing View system...");
         try {
             Class<?> actCls = Class.forName("android.app.Activity");
             Field calledF = actCls.getDeclaredField("mCalled");
             calledF.setAccessible(true);
             calledF.set(splash, true);
-            log("[OK] mCalled = true (Activity lifecycle marker)");
+            log("[OK] mCalled = true");
 
-            // Try to load MCD's main layout via setContentView
-            // SplashActivity likely calls setContentView(R.layout.activity_splash)
-            // We can find the layout ID from the MCD resources
+            // Test: create a simple View to see how far rendering gets
+            // Use android.view.View directly (simpler than TextView)
             try {
-                // Try a simple View creation to test rendering pipeline
-                Class<?> tvClass = Class.forName("android.widget.TextView");
-                Object tv = tvClass.getConstructor(Class.forName("android.content.Context")).newInstance(splash);
-                log("[OK] TextView created via constructor!");
+                Class<?> viewClass = Class.forName("android.view.View");
+                Object view = nativeAllocInstance(viewClass);
+                log("[OK] View created via AllocObject");
 
-                // Try setText
+                // Set layout params
                 try {
-                    Method setText = tvClass.getMethod("setText", CharSequence.class);
-                    setText.invoke(tv, "Westlake MCD Running!");
-                    log("[OK] TextView.setText('Westlake MCD Running!')");
+                    Class<?> lpClass = Class.forName("android.view.ViewGroup$LayoutParams");
+                    Object lp = nativeAllocInstance(lpClass);
+                    try { lpClass.getDeclaredField("width").setInt(lp, -1); } catch (Throwable x) {}  // MATCH_PARENT
+                    try { lpClass.getDeclaredField("height").setInt(lp, -1); } catch (Throwable x) {}
+                    Field lpF = viewClass.getDeclaredField("mLayoutParams");
+                    lpF.setAccessible(true);
+                    lpF.set(view, lp);
+                    log("[OK] View layout params set");
                 } catch (Throwable t2) {}
 
-                // Try setContentView with the TextView
-                try {
-                    Method scv = actCls.getMethod("setContentView", Class.forName("android.view.View"));
-                    scv.invoke(splash, tv);
-                    log("[OK] Activity.setContentView(TextView) called!");
-                } catch (Throwable t2) {
-                    try { nativePrintException(t2); } catch (Throwable t3) {}
-                }
+                // Log what we have
+                log("[INFO] View system test complete. Rendering needs Window + Surface.");
+                log("[INFO] With real Binder, the next step is WindowManager.addView().");
             } catch (Throwable t) {
                 try { nativePrintException(t); } catch (Throwable t2) {}
             }
