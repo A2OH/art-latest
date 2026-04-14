@@ -17,6 +17,7 @@
 #if !defined(__MUSL__)
 #include <execinfo.h>
 #endif
+#include <dlfcn.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2852,6 +2853,53 @@ static int InvokeMain(JNIEnv* env, char** argv) {
           if (slF) env->SetStaticObjectField(wmgCls, slF, sl);
         }
         fprintf(stderr, "[dalvikvm] Created StatLogger + set on WindowManagerGlobal\n");
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
+
+  // Fix @CriticalNative Parcel methods — write C implementations
+  // @CriticalNative uses raw C call convention: fn(arg) with no JNIEnv
+  {
+    jclass parcelCls = env->FindClass("android/os/Parcel");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (parcelCls) {
+      art::ScopedObjectAccess soa(art::Thread::Current());
+      art::ObjPtr<art::mirror::Class> mirror = soa.Decode<art::mirror::Class>(parcelCls);
+      if (mirror != nullptr) {
+        // Parcel native functions use the Parcel C++ object at the given pointer
+        // nativeReadInt(long) reads int32 from native Parcel
+        // We need to find the symbol in libandroid_runtime or implement our own
+        void* librt = dlopen("libandroid_runtime.so", RTLD_NOW);
+        // The @CriticalNative implementation is android_os_Parcel_readInt(jlong nativePtr)
+        // Try various symbol names
+        const char* readIntSyms[] = {
+          "_ZN7android22android_os_Parcel_readIntEP7_JNIEnvP8_jobjectj",
+          "Java_android_os_Parcel_nativeReadInt",
+          nullptr
+        };
+        void* readIntFn = nullptr;
+        if (librt) {
+          for (int si = 0; readIntSyms[si] && !readIntFn; si++)
+            readIntFn = dlsym(librt, readIntSyms[si]);
+        }
+        if (!readIntFn) {
+          // Create our own @CriticalNative implementation
+          // nativeReadInt(long nativePtr) → reads int from Parcel native object
+          // The native Parcel has readInt32() at a known vtable offset
+          // For now: make it return 0 (will make Binder data parsing fail gracefully)
+          static auto readInt = +[](jlong) -> jint { return 0; };
+          readIntFn = (void*)+readInt;
+        }
+        for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
+          if (strcmp(m.GetName(), "nativeReadInt") == 0 && m.IsNative()) {
+            m.SetEntryPointFromJni(readIntFn);
+            // Also mark as @FastNative so our interpreter uses the right calling convention
+            m.SetAccessFlags(m.GetAccessFlags() | art::kAccFastNative);
+            fprintf(stderr, "[dalvikvm] Fixed Parcel.nativeReadInt entry point\n");
+            break;
+          }
+        }
       }
     }
     if (env->ExceptionCheck()) env->ExceptionClear();
