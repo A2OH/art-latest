@@ -89,6 +89,28 @@ public class McdLoader {
                 log("[WARN] mBasePackageName: " + t.getClass().getName());
             }
 
+            // Set mResourcesManager on ContextImpl
+            try {
+                Class<?> rmClass = Class.forName("android.app.ResourcesManager");
+                Method rmGetInst = rmClass.getDeclaredMethod("getInstance");
+                rmGetInst.setAccessible(true);
+                Object rm = rmGetInst.invoke(null);
+                if (rm == null) rm = nativeAllocInstance(rmClass);
+                // Set ALL Object fields to new Object() (lock fields etc.)
+                for (Field f : rmClass.getDeclaredFields()) {
+                    try {
+                        f.setAccessible(true);
+                        if (f.getType() == Object.class && f.get(rm) == null) {
+                            f.set(rm, new Object());
+                        }
+                    } catch (Throwable x) {}
+                }
+                Field rmF = ctxImpl.getDeclaredField("mResourcesManager");
+                rmF.setAccessible(true);
+                rmF.set(mockContext, rm);
+                log("[OK] ResourcesManager set");
+            } catch (Throwable t) {}
+
             // Set mContextType = CONTEXT_TYPE_ACTIVITY (not system context!)
             try {
                 // CONTEXT_TYPE_ACTIVITY is typically 1
@@ -865,9 +887,108 @@ public class McdLoader {
                     log("[OK] View layout params set");
                 } catch (Throwable t2) {}
 
-                // Log what we have
-                log("[INFO] View system test complete. Rendering needs Window + Surface.");
-                log("[INFO] With real Binder, the next step is WindowManager.addView().");
+                // Try to add the View to the screen via WindowManager!
+                log("[9] Attempting WindowManager.addView()...");
+                try {
+                    // Get WindowManager via Context.getSystemService
+                    Class<?> ctxClass = Class.forName("android.content.Context");
+                    Method getService = ctxClass.getMethod("getSystemService", String.class);
+                    Object wm = getService.invoke(splash, "window");
+                    log("[DEBUG] WindowManager = " + (wm != null ? wm.getClass().getName() : "null"));
+
+                    if (wm == null) {
+                        // Create WindowManagerImpl directly
+                        try {
+                            Class<?> wmiClass = Class.forName("android.view.WindowManagerImpl");
+                            wm = nativeAllocInstance(wmiClass);
+                            // Set mContext to our Activity
+                            try { Field cf = wmiClass.getDeclaredField("mContext"); cf.setAccessible(true);
+                                  cf.set(wm, splash); } catch (Throwable x) {}
+                            // Set mParentWindow
+                            try { Field pwF = wmiClass.getDeclaredField("mParentWindow"); pwF.setAccessible(true);
+                                  Field wF = Class.forName("android.app.Activity").getDeclaredField("mWindow"); wF.setAccessible(true);
+                                  pwF.set(wm, wF.get(splash)); } catch (Throwable x) {}
+                            // Set the WindowManagerGlobal singleton
+                            try {
+                                Class<?> wmgClass = Class.forName("android.view.WindowManagerGlobal");
+                                Method getInstance = wmgClass.getDeclaredMethod("getInstance");
+                                getInstance.setAccessible(true);
+                                Object wmg = getInstance.invoke(null);
+                                if (wmg != null) {
+                                    Field gF = wmiClass.getDeclaredField("mGlobal");
+                                    gF.setAccessible(true);
+                                    gF.set(wm, wmg);
+                                    log("[OK] WindowManagerImpl set (context+global)");
+                                }
+                            } catch (Throwable x) {}
+                            // Also set on Activity.mWindowManager
+                            try { Field wmF = Class.forName("android.app.Activity").getDeclaredField("mWindowManager"); wmF.setAccessible(true);
+                                  wmF.set(splash, wm); } catch (Throwable x) {}
+                        } catch (Throwable x) {}
+                    }
+
+                    if (wm != null) {
+                        log("[OK] WindowManager = " + wm.getClass().getName());
+                        // Create WindowManager.LayoutParams
+                        Class<?> wmlpClass = Class.forName("android.view.WindowManager$LayoutParams");
+                        Object wmLp = nativeAllocInstance(wmlpClass);
+                        try { wmlpClass.getDeclaredField("width").setInt(wmLp, 300); } catch (Throwable x) {}
+                        try { wmlpClass.getDeclaredField("height").setInt(wmLp, 200); } catch (Throwable x) {}
+                        try { wmlpClass.getDeclaredField("type").setInt(wmLp, 2038); } catch (Throwable x) {} // OVERLAY
+                        try { wmlpClass.getDeclaredField("flags").setInt(wmLp, 8 | 256); } catch (Throwable x) {} // NOT_FOCUSABLE | NOT_TOUCH_MODAL
+                        try { wmlpClass.getDeclaredField("format").setInt(wmLp, -3); } catch (Throwable x) {} // TRANSLUCENT
+                        try { wmlpClass.getDeclaredField("gravity").setInt(wmLp, 48 | 3); } catch (Throwable x) {} // TOP|LEFT
+                        try { wmlpClass.getDeclaredField("x").setInt(wmLp, 100); } catch (Throwable x) {}
+                        try { wmlpClass.getDeclaredField("y").setInt(wmLp, 100); } catch (Throwable x) {}
+                        try {
+                            Method setTitle = wmlpClass.getMethod("setTitle", CharSequence.class);
+                            setTitle.invoke(wmLp, "WestlakeMCD");
+                        } catch (Throwable x) {}
+
+                        // Call WindowManagerGlobal.addView directly
+                        try {
+                            Class<?> wmgClass = Class.forName("android.view.WindowManagerGlobal");
+                            Method getInstance = wmgClass.getDeclaredMethod("getInstance");
+                            getInstance.setAccessible(true);
+                            Object wmg = getInstance.invoke(null);
+                            if (wmg != null) {
+                                // Get the default Display
+                                Class<?> dispClass = Class.forName("android.view.Display");
+                                Object display = null;
+                                try {
+                                    // DisplayManager.getDisplay(0) for default display
+                                    Class<?> dmClass = Class.forName("android.hardware.display.DisplayManagerGlobal");
+                                    Method dmGetInst = dmClass.getDeclaredMethod("getInstance");
+                                    dmGetInst.setAccessible(true);
+                                    Object dm = dmGetInst.invoke(null);
+                                    if (dm != null) {
+                                        Method getDisp = dmClass.getDeclaredMethod("getCompatibleDisplay", int.class, Class.forName("android.view.DisplayAdjustments"));
+                                        getDisp.setAccessible(true);
+                                        display = getDisp.invoke(dm, 0, (Object)null);
+                                    }
+                                } catch (Throwable x) {}
+                                if (display == null) display = nativeAllocInstance(dispClass);
+                                log("[DEBUG] Display = " + (display != null ? display.getClass().getName() : "null"));
+
+                                // addView(View, LayoutParams, Display, Window, int)
+                                Method addView = wmgClass.getDeclaredMethod("addView",
+                                    Class.forName("android.view.View"),
+                                    Class.forName("android.view.ViewGroup$LayoutParams"),
+                                    dispClass,
+                                    Class.forName("android.view.Window"),
+                                    int.class);
+                                addView.setAccessible(true);
+                                addView.invoke(wmg, view, wmLp, display, null, 0);
+                                log("[OK] WindowManagerGlobal.addView() CALLED — VIEW ADDED!!!");
+                            }
+                        } catch (Throwable t2) {
+                            log("[WARN] addView: " + t2.getClass().getSimpleName());
+                            try { nativePrintException(t2); } catch (Throwable t3) {}
+                        }
+                    }
+                } catch (Throwable t) {
+                    try { nativePrintException(t); } catch (Throwable t2) {}
+                }
             } catch (Throwable t) {
                 try { nativePrintException(t); } catch (Throwable t2) {}
             }
