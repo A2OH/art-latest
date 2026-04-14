@@ -1004,25 +1004,41 @@ public class McdLoader {
                                         }
                                     }
                                 } catch (Throwable x) {}
-                                if (display == null) {
-                                    // Create Display with mock DisplayInfo
-                                    display = nativeAllocInstance(dispClass);
-                                    // Set mDisplayInfo with real dimensions
+                                // Ensure Display has valid DisplayInfo (whether from getRealDisplay or mock)
+                                if (display == null) display = nativeAllocInstance(dispClass);
+                                try {
+                                    Class<?> diClass = Class.forName("android.view.DisplayInfo");
+                                    Field diF = dispClass.getDeclaredField("mDisplayInfo");
+                                    diF.setAccessible(true);
+                                    Object di = diF.get(display);
+                                    if (di == null) di = nativeAllocInstance(diClass);
+                                    // Set real display dimensions (from phone: 1080x2280, density 450)
+                                    try { diClass.getDeclaredField("logicalWidth").setInt(di, 1080); } catch (Throwable x) {}
+                                    try { diClass.getDeclaredField("logicalHeight").setInt(di, 2280); } catch (Throwable x) {}
+                                    try { diClass.getDeclaredField("logicalDensityDpi").setInt(di, 450); } catch (Throwable x) {}
+                                    try { diClass.getDeclaredField("physicalXDpi").setFloat(di, 403f); } catch (Throwable x) {}
+                                    try { diClass.getDeclaredField("physicalYDpi").setFloat(di, 399f); } catch (Throwable x) {}
+                                    try { diClass.getDeclaredField("appWidth").setInt(di, 1080); } catch (Throwable x) {}
+                                    try { diClass.getDeclaredField("appHeight").setInt(di, 2280); } catch (Throwable x) {}
+                                    try { diClass.getDeclaredField("modeId").setInt(di, 1); } catch (Throwable x) {}
+                                    try { diClass.getDeclaredField("defaultModeId").setInt(di, 1); } catch (Throwable x) {}
+                                    try { diClass.getDeclaredField("renderFrameRate").setFloat(di, 60f); } catch (Throwable x) {}
+                                    // Create Display.Mode array with one valid mode
                                     try {
-                                        Class<?> diClass = Class.forName("android.view.DisplayInfo");
-                                        Object di = nativeAllocInstance(diClass);
-                                        try { diClass.getDeclaredField("logicalWidth").setInt(di, 1080); } catch (Throwable x) {}
-                                        try { diClass.getDeclaredField("logicalHeight").setInt(di, 2340); } catch (Throwable x) {}
-                                        try { diClass.getDeclaredField("logicalDensityDpi").setInt(di, 420); } catch (Throwable x) {}
-                                        try { diClass.getDeclaredField("physicalXDpi").setFloat(di, 420f); } catch (Throwable x) {}
-                                        try { diClass.getDeclaredField("physicalYDpi").setFloat(di, 420f); } catch (Throwable x) {}
-                                        try { diClass.getDeclaredField("appWidth").setInt(di, 1080); } catch (Throwable x) {}
-                                        try { diClass.getDeclaredField("appHeight").setInt(di, 2340); } catch (Throwable x) {}
-                                        Field diF = dispClass.getDeclaredField("mDisplayInfo");
-                                        diF.setAccessible(true);
-                                        diF.set(display, di);
+                                        Class<?> modeClass = Class.forName("android.view.Display$Mode");
+                                        Object mode = nativeAllocInstance(modeClass);
+                                        try { modeClass.getDeclaredField("mModeId").setInt(mode, 1); } catch (Throwable x) {}
+                                        try { modeClass.getDeclaredField("mWidth").setInt(mode, 1080); } catch (Throwable x) {}
+                                        try { modeClass.getDeclaredField("mHeight").setInt(mode, 2280); } catch (Throwable x) {}
+                                        try { modeClass.getDeclaredField("mRefreshRate").setFloat(mode, 60f); } catch (Throwable x) {}
+                                        Object modeArr = java.lang.reflect.Array.newInstance(modeClass, 1);
+                                        java.lang.reflect.Array.set(modeArr, 0, mode);
+                                        try { diClass.getDeclaredField("supportedModes").set(di, modeArr); } catch (Throwable x) {}
+                                        try { diClass.getDeclaredField("appsSupportedModes").set(di, modeArr); } catch (Throwable x) {}
                                     } catch (Throwable x) {}
-                                }
+                                    diF.set(display, di);
+                                    log("[OK] Display: 1080x2280 @450dpi");
+                                } catch (Throwable x) {}
                                 log("[DEBUG] Display = " + (display != null ? display.getClass().getName() : "null"));
 
                                 // addView(View, LayoutParams, Display, Window, int)
