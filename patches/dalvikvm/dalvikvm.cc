@@ -2601,6 +2601,50 @@ static int InvokeMain(JNIEnv* env, char** argv) {
     }
   }
 
+  // FINAL FIXUP: re-set ConcurrentHashMap.U right before main()
+  // Earlier setting might have been overwritten by class loading/init during pre-init phase.
+  {
+    jclass chmCls = env->FindClass("java/util/concurrent/ConcurrentHashMap");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    jclass unsafeCls = env->FindClass("jdk/internal/misc/Unsafe");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (chmCls && unsafeCls) {
+      jfieldID uField = env->GetStaticFieldID(chmCls, "U", "Ljdk/internal/misc/Unsafe;");
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      jfieldID theUnsafeF = env->GetStaticFieldID(unsafeCls, "theUnsafe", "Ljdk/internal/misc/Unsafe;");
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      jobject u = theUnsafeF ? env->GetStaticObjectField(unsafeCls, theUnsafeF) : nullptr;
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      if (!u) {
+        u = env->AllocObject(unsafeCls);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (u && theUnsafeF) env->SetStaticObjectField(unsafeCls, theUnsafeF, u);
+      }
+      if (uField && u) {
+        env->SetStaticObjectField(chmCls, uField, u);
+        // Also re-set field offsets
+        jmethodID ofo = env->GetMethodID(unsafeCls, "objectFieldOffset",
+            "(Ljava/lang/Class;Ljava/lang/String;)J");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (ofo) {
+          auto setOff = [&](const char* name, const char* sname) {
+            jlong off = env->CallLongMethod(u, ofo, chmCls, env->NewStringUTF(name));
+            if (env->ExceptionCheck()) { env->ExceptionClear(); return; }
+            jfieldID sf = env->GetStaticFieldID(chmCls, sname, "J");
+            if (env->ExceptionCheck()) { env->ExceptionClear(); return; }
+            if (sf) env->SetStaticLongField(chmCls, sf, off);
+          };
+          setOff("sizeCtl", "SIZECTL");
+          setOff("transferIndex", "TRANSFERINDEX");
+          setOff("baseCount", "BASECOUNT");
+          setOff("cellsBusy", "CELLSBUSY");
+        }
+        fprintf(stderr, "[dalvikvm] Final fixup: ConcurrentHashMap.U re-set\n");
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
+
   fprintf(stderr, "[dalvikvm] Calling main()...\n");
   fflush(stderr);
   struct timespec ts_start, ts_end;

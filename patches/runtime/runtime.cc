@@ -23,6 +23,7 @@
 #include <sys/prctl.h>
 #endif
 
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/mount.h>
@@ -1347,6 +1348,95 @@ bool Runtime::Start() {
   class_linker_->RunEarlyRootClinits(self);
   fprintf(stderr, "[RT] RunEarlyRootClinits done\n"); fflush(stderr);
   if (self->IsExceptionPending()) self->ClearException();
+
+  // CRITICAL: Fix ConcurrentHashMap.U IMMEDIATELY after boot image clinits.
+  // Must happen before ANY class loading that might create ConcurrentHashMaps.
+  {
+    ScopedObjectAccess soa(self);
+    ObjPtr<mirror::Class> unsafe_class = class_linker_->FindSystemClass(self, "Ljdk/internal/misc/Unsafe;");
+    if (self->IsExceptionPending()) self->ClearException();
+    ObjPtr<mirror::Class> chm_class = class_linker_->FindSystemClass(self, "Ljava/util/concurrent/ConcurrentHashMap;");
+    if (self->IsExceptionPending()) self->ClearException();
+    if (unsafe_class != nullptr && chm_class != nullptr) {
+      // Find Unsafe.theUnsafe field
+      ArtField* theUnsafeField = nullptr;
+      for (uint32_t i = 0; i < unsafe_class->NumStaticFields(); i++) {
+        ArtField* f = unsafe_class->GetStaticField(i);
+        if (strcmp(f->GetName(), "theUnsafe") == 0) { theUnsafeField = f; break; }
+      }
+      // Find ConcurrentHashMap.U field
+      ArtField* uField = nullptr;
+      for (uint32_t i = 0; i < chm_class->NumStaticFields(); i++) {
+        ArtField* f = chm_class->GetStaticField(i);
+        if (strcmp(f->GetName(), "U") == 0) { uField = f; break; }
+      }
+      if (theUnsafeField && uField) {
+        ObjPtr<mirror::Object> unsafeObj = theUnsafeField->GetObject(unsafe_class);
+        if (unsafeObj == nullptr) {
+          // Create an Unsafe instance
+          StackHandleScope<1> hs(self);
+          Handle<mirror::Class> h_unsafe = hs.NewHandle(unsafe_class);
+          unsafeObj = h_unsafe->AllocObject(self);
+          if (self->IsExceptionPending()) self->ClearException();
+          if (unsafeObj != nullptr) {
+            theUnsafeField->SetObject<false>(unsafe_class, unsafeObj);
+            fprintf(stderr, "[RT] Created Unsafe.theUnsafe (early)\n");
+          }
+        }
+        if (unsafeObj != nullptr) {
+          uField->SetObject<false>(chm_class, unsafeObj);
+          fprintf(stderr, "[RT] Set ConcurrentHashMap.U (EARLY, before any class loading)\n");
+          fflush(stderr);
+          // Also set field offsets
+          ArtField* fields[] = {nullptr, nullptr, nullptr, nullptr};
+          const char* names[] = {"SIZECTL", "TRANSFERINDEX", "BASECOUNT", "CELLSBUSY"};
+          const char* inames[] = {"sizeCtl", "transferIndex", "baseCount", "cellsBusy"};
+          for (uint32_t i = 0; i < chm_class->NumStaticFields(); i++) {
+            ArtField* f = chm_class->GetStaticField(i);
+            for (int j = 0; j < 4; j++) {
+              if (strcmp(f->GetName(), names[j]) == 0) fields[j] = f;
+            }
+          }
+          for (int j = 0; j < 4; j++) {
+            if (fields[j]) {
+              // Find instance field offset
+              for (uint32_t i = 0; i < chm_class->NumInstanceFields(); i++) {
+                ArtField* f = chm_class->GetInstanceField(i);
+                if (strcmp(f->GetName(), inames[j]) == 0) {
+                  fields[j]->SetLong<false>(chm_class, f->GetOffset().SizeValue());
+                  break;
+                }
+              }
+            }
+          }
+          // CRITICAL: Also set ABASE and ASHIFT for Node[] array element access
+          {
+            ArtField* abaseF = nullptr;
+            ArtField* ashiftF = nullptr;
+            for (uint32_t i = 0; i < chm_class->NumStaticFields(); i++) {
+              ArtField* f = chm_class->GetStaticField(i);
+              if (strcmp(f->GetName(), "ABASE") == 0) abaseF = f;
+              if (strcmp(f->GetName(), "ASHIFT") == 0) ashiftF = f;
+            }
+            if (abaseF && ashiftF) {
+              // ABASE = Object array data offset (typically 12 on 32-bit refs, 16 on 64-bit)
+              int32_t abase = mirror::Array::DataOffset(
+                  sizeof(mirror::HeapReference<mirror::Object>)).Int32Value();
+              // ASHIFT = log2 of reference size
+              int32_t scale = sizeof(mirror::HeapReference<mirror::Object>);
+              int32_t ashift = 0;
+              while ((1 << ashift) < scale) ashift++;
+              abaseF->SetInt<false>(chm_class, abase);
+              ashiftF->SetInt<false>(chm_class, ashift);
+              fprintf(stderr, "[RT] Set ConcurrentHashMap ABASE=%d ASHIFT=%d\n", abase, ashift);
+            }
+          }
+        }
+      }
+    }
+    if (self->IsExceptionPending()) self->ClearException();
+  }
+
   fprintf(stderr, "[RT] InitializeIntrinsics entering\n"); fflush(stderr);
   InitializeIntrinsics();
   fprintf(stderr, "[RT] InitializeIntrinsics done\n"); fflush(stderr);
@@ -1393,6 +1483,69 @@ bool Runtime::Start() {
     jni_env->PopLocalFrame(nullptr);
     if (self->IsExceptionPending()) self->ClearException();
     jni_env->DeleteGlobalRef(java_lang_Object);
+
+    // DYNAMIC MODE: dlopen libandroid_runtime.so to get REAL Binder/Parcel/Surface natives.
+    // This replaces our no-op stubs with the phone's actual implementations,
+    // giving framework.jar full access to system services via Binder IPC.
+    {
+      void* librt = dlopen("libandroid_runtime.so", RTLD_NOW | RTLD_GLOBAL);
+      if (librt) {
+        fprintf(stderr, "[RT] dlopen(libandroid_runtime.so) = %p\n", librt); fflush(stderr);
+
+        // Registration function type: int register_xxx(JNIEnv*)
+        typedef int (*RegFn)(JNIEnv*);
+
+        // Critical: Binder + Parcel (needed for ALL system service communication)
+        struct { const char* sym; const char* name; } regs[] = {
+          {"_Z26register_android_os_BinderP7_JNIEnv", "android.os.Binder"},
+          {"_ZN7android26register_android_os_ParcelEP7_JNIEnv", "android.os.Parcel"},
+          {"_ZN7android36register_android_os_SystemPropertiesEP7_JNIEnv", "android.os.SystemProperties"},
+          {"_ZN7android31register_android_os_SystemClockEP7_JNIEnv", "android.os.SystemClock"},
+          {"_Z27register_android_os_ProcessP7_JNIEnv", "android.os.Process"},
+          // MessageQueue for Looper (Handler/message dispatch)
+          {"_ZN7android35register_android_os_MessageQueueImplEP7_JNIEnv", "android.os.MessageQueue"},
+          // HardwareRenderer / Canvas / Surface for rendering
+          {"_ZN7android45register_android_graphics_HardwareRendererObserverEP7_JNIEnv", "HardwareRendererObserver"},
+          {"_ZN7android30register_android_view_SurfaceEP7_JNIEnv", "android.view.Surface"},
+          {"_ZN7android37register_android_view_SurfaceControlEP7_JNIEnv", "SurfaceControl"},
+          {"_ZN7android35register_android_view_SurfaceSessionEP7_JNIEnv", "SurfaceSession"},
+          {"_ZN7android33register_android_view_InputDeviceEP7_JNIEnv", "InputDevice"},
+          {"_ZN7android34register_android_view_InputChannelEP7_JNIEnv", "InputChannel"},
+          // Graphics
+          {"_ZN7android31register_android_graphics_PathEP7_JNIEnv", "graphics.Path"},
+          // ActivityManager for process management
+          {"_ZN7android37register_android_app_ActivityManagerEP7_JNIEnv", "ActivityManager"},
+          {nullptr, nullptr}
+        };
+        int registered = 0, failed = 0;
+        for (int i = 0; regs[i].sym; i++) {
+          RegFn fn = (RegFn)dlsym(librt, regs[i].sym);
+          if (fn) {
+            jni_env->PushLocalFrame(128);
+            int rc = fn(jni_env);
+            jni_env->PopLocalFrame(nullptr);
+            if (self->IsExceptionPending()) self->ClearException();
+            if (rc == 0) {
+              registered++;
+            } else {
+              fprintf(stderr, "[RT]   WARN: %s register returned %d\n", regs[i].name, rc);
+              failed++;
+            }
+          } else {
+            // Symbol not found — skip silently (different Android versions have different symbols)
+            failed++;
+          }
+        }
+        fprintf(stderr, "[RT] libandroid_runtime: %d/%d JNI registrations OK\n",
+                registered, registered + failed);
+        fflush(stderr);
+      } else {
+        fprintf(stderr, "[RT] dlopen(libandroid_runtime.so) failed: %s\n", dlerror());
+        fprintf(stderr, "[RT]   (expected in static builds — using stubs)\n");
+        fflush(stderr);
+      }
+    }
+
     // WellKnownClasses::LateInit may also crash -- skip for standalone
     fprintf(stderr, "[RT]   Skipping WellKnownClasses::LateInit\n"); fflush(stderr);
   }
