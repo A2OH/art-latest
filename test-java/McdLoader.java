@@ -357,6 +357,46 @@ public class McdLoader {
                 log("[OK] ComponentActivity fields set");
             } catch (Throwable t) {}
 
+            // FragmentController (needed for Activity.performCreate → dispatchCreate)
+            try {
+                Class<?> fcClass = Class.forName("android.app.FragmentController");
+                Object fc = nativeAllocInstance(fcClass);
+                // Set mHost on FragmentController
+                try {
+                    Class<?> fhcClass = Class.forName("android.app.FragmentHostCallback");
+                    // Activity has mFragments field
+                    Field fragF = actClass.getDeclaredField("mFragments");
+                    fragF.setAccessible(true);
+                    fragF.set(splash, fc);
+                    // FragmentController needs a FragmentManagerImpl
+                    try {
+                        Class<?> fmiClass = Class.forName("android.app.FragmentManagerImpl");
+                        Object fmi = nativeAllocInstance(fmiClass);
+                        // Set critical fields on FragmentManagerImpl
+                        try { Field pf = fmiClass.getDeclaredField("mPendingActions"); pf.setAccessible(true);
+                              pf.set(fmi, new java.util.ArrayList<>()); } catch (Throwable x2) {}
+                        try { Field af = fmiClass.getDeclaredField("mAdded"); af.setAccessible(true);
+                              af.set(fmi, new java.util.ArrayList<>()); } catch (Throwable x2) {}
+                        try { Field af = fmiClass.getDeclaredField("mActive"); af.setAccessible(true);
+                              af.set(fmi, nativeAllocInstance(Class.forName("android.util.SparseArray"))); } catch (Throwable x2) {
+                            // mActive might be a List in some versions
+                            try { Field af2 = fmiClass.getDeclaredField("mActive"); af2.setAccessible(true);
+                                  af2.set(fmi, new java.util.ArrayList<>()); } catch (Throwable x3) {}
+                        }
+                        // mHost is a FragmentHostCallback
+                        Object fhc = nativeAllocInstance(fhcClass);
+                        // Set FragmentManager on host
+                        try { Field fmOnHost = fhcClass.getDeclaredField("mFragmentManager");
+                              fmOnHost.setAccessible(true); fmOnHost.set(fhc, fmi); } catch (Throwable x2) {}
+                        // Set host on controller
+                        Field fmF = fcClass.getDeclaredField("mHost");
+                        fmF.setAccessible(true);
+                        fmF.set(fc, fhc);
+                    } catch (Throwable x) {}
+                    log("[OK] FragmentController set");
+                } catch (Throwable x) {}
+            } catch (Throwable t) {}
+
             // mActivityLifecycleCallbacks (needed for dispatchActivityPreCreated)
             try {
                 Field alcF = actClass.getDeclaredField("mActivityLifecycleCallbacks");
