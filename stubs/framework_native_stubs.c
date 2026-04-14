@@ -386,3 +386,6 @@ jint JNI_OnLoad_framework(void* vm, void* reserved) {
     fprintf(stderr, "[fw_stubs] Framework native stubs registered\n");
     return JNI_VERSION_1_6;
 }
+
+/* DEBUG: Check GetShorty for boot image methods */
+/* Called from JNI_OnLoad_framework to diagnose shorty bug */

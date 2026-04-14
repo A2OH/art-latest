@@ -1259,30 +1259,32 @@ static int InvokeMain(JNIEnv* env, char** argv) {
             // to bypass FloatingDecimal which uses arrays that can't be allocated.
             auto patchToNative = [&](const char* classDesc, const char* methodName,
                                      const char* shorty, void* nativeFunc) {
-              art::ObjPtr<art::mirror::Class> cls =
-                  art::Runtime::Current()->GetClassLinker()->FindSystemClass(soa.Self(), classDesc);
+              fprintf(stderr, "[dalvikvm] patchToNative: looking for %s.%s\n", classDesc, methodName); fflush(stderr);
+              art::StackHandleScope<1> hs(soa.Self());
+              art::Handle<art::mirror::Class> cls = hs.NewHandle(
+                  art::Runtime::Current()->GetClassLinker()->FindSystemClass(soa.Self(), classDesc));
               if (cls == nullptr) {
                 if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
                 fprintf(stderr, "[dalvikvm] DBG: class %s not found\n", classDesc);
               }
               if (cls != nullptr) {
+                // Prevent GC during method iteration (ArtMethod pointers are raw)
+                const char* old_cause = soa.Self()->StartAssertNoThreadSuspension("patchToNative");
                 int total = 0, matched = 0;
-                for (art::ArtMethod& m : cls->GetDeclaredMethods(art::kRuntimePointerSize)) {
+                auto methods = cls->GetDeclaredMethods(art::kRuntimePointerSize);
+                // Match by name only — GetShorty crashes due to GC moving DexCache
+                art::ArtMethod* found = nullptr;
+                for (art::ArtMethod& m : methods) {
                   total++;
-                  if (strcmp(m.GetName(), methodName) == 0) {
-                    matched++;
-                    fprintf(stderr, "[dalvikvm] DBG: %s.%s shorty=%s sig=%s (want %s) native=%d\n",
-                            classDesc, methodName, m.GetShorty(),
-                            m.GetSignature().ToString().c_str(), shorty, m.IsNative());
+                  if (strcmp(m.GetName(), methodName) == 0 && !m.IsNative()) {
+                    found = &m; matched++; break;
                   }
-                  if (strcmp(m.GetName(), methodName) == 0 &&
-                      strcmp(m.GetShorty(), shorty) == 0 && !m.IsNative()) {
-                    m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
-                    m.SetEntryPointFromJni(nativeFunc);
-                    // Interpreter handles native methods via JNI entry point directly.
-                    fprintf(stderr, "[dalvikvm] Patched %s.%s to native\n", classDesc, methodName);
-                    break;
-                  }
+                }
+                soa.Self()->EndAssertNoThreadSuspension(old_cause);
+                if (found) {
+                  found->SetAccessFlags(found->GetAccessFlags() | art::kAccNative);
+                  found->SetEntryPointFromJni(nativeFunc);
+                  fprintf(stderr, "[dalvikvm] Patched %s.%s → native\n", classDesc, methodName);
                 }
                 if (matched == 0) {
                   fprintf(stderr, "[dalvikvm] DBG: %s.%s NOT FOUND (%d total methods)\n",
@@ -1291,6 +1293,7 @@ static int InvokeMain(JNIEnv* env, char** argv) {
               }
               if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
             };
+            fprintf(stderr, "[dalvikvm] About to call patchToNative for Float.toString...\n"); fflush(stderr);
             patchToNative("Ljava/lang/Float;", "toString", "LF",
                 (void*)Java_java_lang_Float_toStringImpl);
             patchToNative("Ljava/lang/Double;", "toString", "LD",
@@ -1299,19 +1302,24 @@ static int InvokeMain(JNIEnv* env, char** argv) {
             // that causes StackOverflow during Build.<clinit>.
             auto patchToNativeBySig = [&](const char* classDesc, const char* methodName,
                                           const char* sig, void* nativeFunc) {
-              art::ObjPtr<art::mirror::Class> cls =
-                  art::Runtime::Current()->GetClassLinker()->FindSystemClass(soa.Self(), classDesc);
+              art::StackHandleScope<1> hs2(soa.Self());
+              art::Handle<art::mirror::Class> cls2 = hs2.NewHandle(
+                  art::Runtime::Current()->GetClassLinker()->FindSystemClass(soa.Self(), classDesc));
               if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
-              if (cls != nullptr) {
-                for (art::ArtMethod& m : cls->GetDeclaredMethods(art::kRuntimePointerSize)) {
+              if (cls2 != nullptr) {
+                const char* oc = soa.Self()->StartAssertNoThreadSuspension("patchBySig");
+                for (art::ArtMethod& m : cls2->GetDeclaredMethods(art::kRuntimePointerSize)) {
                   if (strcmp(m.GetName(), methodName) == 0 &&
                       m.GetSignature().ToString() == sig && !m.IsNative()) {
                     m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
                     m.SetEntryPointFromJni(nativeFunc);
+                    soa.Self()->EndAssertNoThreadSuspension(oc);
                     fprintf(stderr, "[dalvikvm] Patched %s.%s → native\n", classDesc, methodName);
+                    oc = nullptr;
                     break;
                   }
                 }
+                if (oc) soa.Self()->EndAssertNoThreadSuspension(oc);
               }
               if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
             };
@@ -1323,8 +1331,12 @@ static int InvokeMain(JNIEnv* env, char** argv) {
                 "()Ljava/util/List;", (void*)TelephonyProperties_baseband_version);
 
             // Stub LocaleUtils.toLowerString — returns input unchanged
-            static auto toLowerStub = +[](JNIEnv* env, jclass, jstring s) -> jstring { return s; };
+            static auto toLowerStub = +[](JNIEnv* env, jclass, jstring s) -> jstring {
+              return s ? s : env->NewStringUTF("");
+            };
             patchToNativeBySig("Lsun/util/locale/LocaleUtils;", "toLowerString",
+                "(Ljava/lang/String;)Ljava/lang/String;", (void*)+toLowerStub);
+            patchToNativeBySig("Lsun/util/locale/LocaleUtils;", "toUpperString",
                 "(Ljava/lang/String;)Ljava/lang/String;", (void*)+toLowerStub);
 
             // Replace TextUtils.formatSimple with String.format delegation.
