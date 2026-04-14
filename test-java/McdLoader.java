@@ -387,14 +387,117 @@ public class McdLoader {
                         Field cfF = resImplClass.getDeclaredField("mConfiguration");
                         cfF.setAccessible(true);
                         cfF.set(resImpl, config);
-                    // Set AssetManager — natives registered EARLY from libandroid_runtime
+                    // Set AssetManager — try getSystem() first (has framework resources),
+                    // fallback to AllocObject (no resources but won't crash)
                     try {
                         Class<?> amClass = Class.forName("android.content.res.AssetManager");
-                        Object assetMgr = nativeAllocInstance(amClass);
+                        Object assetMgr = null;
+                        // Create native AssetManager via nativeCreate + load framework resources
+                        try {
+                            // Call AssetManager() constructor which calls nativeCreate internally
+                            Constructor<?> amCtor = amClass.getDeclaredConstructor();
+                            amCtor.setAccessible(true);
+                            assetMgr = amCtor.newInstance();
+                            if (assetMgr != null) {
+                                log("[OK] AssetManager() constructor → real native AM!");
+                                // Try adding framework resources path
+                                try {
+                                    Method addPath = amClass.getDeclaredMethod("addAssetPath", String.class);
+                                    addPath.setAccessible(true);
+                                    addPath.invoke(assetMgr, "/system/framework/framework-res.apk");
+                                    log("[OK] addAssetPath(framework-res.apk)");
+                                } catch (Throwable t5) {
+                                    log("[WARN] framework-res: " + t5.getClass().getSimpleName());
+                                }
+                                // Try adding MCD APK
+                                try {
+                                    Method addPath = amClass.getDeclaredMethod("addAssetPath", String.class);
+                                    addPath.setAccessible(true);
+                                    addPath.invoke(assetMgr, "/data/local/tmp/westlake/mcd.apk");
+                                    log("[OK] addAssetPath(mcd.apk)");
+                                } catch (Throwable t5) {}
+                            }
+                        } catch (Throwable t5) {
+                            // Get inner exception
+                            Throwable cause = t5;
+                            while (cause.getCause() != null) cause = cause.getCause();
+                            try { nativePrintException(t5); } catch (Throwable x) {}
+                            // Fallback: try nativeCreate directly on AllocObject instance
+                            try {
+                                assetMgr = nativeAllocInstance(amClass);
+                                Method nc = amClass.getDeclaredMethod("nativeCreate");
+                                nc.setAccessible(true);
+                                long ptr = (Long) nc.invoke(null);
+                                if (ptr != 0) {
+                                    Field moF = amClass.getDeclaredField("mObject");
+                                    moF.setAccessible(true);
+                                    moF.setLong(assetMgr, ptr);
+                                    log("[OK] nativeCreate() → ptr=" + ptr);
+                                    // Initialize internal lists that the Java wrapper needs
+                                    try {
+                                        Field oaF = amClass.getDeclaredField("mApkAssets");
+                                        oaF.setAccessible(true);
+                                        oaF.set(assetMgr, java.lang.reflect.Array.newInstance(
+                                            Class.forName("android.content.res.ApkAssets"), 0));
+                                    } catch (Throwable x) {}
+                                    // Load framework resources via ApkAssets
+                                    try {
+                                        Class<?> apkClass = Class.forName("android.content.res.ApkAssets");
+                                        // Try ApkAssets.loadFromPath(path)
+                                        Method loadFrom = null;
+                                        for (Method m : apkClass.getDeclaredMethods()) {
+                                            if (m.getName().equals("loadFromPath") && m.getParameterCount() == 1) {
+                                                loadFrom = m; break;
+                                            }
+                                        }
+                                        if (loadFrom == null) {
+                                            // Try loadFromPath(String, int) — format varies by Android version
+                                            for (Method m : apkClass.getDeclaredMethods()) {
+                                                if (m.getName().equals("loadFromPath") && m.getParameterCount() == 2) {
+                                                    loadFrom = m; break;
+                                                }
+                                            }
+                                        }
+                                        if (loadFrom != null) {
+                                            loadFrom.setAccessible(true);
+                                            Object fwApk = null;
+                                            try {
+                                                if (loadFrom.getParameterCount() == 1)
+                                                    fwApk = loadFrom.invoke(null, "/system/framework/framework-res.apk");
+                                                else
+                                                    fwApk = loadFrom.invoke(null, "/system/framework/framework-res.apk", 0);
+                                                log("[OK] ApkAssets.loadFromPath(framework-res) = " + (fwApk != null ? "loaded" : "null"));
+                                            } catch (Throwable x) {
+                                                log("[WARN] loadFromPath: " + x.getClass().getSimpleName());
+                                            }
+                                            // Also try MCD APK
+                                            try {
+                                                Object mcdApk = null;
+                                                if (loadFrom.getParameterCount() == 1)
+                                                    mcdApk = loadFrom.invoke(null, "/data/local/tmp/westlake/mcd.apk");
+                                                else
+                                                    mcdApk = loadFrom.invoke(null, "/data/local/tmp/westlake/mcd.apk", 0);
+                                                if (mcdApk != null) log("[OK] ApkAssets.loadFromPath(mcd.apk)");
+                                            } catch (Throwable x) {}
+                                        } else {
+                                            log("[WARN] No loadFromPath method found");
+                                        }
+                                    } catch (Throwable x) {
+                                        log("[WARN] ApkAssets: " + x.getClass().getSimpleName());
+                                    }
+                                }
+                            } catch (Throwable t6) {
+                                log("[WARN] nativeCreate: " + t6.getClass().getSimpleName());
+                            }
+                        }
+                        // Fallback to AllocObject
+                        if (assetMgr == null) {
+                            assetMgr = nativeAllocInstance(amClass);
+                            log("[INFO] AssetManager via AllocObject (no resources)");
+                        }
                         Field amF = resImplClass.getDeclaredField("mAssets");
                         amF.setAccessible(true);
                         amF.set(resImpl, assetMgr);
-                        log("[OK] AssetManager on ResourcesImpl");
                     } catch (Throwable t4) {
                         log("[WARN] AssetManager: " + t4.getClass().getSimpleName());
                     }
