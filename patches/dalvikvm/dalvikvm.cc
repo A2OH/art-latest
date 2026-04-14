@@ -2765,25 +2765,38 @@ static int InvokeMain(JNIEnv* env, char** argv) {
     if (env->ExceptionCheck()) env->ExceptionClear();
   }
 
-  // Bypass SavedState (AndroidX lifecycle — needs full component init)
+  // Bypass AndroidX lifecycle components (need full system init)
   {
-    jclass ssrcCls = env->FindClass("androidx/savedstate/SavedStateRegistryController");
-    if (env->ExceptionCheck()) env->ExceptionClear();
-    if (ssrcCls) {
+    const char* axClasses[] = {
+      "androidx/savedstate/SavedStateRegistryController",
+      "androidx/activity/contextaware/ContextAwareHelper",
+      "androidx/lifecycle/LifecycleRegistry",
+      "androidx/lifecycle/ReportFragment",
+      nullptr
+    };
+    for (int ci = 0; axClasses[ci]; ci++) {
+      jclass cls = env->FindClass(axClasses[ci]);
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      if (!cls) continue;
       art::ScopedObjectAccess soa(art::Thread::Current());
-      art::ObjPtr<art::mirror::Class> mirror = soa.Decode<art::mirror::Class>(ssrcCls);
-      if (mirror != nullptr) {
-        for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
-          if (m.IsNative() || m.IsAbstract() || m.IsConstructor()) continue;
-          std::string sig = m.GetSignature().ToString();
-          if (sig.find(")V") != std::string::npos) {
-            m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
-            m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_java_lang_Throwable_printStackTrace_noop));
-          }
+      art::ObjPtr<art::mirror::Class> mirror = soa.Decode<art::mirror::Class>(cls);
+      if (mirror == nullptr) continue;
+      for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
+        if (m.IsNative() || m.IsAbstract() || m.IsConstructor()) continue;
+        std::string sig = m.GetSignature().ToString();
+        if (sig.find(")V") != std::string::npos) {
+          m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+          m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_java_lang_Throwable_printStackTrace_noop));
+        } else if (sig.find(")Z") != std::string::npos) {
+          m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+          m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_noop_return_false));
+        } else if (sig.find(")L") != std::string::npos) {
+          m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+          m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_noop_return_null));
         }
-        fprintf(stderr, "[dalvikvm] Patched SavedStateRegistryController → no-op\n");
       }
     }
+    fprintf(stderr, "[dalvikvm] Patched AndroidX lifecycle components → no-op\n");
     if (env->ExceptionCheck()) env->ExceptionClear();
   }
 

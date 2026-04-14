@@ -316,6 +316,47 @@ public class McdLoader {
                 } catch (Throwable x) {}
             }
 
+            // ComponentActivity fields (Kotlin-style names)
+            try {
+                Class<?> compActCls = Class.forName("androidx.activity.ComponentActivity");
+                // contextAwareHelper
+                try {
+                    Class<?> cahCls = Class.forName("androidx.activity.contextaware.ContextAwareHelper");
+                    Object cah = nativeAllocInstance(cahCls);
+                    Field f = compActCls.getDeclaredField("contextAwareHelper");
+                    f.setAccessible(true); f.set(splash, cah);
+                } catch (Throwable x) {}
+                // onConfigurationChangedListeners
+                try {
+                    Field f = compActCls.getDeclaredField("onConfigurationChangedListeners");
+                    f.setAccessible(true);
+                    f.set(splash, new java.util.concurrent.CopyOnWriteArrayList<>());
+                } catch (Throwable x) {}
+                // onMultiWindowModeChangedListeners
+                try {
+                    Field f = compActCls.getDeclaredField("onMultiWindowModeChangedListeners");
+                    f.setAccessible(true);
+                    f.set(splash, new java.util.concurrent.CopyOnWriteArrayList<>());
+                } catch (Throwable x) {}
+                // onNewIntentListeners, onTrimMemoryListeners, etc.
+                String[] listFields = {"onNewIntentListeners", "onTrimMemoryListeners",
+                    "onPictureInPictureModeChangedListeners", "onUserLeaveHintListeners"};
+                for (String fn : listFields) {
+                    try {
+                        Field f = compActCls.getDeclaredField(fn);
+                        f.setAccessible(true);
+                        f.set(splash, new java.util.concurrent.CopyOnWriteArrayList<>());
+                    } catch (Throwable x) {}
+                }
+                // nextLocalRequestCode
+                try {
+                    Field f = compActCls.getDeclaredField("nextLocalRequestCode");
+                    f.setAccessible(true);
+                    f.set(splash, new java.util.concurrent.atomic.AtomicInteger(0));
+                } catch (Throwable x) {}
+                log("[OK] ComponentActivity fields set");
+            } catch (Throwable t) {}
+
             // mActivityLifecycleCallbacks (needed for dispatchActivityPreCreated)
             try {
                 Field alcF = actClass.getDeclaredField("mActivityLifecycleCallbacks");
