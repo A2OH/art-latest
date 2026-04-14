@@ -83,6 +83,64 @@ Java_java_lang_String_lastIndexOf_native(JNIEnv* env, jobject thiz, jint ch) {
   return result;
 }
 
+// UUID.randomUUID() stub — SecureRandom isn't initialized in standalone mode
+// Returns sequential UUIDs to avoid crypto dependency
+static std::atomic<uint64_t> uuid_counter{1};
+extern "C" JNIEXPORT jobject JNICALL
+Java_java_util_UUID_randomUUID_stub(JNIEnv* env, jclass) {
+  uint64_t lo = uuid_counter.fetch_add(1);
+  uint64_t hi = 0xDEADBEEF00000004ULL; // version 4 UUID marker
+  jclass uuidCls = env->FindClass("java/util/UUID");
+  if (env->ExceptionCheck()) env->ExceptionClear();
+  if (!uuidCls) return nullptr;
+  jmethodID ctor = env->GetMethodID(uuidCls, "<init>", "(JJ)V");
+  if (env->ExceptionCheck()) env->ExceptionClear();
+  if (!ctor) return nullptr;
+  jobject uuid = env->NewObject(uuidCls, ctor, (jlong)hi, (jlong)lo);
+  if (env->ExceptionCheck()) env->ExceptionClear();
+  return uuid;
+}
+
+// Charset.defaultCharset() stub — always returns UTF-8
+extern "C" JNIEXPORT jobject JNICALL
+Java_java_nio_charset_Charset_defaultCharset_stub(JNIEnv* env, jclass) {
+  jclass csCls = env->FindClass("java/nio/charset/StandardCharsets");
+  if (env->ExceptionCheck()) env->ExceptionClear();
+  if (csCls) {
+    jfieldID f = env->GetStaticFieldID(csCls, "UTF_8", "Ljava/nio/charset/Charset;");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (f) {
+      jobject cs = env->GetStaticObjectField(csCls, f);
+      if (cs) return cs;
+    }
+  }
+  // Fallback: find UTF_8 singleton directly
+  jclass utf8Cls = env->FindClass("sun/nio/cs/UTF_8");
+  if (env->ExceptionCheck()) env->ExceptionClear();
+  if (utf8Cls) {
+    jfieldID instF = env->GetStaticFieldID(utf8Cls, "INSTANCE", "Lsun/nio/cs/UTF_8;");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (instF) return env->GetStaticObjectField(utf8Cls, instF);
+  }
+  return nullptr;
+}
+
+// SecureRandom.nextBytes(byte[]) stub — fills with pseudo-random bytes
+extern "C" JNIEXPORT void JNICALL
+Java_java_security_SecureRandom_nextBytes_stub(JNIEnv* env, jobject, jbyteArray arr) {
+  if (!arr) return;
+  jint len = env->GetArrayLength(arr);
+  jbyte* buf = env->GetByteArrayElements(arr, nullptr);
+  if (buf) {
+    static uint32_t seed = 0x12345678;
+    for (int i = 0; i < len; i++) {
+      seed = seed * 1103515245 + 12345;
+      buf[i] = (jbyte)(seed >> 16);
+    }
+    env->ReleaseByteArrayElements(arr, buf, 0);
+  }
+}
+
 // Sysprop stubs from framework_native_stubs.c
 extern "C" jobject SocProperties_soc_manufacturer(JNIEnv*, jclass);
 extern "C" jobject SocProperties_soc_model(JNIEnv*, jclass);
@@ -367,11 +425,97 @@ static int InvokeMain(JNIEnv* env, char** argv) {
       const char* s = e->GetStringUTFChars(msg, nullptr);
       if (s) { write(STDERR_FILENO, s, strlen(s)); write(STDERR_FILENO, "\n", 1); e->ReleaseStringUTFChars(msg, s); }
     };
+    static auto printException = +[](JNIEnv* e, jclass, jthrowable t) {
+      if (!t) { fprintf(stderr, "[EXEC] null exception\n"); return; }
+      // Walk cause chain, get details via field access (no Java string ops)
+      jclass throwCls = e->FindClass("java/lang/Throwable");
+      if (e->ExceptionCheck()) e->ExceptionClear();
+      jclass classCls = e->FindClass("java/lang/Class");
+      if (e->ExceptionCheck()) e->ExceptionClear();
+      jmethodID getNameM = classCls ? e->GetMethodID(classCls, "getNameNative", "()Ljava/lang/String;") : nullptr;
+      if (e->ExceptionCheck()) { e->ExceptionClear(); getNameM = nullptr; }
+      jfieldID msgField = throwCls ? e->GetFieldID(throwCls, "detailMessage", "Ljava/lang/String;") : nullptr;
+      if (e->ExceptionCheck()) e->ExceptionClear();
+      jfieldID causeField = throwCls ? e->GetFieldID(throwCls, "cause", "Ljava/lang/Throwable;") : nullptr;
+      if (e->ExceptionCheck()) e->ExceptionClear();
+      jfieldID stField = throwCls ? e->GetFieldID(throwCls, "stackTrace", "[Ljava/lang/StackTraceElement;") : nullptr;
+      if (e->ExceptionCheck()) e->ExceptionClear();
+
+      jthrowable cur = t;
+      for (int depth = 0; depth < 5 && cur; depth++) {
+        jclass cls = e->GetObjectClass(cur);
+        jstring nameJ = (getNameM && cls) ? (jstring)e->CallObjectMethod(cls, getNameM) : nullptr;
+        if (e->ExceptionCheck()) e->ExceptionClear();
+        const char* name = nameJ ? e->GetStringUTFChars(nameJ, nullptr) : "???";
+        jstring msgJ = msgField ? (jstring)e->GetObjectField(cur, msgField) : nullptr;
+        if (e->ExceptionCheck()) e->ExceptionClear();
+        const char* msg = msgJ ? e->GetStringUTFChars(msgJ, nullptr) : nullptr;
+        fprintf(stderr, "[EXEC] %s%s: %s\n", depth ? "Caused by: " : "", name, msg ? msg : "(no message)");
+        if (msgJ) e->ReleaseStringUTFChars(msgJ, msg);
+        if (nameJ) e->ReleaseStringUTFChars(nameJ, name);
+
+        // Populate stackTrace by calling getStackTrace() (converts native backtrace)
+        jmethodID getSTM = throwCls ? e->GetMethodID(throwCls, "getStackTrace",
+            "()[Ljava/lang/StackTraceElement;") : nullptr;
+        if (e->ExceptionCheck()) e->ExceptionClear();
+        if (getSTM) {
+          e->CallObjectMethod(cur, getSTM); // populates the field
+          if (e->ExceptionCheck()) e->ExceptionClear();
+        }
+        // Print stack trace from stackTrace field (StackTraceElement[])
+        jobjectArray frames = stField ? (jobjectArray)e->GetObjectField(cur, stField) : nullptr;
+        if (e->ExceptionCheck()) e->ExceptionClear();
+        if (frames) {
+          int len = e->GetArrayLength(frames);
+          fprintf(stderr, "[EXEC]   (%d frames)\n", len);
+          jclass steCls = e->FindClass("java/lang/StackTraceElement");
+          if (e->ExceptionCheck()) e->ExceptionClear();
+          jfieldID dclsF = steCls ? e->GetFieldID(steCls, "declaringClass", "Ljava/lang/String;") : nullptr;
+          if (e->ExceptionCheck()) e->ExceptionClear();
+          jfieldID methF = steCls ? e->GetFieldID(steCls, "methodName", "Ljava/lang/String;") : nullptr;
+          if (e->ExceptionCheck()) e->ExceptionClear();
+          jfieldID lineF = steCls ? e->GetFieldID(steCls, "lineNumber", "I") : nullptr;
+          if (e->ExceptionCheck()) e->ExceptionClear();
+          int show = len < 20 ? len : 20;
+          for (int i = 0; i < show; i++) {
+            jobject frame = e->GetObjectArrayElement(frames, i);
+            if (e->ExceptionCheck()) { e->ExceptionClear(); break; }
+            if (!frame) continue;
+            jstring dcls = dclsF ? (jstring)e->GetObjectField(frame, dclsF) : nullptr;
+            jstring meth = methF ? (jstring)e->GetObjectField(frame, methF) : nullptr;
+            jint line = lineF ? e->GetIntField(frame, lineF) : -1;
+            const char* dc = dcls ? e->GetStringUTFChars(dcls, nullptr) : "?";
+            const char* mn = meth ? e->GetStringUTFChars(meth, nullptr) : "?";
+            fprintf(stderr, "[EXEC]   at %s.%s:%d\n", dc, mn, line);
+            if (dcls) e->ReleaseStringUTFChars(dcls, dc);
+            if (meth) e->ReleaseStringUTFChars(meth, mn);
+          }
+          if (len > show) fprintf(stderr, "[EXEC]   ... %d more\n", len - show);
+        } else {
+          fprintf(stderr, "[EXEC]   (no stack trace available)\n");
+        }
+        // Get cause — try 'cause' field first, then 'target' (InvocationTargetException)
+        jthrowable next = causeField ? (jthrowable)e->GetObjectField(cur, causeField) : nullptr;
+        if (e->ExceptionCheck()) e->ExceptionClear();
+        if (!next || e->IsSameObject(next, cur)) {
+          // Try 'target' field for InvocationTargetException
+          jclass curCls = e->GetObjectClass(cur);
+          jfieldID targetF = curCls ? e->GetFieldID(curCls, "target", "Ljava/lang/Throwable;") : nullptr;
+          if (e->ExceptionCheck()) e->ExceptionClear();
+          if (targetF) next = (jthrowable)e->GetObjectField(cur, targetF);
+          if (e->ExceptionCheck()) e->ExceptionClear();
+        }
+        if (!next || e->IsSameObject(next, cur)) break;
+        cur = next;
+      }
+      fflush(stderr);
+    };
     JNINativeMethod methods[] = {
       {"nativeAllocInstance", "(Ljava/lang/Class;)Ljava/lang/Object;", (void*)+allocInstance},
       {"nativeLog", "(Ljava/lang/String;)V", (void*)+nativeLog},
+      {"nativePrintException", "(Ljava/lang/Throwable;)V", (void*)+printException},
     };
-    int rc = env->RegisterNatives(klass.get(), methods, 2);
+    int rc = env->RegisterNatives(klass.get(), methods, 3);
     if (env->ExceptionCheck()) env->ExceptionClear();
     fprintf(stderr, "[dalvikvm] RegisterNatives for %s: %s\n", class_name.c_str(),
             rc == 0 ? "OK" : "FAILED");
@@ -1619,6 +1763,47 @@ static int InvokeMain(JNIEnv* env, char** argv) {
               }
             }
 
+            // Stub UUID.randomUUID() — SecureRandom not available
+            {
+              art::ObjPtr<art::mirror::Class> uuidCls =
+                  art::Runtime::Current()->GetClassLinker()->FindSystemClass(
+                      soa.Self(), "Ljava/util/UUID;");
+              if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
+              if (uuidCls != nullptr) {
+                for (art::ArtMethod& m : uuidCls->GetDeclaredMethods(art::kRuntimePointerSize)) {
+                  if (strcmp(m.GetName(), "randomUUID") == 0 && !m.IsNative()) {
+                    m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+                    m.SetEntryPointFromJni(
+                        reinterpret_cast<void*>(Java_java_util_UUID_randomUUID_stub));
+                    fprintf(stderr, "[dalvikvm] Patched UUID.randomUUID() → native stub\n");
+                    break;
+                  }
+                }
+              }
+              if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
+            }
+
+            // Stub SecureRandom.nextBytes() — no crypto provider
+            {
+              art::ObjPtr<art::mirror::Class> srCls =
+                  art::Runtime::Current()->GetClassLinker()->FindSystemClass(
+                      soa.Self(), "Ljava/security/SecureRandom;");
+              if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
+              if (srCls != nullptr) {
+                for (art::ArtMethod& m : srCls->GetDeclaredMethods(art::kRuntimePointerSize)) {
+                  if (strcmp(m.GetName(), "nextBytes") == 0 &&
+                      m.GetSignature().ToString() == "([B)V" && !m.IsNative()) {
+                    m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+                    m.SetEntryPointFromJni(
+                        reinterpret_cast<void*>(Java_java_security_SecureRandom_nextBytes_stub));
+                    fprintf(stderr, "[dalvikvm] Patched SecureRandom.nextBytes() → native stub\n");
+                    break;
+                  }
+                }
+              }
+              if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
+            }
+
             // Replace TextUtils.formatSimple with String.format delegation.
             // The built-in only handles %s/%d and crashes on %x, %08x, etc.
             // Note: can't use patchToNative because GetShorty() returns wrong value
@@ -2190,6 +2375,135 @@ static int InvokeMain(JNIEnv* env, char** argv) {
         "()Ljava/util/Optional;", (void*)SocProperties_soc_model);
     latePatch("Landroid/sysprop/TelephonyProperties;", "baseband_version",
         "()Ljava/util/List;", (void*)TelephonyProperties_baseband_version);
+  }
+
+  // Pre-initialize classes that MCD app needs during onCreate
+  {
+    // Force-init SecureRandom / UUID (analytics SDKs use UUID.randomUUID())
+    const char* preInitClasses[] = {
+      "java/security/SecureRandom",
+      "java/util/UUID",
+      "java/util/Collections",
+      "java/util/HashMap",
+      "java/util/ArrayList",
+      "java/util/HashSet",
+      "java/lang/ref/WeakReference",
+      "android/util/ArrayMap",
+      "android/util/SparseArray",
+      "android/os/Handler",
+      "android/os/Looper",
+      nullptr
+    };
+    for (int i = 0; preInitClasses[i]; i++) {
+      jclass cls = env->FindClass(preInitClasses[i]);
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      // FindClass triggers class initialization
+    }
+
+    // Fix StandardCharsets.UTF_8 and sun.nio.cs.UTF_8.INSTANCE
+    {
+      // First ensure sun.nio.cs.UTF_8 singleton exists
+      jclass utf8Impl = env->FindClass("sun/nio/cs/UTF_8");
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      jobject utf8Instance = nullptr;
+      if (utf8Impl) {
+        jfieldID instF = env->GetStaticFieldID(utf8Impl, "INSTANCE", "Lsun/nio/cs/UTF_8;");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (instF) utf8Instance = env->GetStaticObjectField(utf8Impl, instF);
+        if (!utf8Instance) {
+          utf8Instance = env->AllocObject(utf8Impl);
+          if (env->ExceptionCheck()) env->ExceptionClear();
+          if (utf8Instance && instF) {
+            env->SetStaticObjectField(utf8Impl, instF, utf8Instance);
+            fprintf(stderr, "[dalvikvm] Created sun.nio.cs.UTF_8.INSTANCE\n");
+          }
+        }
+      }
+      // Set StandardCharsets.UTF_8 using the instance
+      jclass scCls = env->FindClass("java/nio/charset/StandardCharsets");
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      if (scCls && utf8Instance) {
+        jfieldID utf8F = env->GetStaticFieldID(scCls, "UTF_8", "Ljava/nio/charset/Charset;");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (utf8F && !env->GetStaticObjectField(scCls, utf8F)) {
+          env->SetStaticObjectField(scCls, utf8F, utf8Instance);
+          fprintf(stderr, "[dalvikvm] Fixed StandardCharsets.UTF_8\n");
+        }
+      }
+      // Also try Charset.forName for other charsets
+      jclass csCls = env->FindClass("java/nio/charset/Charset");
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      if (scCls && csCls) {
+        jmethodID forName = env->GetStaticMethodID(csCls, "forName",
+            "(Ljava/lang/String;)Ljava/nio/charset/Charset;");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (forName) {
+          const char* names[] = {"US_ASCII", "ISO_8859_1", nullptr};
+          const char* csnames[] = {"US-ASCII", "ISO-8859-1", nullptr};
+          for (int i = 0; names[i]; i++) {
+            jfieldID f = env->GetStaticFieldID(scCls, names[i], "Ljava/nio/charset/Charset;");
+            if (env->ExceptionCheck()) { env->ExceptionClear(); continue; }
+            if (f && !env->GetStaticObjectField(scCls, f)) {
+              jobject cs = env->CallStaticObjectMethod(csCls, forName, env->NewStringUTF(csnames[i]));
+              if (env->ExceptionCheck()) env->ExceptionClear();
+              if (cs) env->SetStaticObjectField(scCls, f, cs);
+            }
+          }
+        }
+      }
+      if (env->ExceptionCheck()) env->ExceptionClear();
+
+      // Fix Kotlin's kotlin.text.Charsets.UTF_8 (most common source of null Charset in MCD)
+      jclass ktCharsets = env->FindClass("kotlin/text/Charsets");
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      if (ktCharsets) {
+        // Get StandardCharsets.UTF_8 as the value
+        jclass scCls2 = env->FindClass("java/nio/charset/StandardCharsets");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        jobject stdUtf8 = nullptr;
+        if (scCls2) {
+          jfieldID suf = env->GetStaticFieldID(scCls2, "UTF_8", "Ljava/nio/charset/Charset;");
+          if (env->ExceptionCheck()) env->ExceptionClear();
+          if (suf) stdUtf8 = env->GetStaticObjectField(scCls2, suf);
+        }
+        if (stdUtf8) {
+          jfieldID ktUtf8F = env->GetStaticFieldID(ktCharsets, "UTF_8", "Ljava/nio/charset/Charset;");
+          if (env->ExceptionCheck()) env->ExceptionClear();
+          if (ktUtf8F) {
+            env->SetStaticObjectField(ktCharsets, ktUtf8F, stdUtf8);
+            fprintf(stderr, "[dalvikvm] Fixed kotlin.text.Charsets.UTF_8\n");
+          }
+        }
+        // Also set ISO_8859_1, US_ASCII
+        const char* ktFields[] = {"ISO_8859_1", "US_ASCII", nullptr};
+        const char* scFields[] = {"ISO_8859_1", "US_ASCII", nullptr};
+        for (int i = 0; ktFields[i]; i++) {
+          jfieldID kf = env->GetStaticFieldID(ktCharsets, ktFields[i], "Ljava/nio/charset/Charset;");
+          if (env->ExceptionCheck()) { env->ExceptionClear(); continue; }
+          jfieldID sf = scCls2 ? env->GetStaticFieldID(scCls2, scFields[i], "Ljava/nio/charset/Charset;") : nullptr;
+          if (env->ExceptionCheck()) { env->ExceptionClear(); continue; }
+          if (kf && sf) {
+            jobject val = env->GetStaticObjectField(scCls2, sf);
+            if (val) env->SetStaticObjectField(ktCharsets, kf, val);
+          }
+        }
+      }
+      if (env->ExceptionCheck()) env->ExceptionClear();
+    }
+
+    // Also ensure Looper.sMainLooper is set (many Android APIs need it)
+    jclass looperCls = env->FindClass("android/os/Looper");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (looperCls) {
+      // Call Looper.prepareMainLooper() to set sMainLooper
+      jmethodID prepMain = env->GetStaticMethodID(looperCls, "prepareMainLooper", "()V");
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      if (prepMain) {
+        env->CallStaticVoidMethod(looperCls, prepMain);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        fprintf(stderr, "[dalvikvm] Looper.prepareMainLooper() called\n");
+      }
+    }
   }
 
   fprintf(stderr, "[dalvikvm] Calling main()...\n");

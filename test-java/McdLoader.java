@@ -5,6 +5,7 @@ import java.lang.reflect.Constructor;
 public class McdLoader {
     static native void nativeLog(String msg);
     static native Object nativeAllocInstance(Class<?> cls);
+    static native void nativePrintException(Throwable t);
 
     static void log(String msg) {
         try { nativeLog(msg); return; } catch (Throwable t) {}
@@ -147,6 +148,33 @@ public class McdLoader {
                 log("[OK] mComponent set");
             } catch (Throwable t) { log("[WARN] mComponent: " + t.getClass().getName()); }
 
+            // mIntent — SplashActivity.onCreate calls getIntent().getExtras()
+            try {
+                Class<?> intentClass = Class.forName("android.content.Intent");
+                Object intent = nativeAllocInstance(intentClass);
+                Field f = actClass.getDeclaredField("mIntent");
+                f.setAccessible(true); f.set(splash, intent);
+                log("[OK] mIntent set");
+            } catch (Throwable t) { log("[WARN] mIntent: " + t.getClass().getName()); }
+
+            // mWindow — many Activity methods need getWindow()
+            try {
+                Class<?> windowClass = Class.forName("com.android.internal.policy.PhoneWindow");
+                Object window = nativeAllocInstance(windowClass);
+                Field f = actClass.getDeclaredField("mWindow");
+                f.setAccessible(true); f.set(splash, window);
+                log("[OK] mWindow set");
+            } catch (Throwable t) { log("[WARN] mWindow: " + t.getClass().getName()); }
+
+            // mToken — needed for window operations
+            try {
+                Class<?> binderClass = Class.forName("android.os.Binder");
+                Object token = nativeAllocInstance(binderClass);
+                Field f = actClass.getDeclaredField("mToken");
+                f.setAccessible(true); f.set(splash, token);
+                log("[OK] mToken set");
+            } catch (Throwable t) { log("[WARN] mToken: " + t.getClass().getName()); }
+
         } catch (Throwable t) {
             log("[FAIL] fields: " + t.getClass().getName());
         }
@@ -160,18 +188,10 @@ public class McdLoader {
             onCreate.invoke(splash, (Object) null);
             log("[OK] onCreate returned!");
         } catch (Throwable t) {
-            Throwable cause = t;
-            while (cause.getCause() != null) cause = cause.getCause();
-            log("[EXEC] onCreate threw: " + cause.getClass().getName());
-            String msg = cause.getMessage();
-            if (msg != null && msg.length() > 80) msg = msg.substring(0, 80);
-            log("[EXEC] message: " + (msg != null ? msg : "null"));
-
-            // Print partial stack trace
-            StackTraceElement[] stack = cause.getStackTrace();
-            int show = Math.min(stack.length, 10);
-            for (int i = 0; i < show; i++) {
-                log("[EXEC]   at " + stack[i].toString());
+            // Use native exception printer to avoid StackOverflow from
+            // getMessage() / string concat in the interpreter
+            try { nativePrintException(t); } catch (Throwable t2) {
+                log("[EXEC] nativePrintException failed");
             }
         }
 
