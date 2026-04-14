@@ -978,12 +978,43 @@ public class McdLoader {
                                 nameF.set(surfaceControl, "WestlakeMCD");
                             } catch (Throwable x) {}
 
-                            // Create a Surface from the SurfaceControl
+                            // Create Surface — use nativeCreateFromSurfaceControl to avoid release
                             Class<?> surfClass = Class.forName("android.view.Surface");
-                            Constructor<?> surfCtor = surfClass.getDeclaredConstructor(scClass);
-                            surfCtor.setAccessible(true);
-                            Object surface = surfCtor.newInstance(surfaceControl);
-                            log("[OK] Surface CREATED from SurfaceControl!");
+                            Object surface = nativeAllocInstance(surfClass);
+                            try {
+                                Method ncfs = surfClass.getDeclaredMethod("nativeCreateFromSurfaceControl", long.class);
+                                ncfs.setAccessible(true);
+                                long surfPtr = (Long)ncfs.invoke(null, scPtr);
+                                Field spF = surfClass.getDeclaredField("mNativeObject");
+                                spF.setAccessible(true);
+                                spF.setLong(surface, surfPtr);
+                                // Set mLock + mCanvas
+                                try { Field lf = surfClass.getDeclaredField("mLock"); lf.setAccessible(true);
+                                      lf.set(surface, new Object()); } catch (Throwable x) {}
+                                // Create Canvas for lockCanvas
+                                try {
+                                    Class<?> canvasCls = Class.forName("android.graphics.Canvas");
+                                    Object canvas = canvasCls.getDeclaredConstructor().newInstance();
+                                    Field cf = surfClass.getDeclaredField("mCanvas");
+                                    cf.setAccessible(true);
+                                    cf.set(surface, canvas);
+                                } catch (Throwable x) {
+                                    try {
+                                        Class<?> canvasCls = Class.forName("android.graphics.Canvas");
+                                        Object canvas = nativeAllocInstance(canvasCls);
+                                        Field cf = surfClass.getDeclaredField("mCanvas");
+                                        cf.setAccessible(true);
+                                        cf.set(surface, canvas);
+                                    } catch (Throwable x2) {}
+                                }
+                                log("[OK] Surface CREATED: nativePtr=" + surfPtr);
+                            } catch (Throwable x) {
+                                // Fallback to constructor
+                                Constructor<?> surfCtor = surfClass.getDeclaredConstructor(scClass);
+                                surfCtor.setAccessible(true);
+                                surface = surfCtor.newInstance(surfaceControl);
+                                log("[OK] Surface via constructor");
+                            }
 
                             // Get a Canvas and draw!
                             try {

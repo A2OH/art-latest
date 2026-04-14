@@ -613,6 +613,15 @@ static void InterpreterJni(Thread* self,
       jlong arg0 = *reinterpret_cast<jlong*>(&args[0]);
       jlong arg1 = *reinterpret_cast<jlong*>(&args[2]);
       fn(soa.Env(), klass.get(), arg0, arg1);
+    } else if (shorty == "JJLL") {
+      // long fn(JNIEnv*, jclass, long, Object, Object) — Surface.nativeLockCanvas
+      using fntype = jlong(JNIEnv*, jclass, jlong, jobject, jobject);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jclass> klass(soa.Env(), soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
+      jlong arg0 = *reinterpret_cast<jlong*>(&args[0]);
+      ScopedLocalRef<jobject> a1(soa.Env(), soa.AddLocalReference<jobject>(ObjArg(args[2])));
+      ScopedLocalRef<jobject> a2(soa.Env(), soa.AddLocalReference<jobject>(ObjArg(args[3])));
+      result->SetJ(fn(soa.Env(), klass.get(), arg0, a1.get(), a2.get()));
     } else if (shorty == "JLLIIIIJL") {
       // long fn(JNIEnv*, jclass, Object, Object, int, int, int, int, long, Object)
       // SurfaceControl.nativeCreate(Session, name, w, h, format, flags, parentPtr, metadata)
