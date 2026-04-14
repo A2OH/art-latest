@@ -1448,6 +1448,33 @@ static int InvokeMain(JNIEnv* env, char** argv) {
                     setOffset("transferIndex", "TRANSFERINDEX");
                     setOffset("baseCount", "BASECOUNT");
                     setOffset("cellsBusy", "CELLSBUSY");
+
+                    // Also set ABASE and ASHIFT for Node[] array access
+                    jmethodID aboM = env->GetMethodID(unsafeCls, "arrayBaseOffset",
+                        "(Ljava/lang/Class;)I");
+                    jmethodID aisM = env->GetMethodID(unsafeCls, "arrayIndexScale",
+                        "(Ljava/lang/Class;)I");
+                    if (env->ExceptionCheck()) env->ExceptionClear();
+                    if (aboM && aisM) {
+                      jclass nodeArrayCls = env->FindClass("[Ljava/util/concurrent/ConcurrentHashMap$Node;");
+                      if (env->ExceptionCheck()) env->ExceptionClear();
+                      if (!nodeArrayCls) nodeArrayCls = env->FindClass("[Ljava/lang/Object;");
+                      if (env->ExceptionCheck()) env->ExceptionClear();
+                      if (nodeArrayCls) {
+                        jint abase = env->CallIntMethod(u, aboM, nodeArrayCls);
+                        if (env->ExceptionCheck()) env->ExceptionClear();
+                        jint scale = env->CallIntMethod(u, aisM, nodeArrayCls);
+                        if (env->ExceptionCheck()) env->ExceptionClear();
+                        int ashift = 0;
+                        while ((1 << ashift) < scale) ashift++;
+                        jfieldID abaseF = env->GetStaticFieldID(chmCls, "ABASE", "I");
+                        if (env->ExceptionCheck()) env->ExceptionClear();
+                        jfieldID ashiftF = env->GetStaticFieldID(chmCls, "ASHIFT", "I");
+                        if (env->ExceptionCheck()) env->ExceptionClear();
+                        if (abaseF) env->SetStaticIntField(chmCls, abaseF, abase);
+                        if (ashiftF) env->SetStaticIntField(chmCls, ashiftF, ashift);
+                      }
+                    }
                     fprintf(stderr, "[dalvikvm] Set ConcurrentHashMap.U + field offsets\n");
                   }
                 }
