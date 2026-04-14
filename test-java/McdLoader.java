@@ -354,6 +354,52 @@ public class McdLoader {
                     f.setAccessible(true);
                     f.set(splash, new java.util.concurrent.atomic.AtomicInteger(0));
                 } catch (Throwable x) {}
+                // LifecycleRegistry — check parent class too (androidx.core.app.ComponentActivity)
+                try {
+                    Class<?> lrClass = Class.forName("androidx.lifecycle.LifecycleRegistry");
+                    // LifecycleRegistry(LifecycleOwner) constructor
+                    Object lr = nativeAllocInstance(lrClass);
+                    // Set the lifecycle on all possible field names/classes
+                    String[] lrFields = {"mLifecycleRegistry", "lifecycle", "mFragmentLifecycleRegistry"};
+                    for (Class<?> c = splashClass; c != null; c = c.getSuperclass()) {
+                        for (String fn : lrFields) {
+                            try {
+                                Field f = c.getDeclaredField(fn);
+                                f.setAccessible(true); f.set(splash, lr);
+                                log("[OK] LifecycleRegistry on " + c.getSimpleName() + "." + fn);
+                            } catch (Throwable x) {}
+                        }
+                    }
+                } catch (Throwable x) {}
+                // AndroidX FragmentController (on FragmentActivity.mFragments)
+                try {
+                    Class<?> axFcClass = Class.forName("androidx.fragment.app.FragmentController");
+                    // FragmentController.createController(FragmentHostCallback)
+                    Object axFc = nativeAllocInstance(axFcClass);
+                    // Set on FragmentActivity.mFragments
+                    Class<?> fragActCls = Class.forName("androidx.fragment.app.FragmentActivity");
+                    Field mfF = fragActCls.getDeclaredField("mFragments");
+                    mfF.setAccessible(true);
+                    mfF.set(splash, axFc);
+                    // Set FragmentManager inside
+                    try {
+                        Class<?> axFmClass = Class.forName("androidx.fragment.app.FragmentManagerImpl");
+                        Object axFm = nativeAllocInstance(axFmClass);
+                        Field hostF = axFcClass.getDeclaredField("mHost");
+                        hostF.setAccessible(true);
+                        // Create FragmentHostCallback
+                        Class<?> axFhcClass = Class.forName("androidx.fragment.app.FragmentHostCallback");
+                        Object axFhc = nativeAllocInstance(axFhcClass);
+                        hostF.set(axFc, axFhc);
+                        // Set FragmentManager on host
+                        try {
+                            Field fmOnHost = axFhcClass.getDeclaredField("mFragmentManager");
+                            fmOnHost.setAccessible(true);
+                            fmOnHost.set(axFhc, axFm);
+                        } catch (Throwable x2) {}
+                    } catch (Throwable x) {}
+                    log("[OK] AndroidX FragmentController set");
+                } catch (Throwable x) {}
                 log("[OK] ComponentActivity fields set");
             } catch (Throwable t) {}
 

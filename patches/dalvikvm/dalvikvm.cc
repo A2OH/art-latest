@@ -2741,6 +2741,103 @@ static int InvokeMain(JNIEnv* env, char** argv) {
     if (env->ExceptionCheck()) env->ExceptionClear();
   }
 
+  // Patch Fragment system — only void/boolean methods (preserve getters)
+  {
+    const char* fragClasses[] = {
+      "android/app/FragmentController",
+      "android/app/FragmentManagerImpl",
+      nullptr
+    };
+    int patched = 0;
+    for (int ci = 0; fragClasses[ci]; ci++) {
+      jclass cls = env->FindClass(fragClasses[ci]);
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      if (!cls) continue;
+      art::ScopedObjectAccess soa(art::Thread::Current());
+      art::ObjPtr<art::mirror::Class> mirror = soa.Decode<art::mirror::Class>(cls);
+      if (mirror == nullptr) continue;
+      for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
+        if (m.IsNative() || m.IsAbstract() || m.IsConstructor()) continue;
+        std::string sig = m.GetSignature().ToString();
+        const char* name = m.GetName();
+        // Only no-op void dispatch methods and specific NPE-causing methods
+        if (sig.find(")V") != std::string::npos) {
+          m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+          m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_java_lang_Throwable_printStackTrace_noop));
+          patched++;
+        } else if (sig.find(")Z") != std::string::npos) {
+          m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+          m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_noop_return_false));
+          patched++;
+        }
+        // retainNonConfig → null (specific method, not all object-returning)
+        else if (strcmp(name, "retainNonConfig") == 0 || strcmp(name, "retainNestedNonConfig") == 0) {
+          m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+          m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_noop_return_null));
+          patched++;
+        }
+      }
+    }
+    // Also patch abstract methods on Fragment base classes
+    const char* abstractFragClasses[] = {
+      "android/app/FragmentManager",
+      "android/app/FragmentTransaction",
+      nullptr
+    };
+    for (int aci = 0; abstractFragClasses[aci]; aci++) {
+    jclass fmBaseCls = env->FindClass(abstractFragClasses[aci]);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (fmBaseCls) {
+      art::ScopedObjectAccess soa2(art::Thread::Current());
+      art::ObjPtr<art::mirror::Class> fmMirror = soa2.Decode<art::mirror::Class>(fmBaseCls);
+      if (fmMirror != nullptr) {
+        for (art::ArtMethod& m : fmMirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
+          if (!m.IsAbstract()) continue;
+          std::string sig = m.GetSignature().ToString();
+          // Make abstract void methods concrete no-ops
+          if (sig.find(")V") != std::string::npos) {
+            m.SetAccessFlags((m.GetAccessFlags() & ~art::kAccAbstract) | art::kAccNative);
+            m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_java_lang_Throwable_printStackTrace_noop));
+            patched++;
+          } else if (sig.find(")L") != std::string::npos) {
+            m.SetAccessFlags((m.GetAccessFlags() & ~art::kAccAbstract) | art::kAccNative);
+            m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_noop_return_null));
+            patched++;
+          } else if (sig.find(")Z") != std::string::npos) {
+            m.SetAccessFlags((m.GetAccessFlags() & ~art::kAccAbstract) | art::kAccNative);
+            m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_noop_return_false));
+            patched++;
+          }
+        }
+      }
+    }
+    } // end for abstractFragClasses
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    fprintf(stderr, "[dalvikvm] Patched %d Fragment system methods\n", patched);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
+
+  // Patch LoadedApk.updateApplicationInfo → no-op (avoids null context chain NPEs)
+  {
+    jclass lapCls = env->FindClass("android/app/LoadedApk");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (lapCls) {
+      art::ScopedObjectAccess soa(art::Thread::Current());
+      art::ObjPtr<art::mirror::Class> mirror = soa.Decode<art::mirror::Class>(lapCls);
+      if (mirror != nullptr) {
+        for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
+          if (strcmp(m.GetName(), "updateApplicationInfo") == 0 && !m.IsNative()) {
+            m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+            m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_java_lang_Throwable_printStackTrace_noop));
+            fprintf(stderr, "[dalvikvm] Patched LoadedApk.updateApplicationInfo → no-op\n");
+            break;
+          }
+        }
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
+
   // Fix ViewConfiguration — create with default display density
   {
     jclass vcCls = env->FindClass("android/view/ViewConfiguration");
@@ -2765,13 +2862,16 @@ static int InvokeMain(JNIEnv* env, char** argv) {
     if (env->ExceptionCheck()) env->ExceptionClear();
   }
 
-  // Bypass AndroidX lifecycle components (need full system init)
+  // Bypass AndroidX lifecycle + fragment components (need full system init)
   {
     const char* axClasses[] = {
       "androidx/savedstate/SavedStateRegistryController",
       "androidx/activity/contextaware/ContextAwareHelper",
       "androidx/lifecycle/LifecycleRegistry",
       "androidx/lifecycle/ReportFragment",
+      "androidx/fragment/app/FragmentController",
+      "androidx/fragment/app/FragmentManagerImpl",
+      "androidx/fragment/app/FragmentHostCallback",
       nullptr
     };
     for (int ci = 0; axClasses[ci]; ci++) {
@@ -2945,12 +3045,12 @@ static int InvokeMain(JNIEnv* env, char** argv) {
           {"isFinishing", "()Z", (void*)Java_noop_return_false},
           {"isDestroyed", "()Z", (void*)Java_noop_return_false},
           {"isChangingConfigurations", "()Z", (void*)Java_noop_return_false},
-          // Skip theme resource application (needs full AssetManager)
           {"onApplyThemeResource",
            "(Landroid/content/res/Resources$Theme;IZ)V",
            (void*)Java_java_lang_Throwable_printStackTrace_noop},
-          // Skip setTheme to prevent AppCompat recursion
           {"setTheme", "(I)V", (void*)Java_java_lang_Throwable_printStackTrace_noop},
+          // Prevent Fragment cleanup from hitting abstract methods
+          {"onDestroy", "()V", (void*)Java_java_lang_Throwable_printStackTrace_noop},
           {nullptr, nullptr, nullptr}
         };
         for (int i = 0; patches[i].name; i++) {
