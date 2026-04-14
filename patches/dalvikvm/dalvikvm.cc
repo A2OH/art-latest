@@ -1330,6 +1330,51 @@ static int InvokeMain(JNIEnv* env, char** argv) {
             patchToNativeBySig("Landroid/sysprop/TelephonyProperties;", "baseband_version",
                 "()Ljava/util/List;", (void*)TelephonyProperties_baseband_version);
 
+            // Also patch lastIndexOf(int,int) to handle null 'this'
+            // The interpreter has a vreg corruption bug where the receiver becomes null
+            static auto lastIdxII = +[](JNIEnv* env, jobject thiz, jint ch, jint fromIndex) -> jint {
+              if (!thiz) return -1; // null guard
+              jint len = env->GetStringLength((jstring)thiz);
+              if (ch < 0x10000) {
+                const jchar* chars = env->GetStringChars((jstring)thiz, nullptr);
+                if (!chars) return -1;
+                jint result = -1;
+                for (jint i = (fromIndex < len ? fromIndex : len - 1); i >= 0; i--) {
+                  if (chars[i] == (jchar)ch) { result = i; break; }
+                }
+                env->ReleaseStringChars((jstring)thiz, chars);
+                return result;
+              }
+              jchar hi = (jchar)((ch >> 10) + 0xD7C0);
+              jchar lo = (jchar)((ch & 0x3FF) + 0xDC00);
+              const jchar* chars = env->GetStringChars((jstring)thiz, nullptr);
+              if (!chars) return -1;
+              jint result = -1;
+              for (jint i = (fromIndex < len - 1 ? fromIndex : len - 2); i >= 0; i--) {
+                if (chars[i] == hi && chars[i+1] == lo) { result = i; break; }
+              }
+              env->ReleaseStringChars((jstring)thiz, chars);
+              return result;
+            };
+            // Patch both lastIndexOf(I) and lastIndexOf(II) via name match
+            {
+              art::StackHandleScope<1> lihs(soa.Self());
+              art::Handle<art::mirror::Class> strCls2 = lihs.NewHandle(
+                  art::Runtime::Current()->GetClassLinker()->FindSystemClass(
+                      soa.Self(), "Ljava/lang/String;"));
+              if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
+              if (strCls2 != nullptr) {
+                for (art::ArtMethod& m : strCls2->GetDeclaredMethods(art::kRuntimePointerSize)) {
+                  if (strcmp(m.GetName(), "lastIndexOf") == 0 && !m.IsNative()) {
+                    m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+                    m.SetEntryPointFromJni(reinterpret_cast<void*>(+lastIdxII));
+                  }
+                }
+                fprintf(stderr, "[dalvikvm] Patched ALL String.lastIndexOf → native\n");
+              }
+              if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
+            }
+
             // Stub LocaleUtils.toLowerString — returns input unchanged
             static auto toLowerStub = +[](JNIEnv* env, jclass, jstring s) -> jstring {
               return s ? s : env->NewStringUTF("");
@@ -1338,6 +1383,60 @@ static int InvokeMain(JNIEnv* env, char** argv) {
                 "(Ljava/lang/String;)Ljava/lang/String;", (void*)+toLowerStub);
             patchToNativeBySig("Lsun/util/locale/LocaleUtils;", "toUpperString",
                 "(Ljava/lang/String;)Ljava/lang/String;", (void*)+toLowerStub);
+
+            // Re-run clinits that failed before our stubs were applied
+            {
+              const char* reinitClasses[] = {
+                "Ljdk/internal/misc/Unsafe;",
+                "Lsun/util/locale/BaseLocale;",
+                "Lsun/util/locale/BaseLocale$Cache;",
+                "Ljava/util/Locale;",
+                "Landroid/os/LocaleList;",
+                "Landroid/content/res/Configuration;",
+                nullptr
+              };
+              for (int i = 0; reinitClasses[i]; i++) {
+                art::StackHandleScope<1> rhs(soa.Self());
+                art::Handle<art::mirror::Class> rc = rhs.NewHandle(
+                    art::Runtime::Current()->GetClassLinker()->FindSystemClass(
+                        soa.Self(), reinitClasses[i]));
+                if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
+                if (rc != nullptr && rc->IsInitialized()) {
+                  // Reset to "verified" status so clinit re-runs
+                  rc->SetStatusForPrimitiveOrArray(art::ClassStatus::kVerified);
+                  // Now re-init
+                  bool ok = art::Runtime::Current()->GetClassLinker()->EnsureInitialized(
+                      soa.Self(), rc, true, true);
+                  if (soa.Self()->IsExceptionPending()) soa.Self()->ClearException();
+                  fprintf(stderr, "[dalvikvm] Re-init %s: %s\n", reinitClasses[i],
+                          ok ? "OK" : "FAILED");
+                }
+              }
+            }
+
+            // Fix ConcurrentHashMap.U (Unsafe) — set via JNI after Unsafe re-init
+            {
+              jclass chmCls = env->FindClass("java/util/concurrent/ConcurrentHashMap");
+              if (env->ExceptionCheck()) env->ExceptionClear();
+              jclass unsafeCls = env->FindClass("jdk/internal/misc/Unsafe");
+              if (env->ExceptionCheck()) env->ExceptionClear();
+              if (chmCls && unsafeCls) {
+                jfieldID uField = env->GetStaticFieldID(chmCls, "U", "Ljdk/internal/misc/Unsafe;");
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                if (uField) {
+                  jfieldID theUnsafe = env->GetStaticFieldID(unsafeCls, "theUnsafe", "Ljdk/internal/misc/Unsafe;");
+                  if (env->ExceptionCheck()) env->ExceptionClear();
+                  if (theUnsafe) {
+                    jobject u = env->GetStaticObjectField(unsafeCls, theUnsafe);
+                    if (u) {
+                      env->SetStaticObjectField(chmCls, uField, u);
+                      fprintf(stderr, "[dalvikvm] Set ConcurrentHashMap.U = Unsafe\n");
+                    }
+                  }
+                }
+              }
+              if (env->ExceptionCheck()) env->ExceptionClear();
+            }
 
             // Replace TextUtils.formatSimple with String.format delegation.
             // The built-in only handles %s/%d and crashes on %x, %08x, etc.
