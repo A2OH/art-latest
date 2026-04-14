@@ -387,9 +387,17 @@ public class McdLoader {
                         Field cfF = resImplClass.getDeclaredField("mConfiguration");
                         cfF.setAccessible(true);
                         cfF.set(resImpl, config);
-                    // Note: NOT setting mAssets (AssetManager) — its clinit crashes.
-                    // Resources.getBoolean etc will NPE on null AssetManager, but
-                    // that's tolerable via the clinit tolerance system.
+                    // Set AssetManager — natives registered EARLY from libandroid_runtime
+                    try {
+                        Class<?> amClass = Class.forName("android.content.res.AssetManager");
+                        Object assetMgr = nativeAllocInstance(amClass);
+                        Field amF = resImplClass.getDeclaredField("mAssets");
+                        amF.setAccessible(true);
+                        amF.set(resImpl, assetMgr);
+                        log("[OK] AssetManager on ResourcesImpl");
+                    } catch (Throwable t4) {
+                        log("[WARN] AssetManager: " + t4.getClass().getSimpleName());
+                    }
                     } catch (Throwable t3) {}
                     // Set DisplayMetrics on ResourcesImpl
                     try {

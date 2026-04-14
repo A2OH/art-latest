@@ -1461,6 +1461,69 @@ bool Runtime::Start() {
     // Call our stub JNI_OnLoad functions directly — bypass LoadNativeLibrary which
     // crashes on dynamic binary because dlsym() on fake handles from OpenNativeLibrary
     // dereferences invalid soinfo pointers. Our stubs register the native methods we need.
+    // FIRST: dlopen libandroid_runtime.so and register ALL native methods.
+    // Must happen BEFORE JNI_OnLoad calls, because JNI_OnLoad_framework triggers
+    // class loading that may invoke AssetManager clinit → needs native methods.
+    {
+      void* librt = dlopen("libandroid_runtime.so", RTLD_NOW | RTLD_GLOBAL);
+      if (librt) {
+        fprintf(stderr, "[RT] dlopen(libandroid_runtime.so) = %p (EARLY)\n", librt); fflush(stderr);
+        typedef int (*RegFn)(JNIEnv*);
+        struct { const char* sym; const char* name; } regs[] = {
+          {"register_android_graphics_classes", "ALL_GRAPHICS"},
+          {"register_android_functions", "ALL_FUNCTIONS"},
+          {"_Z26register_android_os_BinderP7_JNIEnv", "Binder"},
+          {"_ZN7android26register_android_os_ParcelEP7_JNIEnv", "Parcel"},
+          {"_ZN7android36register_android_os_SystemPropertiesEP7_JNIEnv", "SystemProperties"},
+          {"_ZN7android31register_android_os_SystemClockEP7_JNIEnv", "SystemClock"},
+          {"_Z27register_android_os_ProcessP7_JNIEnv", "Process"},
+          {"_ZN7android25register_android_os_TraceEP7_JNIEnv", "Trace"},
+          {"_ZN7android25register_android_os_DebugEP7_JNIEnv", "Debug"},
+          {"_ZN7android32register_android_os_MessageQueueEP7_JNIEnv", "MessageQueue"},
+          {"_ZN7android34register_android_os_ServiceManagerEP7_JNIEnv", "ServiceManager"},
+          {"_ZN7android37register_android_content_AssetManagerEP7_JNIEnv", "AssetManager"},
+          {"_ZN7android38register_android_content_res_ApkAssetsEP7_JNIEnv", "ApkAssets"},
+          {"_ZN7android36register_android_content_StringBlockEP7_JNIEnv", "StringBlock"},
+          {"_ZN7android33register_android_content_XmlBlockEP7_JNIEnv", "XmlBlock"},
+          {"_ZN7android42register_android_content_res_ConfigurationEP7_JNIEnv", "Configuration"},
+          {"_ZN7android29register_android_view_SurfaceEP7_JNIEnv", "Surface"},
+          {"_ZN7android36register_android_view_SurfaceControlEP7_JNIEnv", "SurfaceControl"},
+          {"_ZN7android36register_android_view_SurfaceSessionEP7_JNIEnv", "SurfaceSession"},
+          {"_ZN7android33register_android_view_InputDeviceEP7_JNIEnv", "InputDevice"},
+          {"_ZN7android34register_android_view_InputChannelEP7_JNIEnv", "InputChannel"},
+          {"_ZN7android30register_android_view_KeyEventEP7_JNIEnv", "KeyEvent"},
+          {"_ZN7android33register_android_view_MotionEventEP7_JNIEnv", "MotionEvent"},
+          {"_ZN7android41register_android_view_WindowManagerGlobalEP7_JNIEnv", "WindowManagerGlobal"},
+          {"_ZN7android29register_android_app_ActivityEP7_JNIEnv", "Activity"},
+          {"_ZN7android35register_android_app_ActivityThreadEP7_JNIEnv", "ActivityThread"},
+          {"_ZN7android47register_android_animation_PropertyValuesHolderEP7_JNIEnv", "PropertyValuesHolder"},
+          {"_ZN7android42register_android_database_SQLiteConnectionEP7_JNIEnv", "SQLiteConnection"},
+          {"_ZN7android38register_android_database_CursorWindowEP7_JNIEnv", "CursorWindow"},
+          {"_ZN7android25register_android_util_LogEP7_JNIEnv", "Log"},
+          {nullptr, nullptr}
+        };
+        int registered = 0, failed = 0;
+        for (int i = 0; regs[i].sym; i++) {
+          RegFn fn = (RegFn)dlsym(librt, regs[i].sym);
+          if (fn) {
+            jni_env->PushLocalFrame(128);
+            int rc = fn(jni_env);
+            jni_env->PopLocalFrame(nullptr);
+            if (self->IsExceptionPending()) self->ClearException();
+            if (rc == 0) registered++;
+            else { fprintf(stderr, "[RT]   WARN: %s returned %d\n", regs[i].name, rc); failed++; }
+          } else { failed++; }
+        }
+        fprintf(stderr, "[RT] libandroid_runtime EARLY: %d/%d registrations OK\n",
+                registered, registered + failed);
+        fflush(stderr);
+      } else {
+        fprintf(stderr, "[RT] dlopen(libandroid_runtime.so) failed: %s (expected in static)\n", dlerror());
+        fflush(stderr);
+      }
+    }
+    if (self->IsExceptionPending()) self->ClearException();
+
     JavaVM* raw_vm = reinterpret_cast<JavaVM*>(java_vm_.get());
     fprintf(stderr, "[RT]   Calling JNI_OnLoad_icu...\n"); fflush(stderr);
     jni_env->PushLocalFrame(128);
@@ -1483,98 +1546,6 @@ bool Runtime::Start() {
     jni_env->PopLocalFrame(nullptr);
     if (self->IsExceptionPending()) self->ClearException();
     jni_env->DeleteGlobalRef(java_lang_Object);
-
-    // DYNAMIC MODE: dlopen libandroid_runtime.so to get REAL Binder/Parcel/Surface natives.
-    // This replaces our no-op stubs with the phone's actual implementations,
-    // giving framework.jar full access to system services via Binder IPC.
-    {
-      void* librt = dlopen("libandroid_runtime.so", RTLD_NOW | RTLD_GLOBAL);
-      if (librt) {
-        fprintf(stderr, "[RT] dlopen(libandroid_runtime.so) = %p\n", librt); fflush(stderr);
-
-        // Registration function type: int register_xxx(JNIEnv*)
-        typedef int (*RegFn)(JNIEnv*);
-
-        // Register ALL available native methods from libandroid_runtime.so.
-        // Use the bulk registration functions first, then individual ones.
-        struct { const char* sym; const char* name; } regs[] = {
-          // BULK: registers ALL graphics JNI (Canvas, Paint, Bitmap, Typeface, etc.)
-          {"register_android_graphics_classes", "ALL_GRAPHICS"},
-          // BULK: registers many android.* JNI methods
-          {"register_android_functions", "ALL_FUNCTIONS"},
-          // OS core
-          {"_Z26register_android_os_BinderP7_JNIEnv", "Binder"},
-          {"_ZN7android26register_android_os_ParcelEP7_JNIEnv", "Parcel"},
-          {"_ZN7android36register_android_os_SystemPropertiesEP7_JNIEnv", "SystemProperties"},
-          {"_ZN7android31register_android_os_SystemClockEP7_JNIEnv", "SystemClock"},
-          {"_Z27register_android_os_ProcessP7_JNIEnv", "Process"},
-          {"_ZN7android25register_android_os_TraceEP7_JNIEnv", "Trace"},
-          {"_ZN7android25register_android_os_DebugEP7_JNIEnv", "Debug"},
-          {"_ZN7android32register_android_os_MessageQueueEP7_JNIEnv", "MessageQueue"},
-          {"_ZN7android34register_android_os_ServiceManagerEP7_JNIEnv", "ServiceManager"},
-          // Content / Resources
-          {"_ZN7android37register_android_content_AssetManagerEP7_JNIEnv", "AssetManager"},
-          {"_ZN7android38register_android_content_res_ApkAssetsEP7_JNIEnv", "ApkAssets"},
-          {"_ZN7android36register_android_content_StringBlockEP7_JNIEnv", "StringBlock"},
-          {"_ZN7android33register_android_content_XmlBlockEP7_JNIEnv", "XmlBlock"},
-          {"_ZN7android42register_android_content_res_ConfigurationEP7_JNIEnv", "Configuration"},
-          // View system
-          {"_ZN7android29register_android_view_SurfaceEP7_JNIEnv", "Surface"},
-          {"_ZN7android36register_android_view_SurfaceControlEP7_JNIEnv", "SurfaceControl"},
-          {"_ZN7android36register_android_view_SurfaceSessionEP7_JNIEnv", "SurfaceSession"},
-          {"_ZN7android33register_android_view_InputDeviceEP7_JNIEnv", "InputDevice"},
-          {"_ZN7android34register_android_view_InputChannelEP7_JNIEnv", "InputChannel"},
-          {"_ZN7android30register_android_view_KeyEventEP7_JNIEnv", "KeyEvent"},
-          {"_ZN7android33register_android_view_MotionEventEP7_JNIEnv", "MotionEvent"},
-          {"_ZN7android32register_android_view_InputQueueEP7_JNIEnv", "InputQueue"},
-          {"_ZN7android41register_android_view_WindowManagerGlobalEP7_JNIEnv", "WindowManagerGlobal"},
-          {"_ZN7android40register_android_view_InputEventReceiverEP7_JNIEnv", "InputEventReceiver"},
-          {"_ZN7android42register_android_view_DisplayEventReceiverEP7_JNIEnv", "DisplayEventReceiver"},
-          // App
-          {"_ZN7android29register_android_app_ActivityEP7_JNIEnv", "Activity"},
-          {"_ZN7android35register_android_app_ActivityThreadEP7_JNIEnv", "ActivityThread"},
-          // Animation
-          {"_ZN7android47register_android_animation_PropertyValuesHolderEP7_JNIEnv", "PropertyValuesHolder"},
-          // Database (SQLite)
-          {"_ZN7android42register_android_database_SQLiteConnectionEP7_JNIEnv", "SQLiteConnection"},
-          {"_ZN7android38register_android_database_SQLiteGlobalEP7_JNIEnv", "SQLiteGlobal"},
-          {"_ZN7android38register_android_database_CursorWindowEP7_JNIEnv", "CursorWindow"},
-          // Text
-          {"_ZN7android32register_android_text_HyphenatorEP7_JNIEnv", "Hyphenator"},
-          {"_ZN7android38register_android_text_AndroidCharacterEP7_JNIEnv", "AndroidCharacter"},
-          // Util
-          {"_ZN7android25register_android_util_LogEP7_JNIEnv", "Log"},
-          {"_ZN7android30register_android_util_EventLogEP7_JNIEnv", "EventLog"},
-          {nullptr, nullptr}
-        };
-        int registered = 0, failed = 0;
-        for (int i = 0; regs[i].sym; i++) {
-          RegFn fn = (RegFn)dlsym(librt, regs[i].sym);
-          if (fn) {
-            jni_env->PushLocalFrame(128);
-            int rc = fn(jni_env);
-            jni_env->PopLocalFrame(nullptr);
-            if (self->IsExceptionPending()) self->ClearException();
-            if (rc == 0) {
-              registered++;
-            } else {
-              fprintf(stderr, "[RT]   WARN: %s register returned %d\n", regs[i].name, rc);
-              failed++;
-            }
-          } else {
-            // Symbol not found — skip silently (different Android versions have different symbols)
-            failed++;
-          }
-        }
-        fprintf(stderr, "[RT] libandroid_runtime: %d/%d JNI registrations OK\n",
-                registered, registered + failed);
-        fflush(stderr);
-      } else {
-        fprintf(stderr, "[RT] dlopen(libandroid_runtime.so) failed: %s\n", dlerror());
-        fprintf(stderr, "[RT]   (expected in static builds — using stubs)\n");
-        fflush(stderr);
-      }
-    }
 
     // WellKnownClasses::LateInit may also crash -- skip for standalone
     fprintf(stderr, "[RT]   Skipping WellKnownClasses::LateInit\n"); fflush(stderr);
