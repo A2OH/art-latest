@@ -161,6 +161,23 @@ static void InterpreterJni(Thread* self,
                                    soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
       // No state transition: stay in kRunnable for FastNative compat + nonconcurrent GC
       result->SetD(fn(soa.Env(), klass.get(), *reinterpret_cast<jlong*>(&args[0])));
+    } else if (shorty == "DD") {
+      // double fn(JNIEnv*, jclass, double) — Math.ceil, Math.floor, Math.sqrt, etc.
+      using fntype = jdouble(JNIEnv*, jclass, jdouble);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jclass> klass(soa.Env(),
+                                   soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
+      jdouble arg0 = *reinterpret_cast<jdouble*>(&args[0]);
+      result->SetD(fn(soa.Env(), klass.get(), arg0));
+    } else if (shorty == "DDD") {
+      // double fn(JNIEnv*, jclass, double, double) — Math.max, Math.min, Math.pow
+      using fntype = jdouble(JNIEnv*, jclass, jdouble, jdouble);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jclass> klass(soa.Env(),
+                                   soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
+      jdouble arg0 = *reinterpret_cast<jdouble*>(&args[0]);
+      jdouble arg1 = *reinterpret_cast<jdouble*>(&args[2]); // double takes 2 slots
+      result->SetD(fn(soa.Env(), klass.get(), arg0, arg1));
     } else if (shorty == "FI") {
       using fntype = jfloat(JNIEnv*, jclass, jint);
       fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
@@ -419,6 +436,16 @@ static void InterpreterJni(Thread* self,
                                    soa.AddLocalReference<jobject>(ObjArg(args[0])));
       jlong arg1 = *reinterpret_cast<jlong*>(&args[1]);
       result->SetJ(fn(soa.Env(), klass.get(), arg0.get(), arg1));
+    } else if (shorty == "LLII") {
+      // Object fn(JNIEnv*, jclass, Object, int, int) — StringFactory.newStringFromUtf8Bytes etc.
+      using fntype = jobject(JNIEnv*, jclass, jobject, jint, jint);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jclass> klass(soa.Env(),
+                                   soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
+      ScopedLocalRef<jobject> arg0(soa.Env(),
+                                   soa.AddLocalReference<jobject>(ObjArg(args[0])));
+      ScopedLocalRef<jobject> jresult(soa.Env(), fn(soa.Env(), klass.get(), arg0.get(), args[1], args[2]));
+      result->SetL(soa.Decode<mirror::Object>(jresult.get()));
     } else {
       LOG(WARNING) << "InterpreterJni: unhandled static shorty '" << shorty << "' for " << method->PrettyMethod();
     }

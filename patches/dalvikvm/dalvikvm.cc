@@ -2453,42 +2453,93 @@ static int InvokeMain(JNIEnv* env, char** argv) {
       }
       if (env->ExceptionCheck()) env->ExceptionClear();
 
-      // Fix Kotlin's kotlin.text.Charsets.UTF_8 (most common source of null Charset in MCD)
-      jclass ktCharsets = env->FindClass("kotlin/text/Charsets");
-      if (env->ExceptionCheck()) env->ExceptionClear();
-      if (ktCharsets) {
-        // Get StandardCharsets.UTF_8 as the value
-        jclass scCls2 = env->FindClass("java/nio/charset/StandardCharsets");
+      // Fix kotlin.text.Charsets.UTF_8 — clinit fails with NoClassDefFoundError.
+      // Must use JNI FindClass (not FindSystemClass) because it's in MCD DEX.
+      // FindClass triggers clinit which fails and is tolerated — then we set the field.
+      {
+        jclass ktCharsets = env->FindClass("kotlin/text/Charsets");
         if (env->ExceptionCheck()) env->ExceptionClear();
-        jobject stdUtf8 = nullptr;
-        if (scCls2) {
-          jfieldID suf = env->GetStaticFieldID(scCls2, "UTF_8", "Ljava/nio/charset/Charset;");
+        fprintf(stderr, "[dalvikvm] kotlin.text.Charsets FindClass: %p\n", ktCharsets);
+        if (ktCharsets) {
+          // Get StandardCharsets.UTF_8
+          jclass scCls2 = env->FindClass("java/nio/charset/StandardCharsets");
           if (env->ExceptionCheck()) env->ExceptionClear();
-          if (suf) stdUtf8 = env->GetStaticObjectField(scCls2, suf);
-        }
-        if (stdUtf8) {
-          jfieldID ktUtf8F = env->GetStaticFieldID(ktCharsets, "UTF_8", "Ljava/nio/charset/Charset;");
-          if (env->ExceptionCheck()) env->ExceptionClear();
-          if (ktUtf8F) {
-            env->SetStaticObjectField(ktCharsets, ktUtf8F, stdUtf8);
-            fprintf(stderr, "[dalvikvm] Fixed kotlin.text.Charsets.UTF_8\n");
+          jobject stdUtf8 = nullptr;
+          if (scCls2) {
+            jfieldID suf = env->GetStaticFieldID(scCls2, "UTF_8", "Ljava/nio/charset/Charset;");
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            if (suf) stdUtf8 = env->GetStaticObjectField(scCls2, suf);
+          }
+          fprintf(stderr, "[dalvikvm] StandardCharsets.UTF_8 = %p\n", stdUtf8);
+          if (!stdUtf8) {
+            // StandardCharsets.UTF_8 is null! Create via Charset.forName
+            jclass csCls = env->FindClass("java/nio/charset/Charset");
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            if (csCls) {
+              jmethodID forName = env->GetStaticMethodID(csCls, "forName",
+                  "(Ljava/lang/String;)Ljava/nio/charset/Charset;");
+              if (env->ExceptionCheck()) env->ExceptionClear();
+              if (forName) {
+                stdUtf8 = env->CallStaticObjectMethod(csCls, forName, env->NewStringUTF("UTF-8"));
+                if (env->ExceptionCheck()) { env->ExceptionClear(); stdUtf8 = nullptr; }
+                fprintf(stderr, "[dalvikvm] Charset.forName(UTF-8) = %p\n", stdUtf8);
+              }
+            }
+            if (!stdUtf8) {
+              // Try multiple concrete charset implementations
+              const char* implClasses[] = {
+                "sun/nio/cs/UTF_8",
+                "com/android/icu/charset/CharsetICU",
+                "java/nio/charset/Charset",  // abstract, but AllocObject may work
+                nullptr
+              };
+              for (int ci = 0; !stdUtf8 && implClasses[ci]; ci++) {
+                jclass implCls = env->FindClass(implClasses[ci]);
+                if (env->ExceptionCheck()) { env->ExceptionClear(); continue; }
+                if (implCls) {
+                  stdUtf8 = env->AllocObject(implCls);
+                  if (env->ExceptionCheck()) { env->ExceptionClear(); stdUtf8 = nullptr; continue; }
+                  fprintf(stderr, "[dalvikvm] AllocObject(%s) = %p\n", implClasses[ci], stdUtf8);
+                }
+              }
+              // Set the name field on whatever we created
+              if (stdUtf8) {
+                jclass charsetCls = env->FindClass("java/nio/charset/Charset");
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                if (charsetCls) {
+                  jfieldID nameF = env->GetFieldID(charsetCls, "name", "Ljava/lang/String;");
+                  if (env->ExceptionCheck()) env->ExceptionClear();
+                  if (nameF) env->SetObjectField(stdUtf8, nameF, env->NewStringUTF("UTF-8"));
+                }
+                fprintf(stderr, "[dalvikvm] Created UTF-8 charset with name field set\n");
+              } else {
+                fprintf(stderr, "[dalvikvm] WARN: Could not create any UTF-8 charset instance\n");
+              }
+            }
+            // Set StandardCharsets.UTF_8
+            if (stdUtf8 && scCls2) {
+              jfieldID suf2 = env->GetStaticFieldID(scCls2, "UTF_8", "Ljava/nio/charset/Charset;");
+              if (env->ExceptionCheck()) env->ExceptionClear();
+              if (suf2) {
+                env->SetStaticObjectField(scCls2, suf2, stdUtf8);
+                fprintf(stderr, "[dalvikvm] Set StandardCharsets.UTF_8\n");
+              }
+            }
+          }
+          if (stdUtf8) {
+            jfieldID ktUtf8F = env->GetStaticFieldID(ktCharsets, "UTF_8", "Ljava/nio/charset/Charset;");
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            fprintf(stderr, "[dalvikvm] kotlin.text.Charsets.UTF_8 field = %p\n", (void*)ktUtf8F);
+            if (ktUtf8F) {
+              jobject cur = env->GetStaticObjectField(ktCharsets, ktUtf8F);
+              fprintf(stderr, "[dalvikvm] kotlin.text.Charsets.UTF_8 current = %p\n", cur);
+              env->SetStaticObjectField(ktCharsets, ktUtf8F, stdUtf8);
+              fprintf(stderr, "[dalvikvm] Fixed kotlin.text.Charsets.UTF_8\n");
+            }
           }
         }
-        // Also set ISO_8859_1, US_ASCII
-        const char* ktFields[] = {"ISO_8859_1", "US_ASCII", nullptr};
-        const char* scFields[] = {"ISO_8859_1", "US_ASCII", nullptr};
-        for (int i = 0; ktFields[i]; i++) {
-          jfieldID kf = env->GetStaticFieldID(ktCharsets, ktFields[i], "Ljava/nio/charset/Charset;");
-          if (env->ExceptionCheck()) { env->ExceptionClear(); continue; }
-          jfieldID sf = scCls2 ? env->GetStaticFieldID(scCls2, scFields[i], "Ljava/nio/charset/Charset;") : nullptr;
-          if (env->ExceptionCheck()) { env->ExceptionClear(); continue; }
-          if (kf && sf) {
-            jobject val = env->GetStaticObjectField(scCls2, sf);
-            if (val) env->SetStaticObjectField(ktCharsets, kf, val);
-          }
-        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
       }
-      if (env->ExceptionCheck()) env->ExceptionClear();
     }
 
     // Also ensure Looper.sMainLooper is set (many Android APIs need it)
