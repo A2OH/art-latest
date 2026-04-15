@@ -1006,8 +1006,9 @@ public class McdLoader {
                                 log("[WARN] createDisplay: " + x.getClass().getSimpleName());
                             }
                             // Create surface
+                            // Create FULL SCREEN surface for maximum visibility
                             long scPtr = (Long)nc.invoke(null, session, "WestlakeMCD",
-                                500, 300, 1 /*RGBA_8888*/, 0, 0L, null);
+                                1080, 2280, 1 /*RGBA_8888*/, 0, 0L, null);
                             log("[OK] SurfaceControl nativeCreate ptr=" + scPtr);
                             // Set native pointer on SurfaceControl
                             try {
@@ -1070,7 +1071,26 @@ public class McdLoader {
                                     Class<?> canvasClass = Class.forName("android.graphics.Canvas");
                                     Method drawColor = canvasClass.getDeclaredMethod("drawColor", int.class);
                                     drawColor.invoke(canvas, 0xFFDA291C); // MCD Red
-                                    log("[OK] drawColor(MCD_RED) called!");
+                                    log("[OK] drawColor(MCD_RED) — full screen red!");
+                                    // Draw text
+                                    try {
+                                        Class<?> paintClass = Class.forName("android.graphics.Paint");
+                                        Object paint = paintClass.getDeclaredConstructor().newInstance();
+                                        Method setColor = paintClass.getMethod("setColor", int.class);
+                                        setColor.invoke(paint, 0xFFFFFFFF); // White
+                                        Method setTextSize = paintClass.getMethod("setTextSize", float.class);
+                                        setTextSize.invoke(paint, 120f);
+                                        Method drawText = canvasClass.getDeclaredMethod("drawText",
+                                            String.class, float.class, float.class, paintClass);
+                                        drawText.invoke(canvas, "WESTLAKE", 150f, 500f, paint);
+                                        drawText.invoke(canvas, "MCD", 300f, 700f, paint);
+                                        setTextSize.invoke(paint, 60f);
+                                        drawText.invoke(canvas, "Running on ART v118", 100f, 900f, paint);
+                                        drawText.invoke(canvas, "Switch Interpreter", 150f, 1000f, paint);
+                                        log("[OK] Drew text: WESTLAKE MCD");
+                                    } catch (Throwable x) {
+                                        log("[WARN] Text: " + x.getClass().getSimpleName());
+                                    }
                                     // Unlock and post
                                     Method unlockAndPost = surfClass.getDeclaredMethod("unlockCanvasAndPost", canvasClass);
                                     unlockAndPost.invoke(surface, canvas);
@@ -1140,9 +1160,9 @@ public class McdLoader {
                                     try {
                                         Class<?> rectClass = Class.forName("android.graphics.Rect");
                                         Object srcRect = rectClass.getConstructor(int.class,int.class,int.class,int.class)
-                                            .newInstance(0, 0, 500, 300);
+                                            .newInstance(0, 0, 1080, 2280);
                                         Object dstRect = rectClass.getConstructor(int.class,int.class,int.class,int.class)
-                                            .newInstance(100, 300, 600, 600);
+                                            .newInstance(0, 0, 1080, 2280);
                                         Method setGeo = txClass.getDeclaredMethod("setGeometry", scClass,
                                             rectClass, rectClass, int.class);
                                         setGeo.setAccessible(true);
@@ -1160,7 +1180,8 @@ public class McdLoader {
                                     log("[OK] Transaction.apply() — layer stack 0, shown, layer MAX, pos(100,200)");
                                     // Keep alive for 10 seconds so user can see it
                                     log("[INFO] MCD RED RECTANGLE SHOULD BE VISIBLE ON PHONE SCREEN!");
-                                    Thread.sleep(10000);
+                                    log("[INFO] WESTLAKE RED SCREEN — LOOK AT PHONE FOR 30 SECONDS!");
+                                    Thread.sleep(30000);
                                 }
                             } catch (Throwable x) {
                                 log("[WARN] Canvas: " + x.getClass().getSimpleName());
