@@ -1180,8 +1180,21 @@ public class McdLoader {
                                     log("[OK] Transaction.apply() — layer stack 0, shown, layer MAX, pos(100,200)");
                                     // Keep alive for 10 seconds so user can see it
                                     log("[INFO] MCD RED RECTANGLE SHOULD BE VISIBLE ON PHONE SCREEN!");
-                                    log("[INFO] WESTLAKE RED SCREEN — LOOK AT PHONE FOR 30 SECONDS!");
-                                    Thread.sleep(30000);
+                                    // Flash colors so it's impossible to miss
+                                    log("[INFO] FLASHING SCREEN — look at phone!");
+                                    int[] colors = {0xFFDA291C, 0xFFFFC72C, 0xFF27251F, 0xFFFFFFFF};
+                                    String[] names = {"MCD_RED", "MCD_GOLD", "MCD_BROWN", "WHITE"};
+                                    for (int frame = 0; frame < 30; frame++) {
+                                        int c = colors[frame % colors.length];
+                                        try {
+                                            Object canvas2 = lockCanvas.invoke(surface, (Object)null);
+                                            if (canvas2 != null) {
+                                                drawColor.invoke(canvas2, c);
+                                                unlockAndPost.invoke(surface, canvas2);
+                                            }
+                                        } catch (Throwable x) { break; }
+                                        Thread.sleep(500); // 2fps flash
+                                    }
                                 }
                             } catch (Throwable x) {
                                 log("[WARN] Canvas: " + x.getClass().getSimpleName());
