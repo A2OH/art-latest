@@ -542,6 +542,48 @@ static void InterpreterJni(Thread* self,
                                    soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
       jlong arg0 = *reinterpret_cast<jlong*>(&args[0]);
       fn(soa.Env(), klass.get(), arg0);
+    } else if (shorty == "VJJI") {
+      // void fn(JNIEnv*, jclass, long, long, int) — SC.nativeSetLayer/nativeSetLayerStack
+      using fntype = void(JNIEnv*, jclass, jlong, jlong, jint);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jclass> klass(soa.Env(), soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
+      jlong a0 = *reinterpret_cast<jlong*>(&args[0]);
+      jlong a1 = *reinterpret_cast<jlong*>(&args[2]);
+      fn(soa.Env(), klass.get(), a0, a1, args[4]);
+    } else if (shorty == "VJJII") {
+      // void fn(JNIEnv*, jclass, long, long, int, int) — SC.nativeSetFlags
+      using fntype = void(JNIEnv*, jclass, jlong, jlong, jint, jint);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jclass> klass(soa.Env(), soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
+      jlong a0 = *reinterpret_cast<jlong*>(&args[0]);
+      jlong a1 = *reinterpret_cast<jlong*>(&args[2]);
+      fn(soa.Env(), klass.get(), a0, a1, args[4], args[5]);
+    } else if (shorty == "VJJLLJ") {
+      // void fn(JNIEnv*, jclass, long, long, Object, Object, long) — SC.nativeSetGeometry
+      using fntype = void(JNIEnv*, jclass, jlong, jlong, jobject, jobject, jlong);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jclass> klass(soa.Env(), soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
+      jlong a0 = *reinterpret_cast<jlong*>(&args[0]);
+      jlong a1 = *reinterpret_cast<jlong*>(&args[2]);
+      ScopedLocalRef<jobject> a2(soa.Env(), soa.AddLocalReference<jobject>(ObjArg(args[4])));
+      ScopedLocalRef<jobject> a3(soa.Env(), soa.AddLocalReference<jobject>(ObjArg(args[5])));
+      jlong a4 = *reinterpret_cast<jlong*>(&args[6]);
+      fn(soa.Env(), klass.get(), a0, a1, a2.get(), a3.get(), a4);
+    } else if (shorty == "VJZZ") {
+      // void fn(JNIEnv*, jclass, long, boolean, boolean) — SC.nativeApplyTransaction
+      using fntype = void(JNIEnv*, jclass, jlong, jboolean, jboolean);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jclass> klass(soa.Env(), soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
+      jlong a0 = *reinterpret_cast<jlong*>(&args[0]);
+      fn(soa.Env(), klass.get(), a0, (jboolean)args[2], (jboolean)args[3]);
+    } else if (shorty == "VLJI") {
+      // void fn(JNIEnv*, jclass, Object, long, int) — Thread.sleep
+      using fntype = void(JNIEnv*, jclass, jobject, jlong, jint);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jclass> klass(soa.Env(), soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
+      ScopedLocalRef<jobject> a0(soa.Env(), soa.AddLocalReference<jobject>(ObjArg(args[0])));
+      jlong a1 = *reinterpret_cast<jlong*>(&args[1]);
+      fn(soa.Env(), klass.get(), a0.get(), a1, args[3]);
     } else if (shorty == "VJII") {
       // void fn(JNIEnv*, jclass, long, int, int) — Canvas.nDrawColor etc.
       using fntype = void(JNIEnv*, jclass, jlong, jint, jint);
@@ -1000,6 +1042,14 @@ static void InterpreterJni(Thread* self,
       ScopedLocalRef<jobject> rcvr(soa.Env(), soa.AddLocalReference<jobject>(receiver));
       jlong arg0 = *reinterpret_cast<jlong*>(&args[0]);
       ScopedLocalRef<jobject> r(soa.Env(), fn(soa.Env(), rcvr.get(), arg0));
+      result->SetL(soa.Decode<mirror::Object>(r.get()));
+    } else if (shorty == "LLII") {
+      // Object fn(JNIEnv*, jobject, Object, int, int) — Linux.open(path, flags, mode)
+      using fntype = jobject(JNIEnv*, jobject, jobject, jint, jint);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jobject> rcvr(soa.Env(), soa.AddLocalReference<jobject>(receiver));
+      ScopedLocalRef<jobject> arg0(soa.Env(), soa.AddLocalReference<jobject>(ObjArg(args[0])));
+      ScopedLocalRef<jobject> r(soa.Env(), fn(soa.Env(), rcvr.get(), arg0.get(), args[1], args[2]));
       result->SetL(soa.Decode<mirror::Object>(r.get()));
     } else if (shorty == "ZILLI") {
       // boolean fn(JNIEnv*, jobject, int, Object, Object, int) — BinderProxy.transactNative!

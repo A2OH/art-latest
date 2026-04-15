@@ -1156,44 +1156,30 @@ public class McdLoader {
                                     Method setLayer = txClass.getDeclaredMethod("setLayer", scClass, int.class);
                                     setLayer.setAccessible(true);
                                     setLayer.invoke(tx, surfaceControl, 0x7FFFFFFF);
-                                    // Set position using setGeometry for reliable placement
-                                    try {
-                                        Class<?> rectClass = Class.forName("android.graphics.Rect");
-                                        Object srcRect = rectClass.getConstructor(int.class,int.class,int.class,int.class)
-                                            .newInstance(0, 0, 1080, 2280);
-                                        Object dstRect = rectClass.getConstructor(int.class,int.class,int.class,int.class)
-                                            .newInstance(0, 0, 1080, 2280);
-                                        Method setGeo = txClass.getDeclaredMethod("setGeometry", scClass,
-                                            rectClass, rectClass, int.class);
-                                        setGeo.setAccessible(true);
-                                        setGeo.invoke(tx, surfaceControl, srcRect, dstRect, 0);
-                                        log("[OK] setGeometry(src=0,0,500,300 dst=100,300,600,600)");
-                                    } catch (Throwable x) {
-                                        // Fallback to setPosition
-                                        Method setPos = txClass.getDeclaredMethod("setPosition", scClass, float.class, float.class);
-                                        setPos.setAccessible(true);
-                                        setPos.invoke(tx, surfaceControl, 100f, 300f);
-                                    }
+                                    // Full screen — no position needed (defaults to 0,0)
                                     Method apply = txClass.getDeclaredMethod("apply");
                                     apply.setAccessible(true);
                                     apply.invoke(tx);
                                     log("[OK] Transaction.apply() — layer stack 0, shown, layer MAX, pos(100,200)");
                                     // Keep alive for 10 seconds so user can see it
                                     log("[INFO] MCD RED RECTANGLE SHOULD BE VISIBLE ON PHONE SCREEN!");
-                                    // Flash colors so it's impossible to miss
-                                    log("[INFO] FLASHING SCREEN — look at phone!");
-                                    int[] colors = {0xFFDA291C, 0xFFFFC72C, 0xFF27251F, 0xFFFFFFFF};
-                                    String[] names = {"MCD_RED", "MCD_GOLD", "MCD_BROWN", "WHITE"};
-                                    for (int frame = 0; frame < 30; frame++) {
-                                        int c = colors[frame % colors.length];
+                                    // Animate MCD branding using only drawColor (works!)
+                                    log("[INFO] MCD animation — 30 seconds!");
+                                    // MCD color palette
+                                    int MCD_RED = 0xFFDA291C;
+                                    int MCD_GOLD = 0xFFFFC72C;
+                                    int MCD_BROWN = 0xFF27251F;
+                                    int MCD_WHITE = 0xFFFFFFFF;
+                                    int[] palette = {MCD_RED, MCD_GOLD, MCD_BROWN, MCD_RED, MCD_WHITE, MCD_GOLD};
+                                    for (int frame = 0; frame < 60; frame++) {
                                         try {
-                                            Object canvas2 = lockCanvas.invoke(surface, (Object)null);
-                                            if (canvas2 != null) {
-                                                drawColor.invoke(canvas2, c);
-                                                unlockAndPost.invoke(surface, canvas2);
-                                            }
+                                            Object c2 = lockCanvas.invoke(surface, (Object)null);
+                                            if (c2 == null) break;
+                                            // Cycle through MCD colors
+                                            drawColor.invoke(c2, palette[frame % palette.length]);
+                                            unlockAndPost.invoke(surface, c2);
                                         } catch (Throwable x) { break; }
-                                        Thread.sleep(500); // 2fps flash
+                                        Thread.sleep(500);
                                     }
                                 }
                             } catch (Throwable x) {
