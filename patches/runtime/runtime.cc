@@ -204,6 +204,197 @@ extern "C" int JNI_OnLoad_framework(void* vm, void* reserved);
 
 namespace art HIDDEN {
 
+extern "C" jint Westlake_UnixFileSystem_getBooleanAttributes(JNIEnv*, jobject, jobject);
+extern "C" jboolean Westlake_UnixFileSystem_hasBooleanAttributes(JNIEnv*, jobject, jobject, jint);
+extern "C" jboolean Westlake_UnixFileSystem_checkAccess(JNIEnv*, jobject, jobject, jint);
+extern "C" jlong Westlake_UnixFileSystem_getLastModifiedTime(JNIEnv*, jobject, jobject);
+extern "C" jlong Westlake_UnixFileSystem_getLength(JNIEnv*, jobject, jobject);
+
+extern "C" jobject Westlake_HashMap_put(JNIEnv* env, jobject thiz, jobject key, jobject value) {
+  struct HashMapIds {
+    bool init_attempted = false;
+    bool init_ok = false;
+    jclass hash_map_class = nullptr;
+    jclass node_class = nullptr;
+    jfieldID table_field = nullptr;
+    jfieldID size_field = nullptr;
+    jfieldID threshold_field = nullptr;
+    jfieldID mod_count_field = nullptr;
+    jfieldID node_hash_field = nullptr;
+    jfieldID node_key_field = nullptr;
+    jfieldID node_value_field = nullptr;
+    jfieldID node_next_field = nullptr;
+    jmethodID node_ctor = nullptr;
+    jmethodID object_hash_code = nullptr;
+    jmethodID object_equals = nullptr;
+  };
+  static HashMapIds ids;
+
+  if (thiz == nullptr) {
+    return nullptr;
+  }
+
+  if (!ids.init_attempted) {
+    ids.init_attempted = true;
+    jclass hash_map_local = env->FindClass("java/util/HashMap");
+    jclass node_local = env->FindClass("java/util/HashMap$Node");
+    jclass object_local = env->FindClass("java/lang/Object");
+    if (env->ExceptionCheck()) {
+      env->ExceptionClear();
+    }
+    if (hash_map_local != nullptr) {
+      ids.hash_map_class = reinterpret_cast<jclass>(env->NewGlobalRef(hash_map_local));
+    }
+    if (node_local != nullptr) {
+      ids.node_class = reinterpret_cast<jclass>(env->NewGlobalRef(node_local));
+    }
+    if (ids.hash_map_class != nullptr) {
+      ids.table_field = env->GetFieldID(ids.hash_map_class, "table", "[Ljava/util/HashMap$Node;");
+      ids.size_field = env->GetFieldID(ids.hash_map_class, "size", "I");
+      ids.threshold_field = env->GetFieldID(ids.hash_map_class, "threshold", "I");
+      ids.mod_count_field = env->GetFieldID(ids.hash_map_class, "modCount", "I");
+    }
+    if (ids.node_class != nullptr) {
+      ids.node_hash_field = env->GetFieldID(ids.node_class, "hash", "I");
+      ids.node_key_field = env->GetFieldID(ids.node_class, "key", "Ljava/lang/Object;");
+      ids.node_value_field = env->GetFieldID(ids.node_class, "value", "Ljava/lang/Object;");
+      ids.node_next_field = env->GetFieldID(ids.node_class, "next", "Ljava/util/HashMap$Node;");
+      ids.node_ctor = env->GetMethodID(
+          ids.node_class, "<init>", "(ILjava/lang/Object;Ljava/lang/Object;Ljava/util/HashMap$Node;)V");
+    }
+    if (object_local != nullptr) {
+      ids.object_hash_code = env->GetMethodID(object_local, "hashCode", "()I");
+      ids.object_equals = env->GetMethodID(object_local, "equals", "(Ljava/lang/Object;)Z");
+    }
+    if (env->ExceptionCheck()) {
+      env->ExceptionClear();
+    }
+    ids.init_ok = ids.hash_map_class != nullptr &&
+                  ids.node_class != nullptr &&
+                  ids.table_field != nullptr &&
+                  ids.size_field != nullptr &&
+                  ids.threshold_field != nullptr &&
+                  ids.mod_count_field != nullptr &&
+                  ids.node_hash_field != nullptr &&
+                  ids.node_key_field != nullptr &&
+                  ids.node_value_field != nullptr &&
+                  ids.node_next_field != nullptr &&
+                  ids.node_ctor != nullptr &&
+                  ids.object_hash_code != nullptr &&
+                  ids.object_equals != nullptr;
+    fprintf(stderr, "[RT] HashMap.put native init: %s\n", ids.init_ok ? "ok" : "failed");
+    fflush(stderr);
+  }
+
+  if (!ids.init_ok) {
+    return nullptr;
+  }
+
+  jobjectArray table = reinterpret_cast<jobjectArray>(env->GetObjectField(thiz, ids.table_field));
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+    table = nullptr;
+  }
+  jint table_length = table != nullptr ? env->GetArrayLength(table) : 0;
+  if (table == nullptr || table_length == 0) {
+    jint requested = env->GetIntField(thiz, ids.threshold_field);
+    if (env->ExceptionCheck()) {
+      env->ExceptionClear();
+      requested = 0;
+    }
+    jint capacity = requested > 0 ? requested : 64;
+    jint rounded = 1;
+    while (rounded < capacity && rounded < (1 << 29)) {
+      rounded <<= 1;
+    }
+    if (rounded < 16) {
+      rounded = 16;
+    }
+    capacity = rounded;
+    table = env->NewObjectArray(capacity, ids.node_class, nullptr);
+    if (env->ExceptionCheck()) {
+      env->ExceptionClear();
+      return nullptr;
+    }
+    env->SetObjectField(thiz, ids.table_field, table);
+    env->SetIntField(thiz, ids.threshold_field, capacity - (capacity >> 2));
+    if (env->ExceptionCheck()) {
+      env->ExceptionClear();
+    }
+    table_length = capacity;
+  }
+
+  jint hash = 0;
+  if (key != nullptr) {
+    jint raw_hash = env->CallIntMethod(key, ids.object_hash_code);
+    if (env->ExceptionCheck()) {
+      env->ExceptionClear();
+      raw_hash = 0;
+    }
+    hash = raw_hash ^ static_cast<jint>(static_cast<uint32_t>(raw_hash) >> 16);
+  }
+
+  jint index = (table_length - 1) & hash;
+  jobject node = env->GetObjectArrayElement(table, index);
+  jobject prev = nullptr;
+  while (node != nullptr) {
+    jint node_hash = env->GetIntField(node, ids.node_hash_field);
+    jobject node_key = env->GetObjectField(node, ids.node_key_field);
+    bool same_key = env->IsSameObject(node_key, key);
+    if (!same_key && key != nullptr && node_key != nullptr) {
+      same_key = env->CallBooleanMethod(key, ids.object_equals, node_key) == JNI_TRUE;
+      if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        same_key = false;
+      }
+    }
+    if (node_hash == hash && same_key) {
+      jobject old_value = env->GetObjectField(node, ids.node_value_field);
+      if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        old_value = nullptr;
+      }
+      env->SetObjectField(node, ids.node_value_field, value);
+      if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+      }
+      return old_value;
+    }
+    prev = node;
+    node = env->GetObjectField(node, ids.node_next_field);
+    if (env->ExceptionCheck()) {
+      env->ExceptionClear();
+      node = nullptr;
+    }
+  }
+
+  jobject new_node = env->NewObject(ids.node_class, ids.node_ctor, hash, key, value, nullptr);
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return nullptr;
+  }
+  if (prev == nullptr) {
+    env->SetObjectArrayElement(table, index, new_node);
+  } else {
+    env->SetObjectField(prev, ids.node_next_field, new_node);
+  }
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+  }
+
+  jint size = env->GetIntField(thiz, ids.size_field);
+  jint mod_count = env->GetIntField(thiz, ids.mod_count_field);
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+  }
+  env->SetIntField(thiz, ids.size_field, size + 1);
+  env->SetIntField(thiz, ids.mod_count_field, mod_count + 1);
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+  }
+  return nullptr;
+}
+
 // If a signal isn't handled properly, enable a handler that attempts to dump the Java stack.
 static constexpr bool kEnableJavaStackTraceHandler = false;
 // Tuned by compiling GmsCore under perf and measuring time spent in DescriptorEquals for class
@@ -248,6 +439,11 @@ inline char** GetEnviron() { return environ; }
 void CheckConstants() {
   CHECK_EQ(mirror::Array::kFirstElementOffset, mirror::Array::FirstElementOffset());
 }
+
+// Standalone Westlake runs app dex files through a native-created PathClassLoader.
+// Keep the DexFile storage alive for the whole process so the class loader's
+// cookies never reference freed DexFile objects.
+std::vector<std::unique_ptr<const DexFile>> g_standalone_class_path_dex_files;
 
 }  // namespace
 
@@ -999,7 +1195,9 @@ static jobject CreateSystemClassLoader(Runtime* runtime) {
   ScopedAssertNoThreadSuspension sants(__FUNCTION__);
   jobject g_system_class_loader =
       runtime->GetJavaVM()->AddGlobalRef(soa.Self(), system_class_loader);
-  soa.Self()->SetClassLoaderOverride(g_system_class_loader);
+  // Standalone Westlake builds keep the Java-level system/context class loader,
+  // but skipping the native class-loader override avoids SIGBUS in LookupClass
+  // when native class resolution decodes the override during app class loading.
 
   ObjPtr<mirror::Class> thread_class = WellKnownClasses::java_lang_Thread.Get();
   ArtField* contextClassLoader =
@@ -1120,17 +1318,41 @@ void Runtime::RunRootClinits(Thread* self) {
 bool Runtime::Start() {
   fprintf(stderr, "[RT] Runtime::Start() ENTERED\n"); fflush(stderr);
 
-  // Deferred classpath-to-BCP append (after boot image loaded successfully)
+  // Prepare a standalone app class loader from -classpath dex files without
+  // appending those dex files to the boot class path.
+  std::vector<const DexFile*> standalone_class_path;
   if (!class_path_string_.empty()) {
     std::vector<std::string> cp_entries;
     Split(class_path_string_, ':', &cp_entries);
+    static constexpr bool kVerifyChecksum = true;
+    const bool verify = IsVerificationEnabled();
+    g_standalone_class_path_dex_files.clear();
     for (const std::string& entry : cp_entries) {
-      fprintf(stderr, "[RT] Deferred BCP append: %s\n", entry.c_str());
-      boot_class_path_.push_back(entry);
-      if (!boot_class_path_locations_.empty()) {
-        boot_class_path_locations_.push_back(entry);
+      if (entry.empty()) {
+        continue;
+      }
+      std::vector<std::unique_ptr<const DexFile>> dex_files;
+      std::string error_msg;
+      ArtDexFileLoader dex_file_loader(entry.c_str());
+      if (!dex_file_loader.Open(verify, kVerifyChecksum, &error_msg, &dex_files)) {
+        fprintf(stderr, "[RT] Deferred BCP append failed: %s (%s)\n",
+                entry.c_str(),
+                error_msg.c_str());
+        fflush(stderr);
+        continue;
+      }
+      fprintf(stderr, "[RT] Standalone class path open: %s (%zu dex)\n",
+              entry.c_str(),
+              dex_files.size());
+      fflush(stderr);
+      for (std::unique_ptr<const DexFile>& dex_file : dex_files) {
+        standalone_class_path.push_back(dex_file.get());
+        g_standalone_class_path_dex_files.push_back(std::move(dex_file));
       }
     }
+    fprintf(stderr, "[RT] Standalone class path ready: %zu dex files\n",
+            standalone_class_path.size());
+    fflush(stderr);
   }
   VLOG(startup) << "Runtime::Start entering";
 
@@ -1179,6 +1401,167 @@ bool Runtime::Start() {
         fflush(stderr);
       }
     }
+    if (self->IsExceptionPending()) self->ClearException();
+  }
+
+  // PATCH: Route java.io.UnixFileSystem wrappers directly to native stubs.
+  // In imageless standalone mode these methods can lose their native flags or
+  // trip Blocker/ThreadLocal before reaching the private *0 natives.
+  {
+    ScopedObjectAccess soa(self);
+    ObjPtr<mirror::Class> unixfs_class = class_linker_->FindSystemClass(self, "Ljava/io/UnixFileSystem;");
+    if (unixfs_class != nullptr) {
+      struct NativePatch {
+        const char* name;
+        const char* sig;
+        const void* fn;
+      };
+      const NativePatch methods[] = {
+          {"getBooleanAttributes", "(Ljava/io/File;)I",
+           reinterpret_cast<const void*>(&Westlake_UnixFileSystem_getBooleanAttributes)},
+          {"hasBooleanAttributes", "(Ljava/io/File;I)Z",
+           reinterpret_cast<const void*>(&Westlake_UnixFileSystem_hasBooleanAttributes)},
+          {"checkAccess", "(Ljava/io/File;I)Z",
+           reinterpret_cast<const void*>(&Westlake_UnixFileSystem_checkAccess)},
+          {"getLastModifiedTime", "(Ljava/io/File;)J",
+           reinterpret_cast<const void*>(&Westlake_UnixFileSystem_getLastModifiedTime)},
+          {"getLength", "(Ljava/io/File;)J",
+           reinterpret_cast<const void*>(&Westlake_UnixFileSystem_getLength)},
+      };
+      for (const NativePatch& patch : methods) {
+        ArtMethod* method = unixfs_class->FindClassMethod(
+            patch.name, patch.sig, class_linker_->GetImagePointerSize());
+        if (method != nullptr) {
+          method->SetAccessFlags(method->GetAccessFlags() | kAccNative);
+          method->SetCodeItem(nullptr, false);
+          method->SetEntryPointFromJni(patch.fn);
+          fprintf(stderr, "[RT] UnixFileSystem.%s%s -> native jni=%p\n",
+                  patch.name, patch.sig, method->GetEntryPointFromJni());
+        }
+      }
+    }
+    if (self->IsExceptionPending()) self->ClearException();
+  }
+
+  // PATCH: Route HashMap.put directly to JNI.
+  // The standalone interpreter still corrupts the receiver on some core
+  // HashMap puts during Locale/VMRuntime/Charset initialization.
+  {
+    ScopedObjectAccess soa(self);
+    ObjPtr<mirror::Class> hash_map_class = class_linker_->FindSystemClass(self, "Ljava/util/HashMap;");
+    if (hash_map_class != nullptr) {
+      ArtMethod* put_method = hash_map_class->FindClassMethod(
+          "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+          class_linker_->GetImagePointerSize());
+      if (put_method != nullptr) {
+        put_method->SetAccessFlags(put_method->GetAccessFlags() | kAccNative);
+        put_method->SetCodeItem(nullptr, false);
+        put_method->SetEntryPointFromJni(reinterpret_cast<const void*>(&Westlake_HashMap_put));
+        fprintf(stderr, "[RT] HashMap.put(Ljava/lang/Object;Ljava/lang/Object;) -> native\n");
+        fflush(stderr);
+      }
+      ObjPtr<mirror::PointerArray> vtable = hash_map_class->GetVTableDuringLinking();
+      if (vtable != nullptr) {
+        const int count = vtable->GetLength();
+        for (int i = 0; i < count; ++i) {
+          ArtMethod* vm = vtable->GetElementPtrSize<ArtMethod*>(i, kRuntimePointerSize);
+          if (vm != nullptr &&
+              strcmp(vm->GetName(), "put") == 0 &&
+              vm->GetSignature().ToString() == "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;") {
+            vm->SetAccessFlags(vm->GetAccessFlags() | kAccNative);
+            vm->SetCodeItem(nullptr, false);
+            vm->SetEntryPointFromJni(reinterpret_cast<const void*>(&Westlake_HashMap_put));
+          }
+        }
+      }
+    }
+    if (self->IsExceptionPending()) self->ClearException();
+  }
+
+  // PATCH: Route early libcore.io.Linux identity/sysconf wrappers directly to native.
+  // System.<clinit> can hit these before dalvikvm.cc gets a chance to register them.
+  {
+    ScopedObjectAccess soa(self);
+    ObjPtr<mirror::Class> linux_class = class_linker_->FindSystemClass(self, "Llibcore/io/Linux;");
+    if (linux_class != nullptr) {
+      static auto getuid_fn = +[](JNIEnv*, jobject) -> jint { return static_cast<jint>(getuid()); };
+      static auto geteuid_fn = +[](JNIEnv*, jobject) -> jint { return static_cast<jint>(geteuid()); };
+      static auto getgid_fn = +[](JNIEnv*, jobject) -> jint { return static_cast<jint>(getgid()); };
+      static auto getegid_fn = +[](JNIEnv*, jobject) -> jint { return static_cast<jint>(getegid()); };
+      static auto getpid_fn = +[](JNIEnv*, jobject) -> jint { return static_cast<jint>(getpid()); };
+      static auto getppid_fn = +[](JNIEnv*, jobject) -> jint { return static_cast<jint>(getppid()); };
+      static auto sysconf_fn = +[](JNIEnv*, jobject, jint name) -> jlong {
+        errno = 0;
+        long value = sysconf(name);
+        return value < 0 ? static_cast<jlong>(-1) : static_cast<jlong>(value);
+      };
+      struct LinuxPatch {
+        const char* name;
+        const char* sig;
+        const void* fn;
+      };
+      const LinuxPatch methods[] = {
+          {"nativeGetuid", "()I", reinterpret_cast<const void*>(+getuid_fn)},
+          {"nativeGeteuid", "()I", reinterpret_cast<const void*>(+geteuid_fn)},
+          {"nativeGetgid", "()I", reinterpret_cast<const void*>(+getgid_fn)},
+          {"nativeGetegid", "()I", reinterpret_cast<const void*>(+getegid_fn)},
+          {"nativeGetpid", "()I", reinterpret_cast<const void*>(+getpid_fn)},
+          {"nativeGetppid", "()I", reinterpret_cast<const void*>(+getppid_fn)},
+          {"nativeSysconf", "(I)J", reinterpret_cast<const void*>(+sysconf_fn)},
+      };
+      for (const LinuxPatch& patch : methods) {
+        ArtMethod* method = linux_class->FindClassMethod(
+            patch.name, patch.sig, class_linker_->GetImagePointerSize());
+        if (method != nullptr) {
+          method->SetAccessFlags(method->GetAccessFlags() | kAccNative);
+          method->SetCodeItem(nullptr, false);
+          method->SetEntryPointFromJni(patch.fn);
+        }
+      }
+      fprintf(stderr, "[RT] libcore.io.Linux identity natives patched early\n");
+      fflush(stderr);
+    }
+    if (self->IsExceptionPending()) self->ClearException();
+  }
+
+  // PATCH: Keep BaseDexClassLoader / DexPathList stringification side-effect free.
+  // When class resolution fails, the exception path tries to stringify the loader.
+  // The current standalone DexPathList path can NPE while formatting that message.
+  {
+    ScopedObjectAccess soa(self);
+    static auto loader_to_string = +[](JNIEnv* env, jobject) -> jstring {
+      return env->NewStringUTF("dalvik.system.PathClassLoader[westlake]");
+    };
+    auto patch_to_string = [&](const char* class_desc) {
+      ObjPtr<mirror::Class> klass = class_linker_->FindSystemClass(self, class_desc);
+      if (klass == nullptr) {
+        return;
+      }
+      ArtMethod* method = klass->FindClassMethod(
+          "toString", "()Ljava/lang/String;", class_linker_->GetImagePointerSize());
+      if (method != nullptr) {
+        method->SetAccessFlags(method->GetAccessFlags() | kAccNative);
+        method->SetCodeItem(nullptr, false);
+        method->SetEntryPointFromJni(reinterpret_cast<const void*>(+loader_to_string));
+      }
+      ObjPtr<mirror::PointerArray> vtable = klass->GetVTableDuringLinking();
+      if (vtable != nullptr) {
+        const int count = vtable->GetLength();
+        for (int i = 0; i < count; ++i) {
+          ArtMethod* vm = vtable->GetElementPtrSize<ArtMethod*>(i, kRuntimePointerSize);
+          if (vm != nullptr &&
+              strcmp(vm->GetName(), "toString") == 0 &&
+              vm->GetSignature().ToString() == "()Ljava/lang/String;") {
+            vm->SetAccessFlags(vm->GetAccessFlags() | kAccNative);
+            vm->SetCodeItem(nullptr, false);
+            vm->SetEntryPointFromJni(reinterpret_cast<const void*>(+loader_to_string));
+          }
+        }
+      }
+    };
+    patch_to_string("Ldalvik/system/BaseDexClassLoader;");
+    patch_to_string("Ldalvik/system/PathClassLoader;");
+    patch_to_string("Ldalvik/system/DexPathList;");
     if (self->IsExceptionPending()) self->ClearException();
   }
 
@@ -1631,15 +2014,31 @@ bool Runtime::Start() {
   }
   fprintf(stderr, "[RT] kStart phase done\n"); fflush(stderr);
 
-  // PATCHED: Skip CreateSystemClassLoader in standalone builds.
-  // The system classloader relies on PathClassLoader/DexPathList which need framework classes
-  // not present in our minimal core libraries. Even when CreateSystemClassLoader succeeds,
-  // the resulting global ref can cause SEGV in ClassLinker::LookupClass when decoded
-  // (the ClassLoader object may be at an address that becomes invalid after GC).
-  // Instead, we'll register the app DEX with the boot class linker in dalvikvm.cc
-  // so all classes are findable via the boot classloader (class_loader=null).
-  fprintf(stderr, "[RT] Skipping CreateSystemClassLoader (standalone build)\n"); fflush(stderr);
-  // system_class_loader_ stays nullptr
+  if (!standalone_class_path.empty()) {
+    jobject app_class_loader = class_linker_->CreatePathClassLoader(self, standalone_class_path);
+    if (app_class_loader != nullptr) {
+      system_class_loader_ = app_class_loader;
+      {
+        ScopedObjectAccess soa(self);
+        ObjPtr<mirror::ClassLoader> loader = soa.Decode<mirror::ClassLoader>(app_class_loader);
+        ObjPtr<mirror::Class> thread_class = WellKnownClasses::java_lang_Thread.Get();
+        ArtField* context_class_loader = thread_class->FindDeclaredInstanceField(
+            "contextClassLoader",
+            "Ljava/lang/ClassLoader;");
+        CHECK(context_class_loader != nullptr);
+        context_class_loader->SetObject<false>(soa.Self()->GetPeer(), loader);
+      }
+      fprintf(stderr, "[RT] Installed standalone app PathClassLoader (%zu dex files)\n",
+              standalone_class_path.size());
+      fflush(stderr);
+    } else {
+      fprintf(stderr, "[RT] Failed to install standalone app PathClassLoader\n");
+      fflush(stderr);
+    }
+  } else {
+    fprintf(stderr, "[RT] No standalone class path; leaving system class loader unset\n");
+    fflush(stderr);
+  }
 
   // Skip InitNonZygoteOrPostFork in standalone builds -- it starts SignalCatcher thread
   // which crashes when ThreadGroup is not initialized

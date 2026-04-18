@@ -416,21 +416,71 @@ static void FileInputStream_close0(JNIEnv* env, jobject thiz) {
 #define BA_EXISTS    0x01
 #define BA_REGULAR   0x02
 #define BA_DIRECTORY 0x04
+#define BA_HIDDEN    0x08
+#define ACCESS_EXECUTE 0x01
+#define ACCESS_WRITE   0x02
+#define ACCESS_READ    0x04
 
-static void UnixFileSystem_initIDs(JNIEnv* env, jclass clazz) { /* no-op */ }
-
-static jint UnixFileSystem_getBooleanAttributes0(JNIEnv* env, jobject thiz, jstring jpath) {
-    if (!jpath) return 0;
-    const char* path = (*env)->GetStringUTFChars(env, jpath, NULL);
+static jint UnixFileSystem_computeBooleanAttributes(const char* path) {
     struct stat sb;
     int rv = 0;
-    if (stat(path, &sb) == 0) {
+    if (path != NULL && stat(path, &sb) == 0) {
         int fmt = sb.st_mode & S_IFMT;
         rv = BA_EXISTS
             | ((fmt == S_IFREG) ? BA_REGULAR : 0)
             | ((fmt == S_IFDIR) ? BA_DIRECTORY : 0);
+        const char* base = strrchr(path, '/');
+        base = (base != NULL) ? base + 1 : path;
+        if (base != NULL && base[0] == '.' && base[1] != '\0') {
+            rv |= BA_HIDDEN;
+        }
     }
-    (*env)->ReleaseStringUTFChars(env, jpath, path);
+    return rv;
+}
+
+static const char* File_getPathChars(JNIEnv* env, jobject file, jstring* out_jpath) {
+    if (!file) return NULL;
+    jclass fileCls = (*env)->GetObjectClass(env, file);
+    if (!fileCls) return NULL;
+    jmethodID getPath = (*env)->GetMethodID(env, fileCls, "getPath", "()Ljava/lang/String;");
+    (*env)->DeleteLocalRef(env, fileCls);
+    if (!getPath) {
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        return NULL;
+    }
+    jstring jpath = (jstring)(*env)->CallObjectMethod(env, file, getPath);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        return NULL;
+    }
+    if (!jpath) return NULL;
+    const char* path = (*env)->GetStringUTFChars(env, jpath, NULL);
+    if (!path && (*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        (*env)->DeleteLocalRef(env, jpath);
+        return NULL;
+    }
+    *out_jpath = jpath;
+    return path;
+}
+
+static void File_releasePathChars(JNIEnv* env, jstring jpath, const char* path) {
+    if (jpath && path) {
+        (*env)->ReleaseStringUTFChars(env, jpath, path);
+    }
+    if (jpath) {
+        (*env)->DeleteLocalRef(env, jpath);
+    }
+}
+
+static void UnixFileSystem_initIDs(JNIEnv* env, jclass clazz) { /* no-op */ }
+
+static jint UnixFileSystem_getBooleanAttributes0(JNIEnv* env, jobject thiz, jobject file) {
+    jstring jpath = NULL;
+    const char* path = File_getPathChars(env, file, &jpath);
+    if (!path) return 0;
+    int rv = UnixFileSystem_computeBooleanAttributes(path);
+    File_releasePathChars(env, jpath, path);
     return rv;
 }
 
@@ -448,17 +498,46 @@ static jstring UnixFileSystem_canonicalize0(JNIEnv* env, jobject thiz, jstring j
 }
 
 static jlong UnixFileSystem_getLastModifiedTime0(JNIEnv* env, jobject thiz, jobject file) {
-    jclass fileCls = (*env)->GetObjectClass(env, file);
-    jmethodID getPath = (*env)->GetMethodID(env, fileCls, "getPath", "()Ljava/lang/String;");
-    jstring jpath = (jstring)(*env)->CallObjectMethod(env, file, getPath);
-    if (!jpath) return 0;
-    const char* path = (*env)->GetStringUTFChars(env, jpath, NULL);
+    jstring jpath = NULL;
+    const char* path = File_getPathChars(env, file, &jpath);
+    if (!path) return 0;
     struct stat sb;
     jlong result = 0;
     if (stat(path, &sb) == 0) {
         result = (jlong)sb.st_mtime * 1000LL;
     }
-    (*env)->ReleaseStringUTFChars(env, jpath, path);
+    File_releasePathChars(env, jpath, path);
+    return result;
+}
+
+static jboolean UnixFileSystem_checkAccess0(JNIEnv* env, jobject thiz, jobject file, jint access_mode) {
+    jstring jpath = NULL;
+    const char* path = File_getPathChars(env, file, &jpath);
+    if (!path) return JNI_FALSE;
+    int mode = 0;
+    if (access_mode == 0) {
+        mode = F_OK;
+    } else {
+        if ((access_mode & ACCESS_READ) != 0) mode |= R_OK;
+        if ((access_mode & ACCESS_WRITE) != 0) mode |= W_OK;
+        if ((access_mode & ACCESS_EXECUTE) != 0) mode |= X_OK;
+    }
+    if (mode == 0) mode = F_OK;
+    jboolean ok = (access(path, mode) == 0) ? JNI_TRUE : JNI_FALSE;
+    File_releasePathChars(env, jpath, path);
+    return ok;
+}
+
+static jlong UnixFileSystem_getLength0(JNIEnv* env, jobject thiz, jobject file) {
+    jstring jpath = NULL;
+    const char* path = File_getPathChars(env, file, &jpath);
+    if (!path) return 0;
+    struct stat sb;
+    jlong result = 0;
+    if (stat(path, &sb) == 0) {
+        result = (jlong)sb.st_size;
+    }
+    File_releasePathChars(env, jpath, path);
     return result;
 }
 
@@ -475,24 +554,20 @@ static jboolean UnixFileSystem_createFileExclusively0(JNIEnv* env, jobject thiz,
 }
 
 static jboolean UnixFileSystem_createDirectory0(JNIEnv* env, jobject thiz, jobject file) {
-    jclass fileCls = (*env)->GetObjectClass(env, file);
-    jmethodID getPath = (*env)->GetMethodID(env, fileCls, "getPath", "()Ljava/lang/String;");
-    jstring jpath = (jstring)(*env)->CallObjectMethod(env, file, getPath);
-    if (!jpath) return JNI_FALSE;
-    const char* path = (*env)->GetStringUTFChars(env, jpath, NULL);
+    jstring jpath = NULL;
+    const char* path = File_getPathChars(env, file, &jpath);
+    if (!path) return JNI_FALSE;
     int result = mkdir(path, 0777);
-    (*env)->ReleaseStringUTFChars(env, jpath, path);
+    File_releasePathChars(env, jpath, path);
     return result == 0 ? JNI_TRUE : JNI_FALSE;
 }
 
 static jobjectArray UnixFileSystem_list0(JNIEnv* env, jobject thiz, jobject file) {
-    jclass fileCls = (*env)->GetObjectClass(env, file);
-    jmethodID getPath = (*env)->GetMethodID(env, fileCls, "getPath", "()Ljava/lang/String;");
-    jstring jpath = (jstring)(*env)->CallObjectMethod(env, file, getPath);
-    if (!jpath) return NULL;
-    const char* path = (*env)->GetStringUTFChars(env, jpath, NULL);
+    jstring jpath = NULL;
+    const char* path = File_getPathChars(env, file, &jpath);
+    if (!path) return NULL;
     DIR* dir = opendir(path);
-    (*env)->ReleaseStringUTFChars(env, jpath, path);
+    File_releasePathChars(env, jpath, path);
     if (!dir) return NULL;
 
     /* Count entries first */
@@ -530,12 +605,83 @@ static jboolean UnixFileSystem_setReadOnly0(JNIEnv* env, jobject thiz, jobject f
     return JNI_FALSE; /* stub */
 }
 
+static jboolean UnixFileSystem_delete0(JNIEnv* env, jobject thiz, jobject file) {
+    jstring jpath = NULL;
+    const char* path = File_getPathChars(env, file, &jpath);
+    if (!path) return JNI_FALSE;
+    struct stat sb;
+    int rc;
+    if (stat(path, &sb) == 0 && S_ISDIR(sb.st_mode)) {
+        rc = rmdir(path);
+    } else {
+        rc = unlink(path);
+    }
+    File_releasePathChars(env, jpath, path);
+    return rc == 0 ? JNI_TRUE : JNI_FALSE;
+}
+
+static jboolean UnixFileSystem_rename0(JNIEnv* env, jobject thiz, jobject from, jobject to) {
+    jstring jfrom = NULL;
+    jstring jto = NULL;
+    const char* from_path = File_getPathChars(env, from, &jfrom);
+    const char* to_path = File_getPathChars(env, to, &jto);
+    if (!from_path || !to_path) {
+        File_releasePathChars(env, jfrom, from_path);
+        File_releasePathChars(env, jto, to_path);
+        return JNI_FALSE;
+    }
+    int rc = rename(from_path, to_path);
+    File_releasePathChars(env, jfrom, from_path);
+    File_releasePathChars(env, jto, to_path);
+    return rc == 0 ? JNI_TRUE : JNI_FALSE;
+}
+
 static jstring UnixFileSystem_parentOrNull(JNIEnv* env, jobject thiz, jstring jpath) {
     return NULL; /* ART will use Java fallback */
 }
 
 static jlong UnixFileSystem_getSpace0(JNIEnv* env, jobject thiz, jobject file, jint t) {
     return 0; /* stub */
+}
+
+static jlong UnixFileSystem_getNameMax0(JNIEnv* env, jobject thiz, jstring jpath) {
+    const char* path = "/";
+    if (jpath != NULL) {
+        const char* candidate = (*env)->GetStringUTFChars(env, jpath, NULL);
+        if (candidate != NULL) {
+            path = candidate;
+        } else if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionClear(env);
+        }
+    }
+    long result = pathconf(path, _PC_NAME_MAX);
+    if (jpath != NULL && path != NULL && path != (const char*)"/") {
+        (*env)->ReleaseStringUTFChars(env, jpath, path);
+    }
+    if (result < 0) result = NAME_MAX;
+    return (jlong)result;
+}
+
+/* Wrappers for public UnixFileSystem methods patched directly in runtime.cc. */
+int Westlake_UnixFileSystem_getBooleanAttributes(JNIEnv* env, jobject thiz, jobject file) {
+    return UnixFileSystem_getBooleanAttributes0(env, thiz, file);
+}
+
+jboolean Westlake_UnixFileSystem_hasBooleanAttributes(JNIEnv* env, jobject thiz, jobject file, jint mask) {
+    jint attrs = UnixFileSystem_getBooleanAttributes0(env, thiz, file);
+    return ((attrs & mask) == mask) ? JNI_TRUE : JNI_FALSE;
+}
+
+jboolean Westlake_UnixFileSystem_checkAccess(JNIEnv* env, jobject thiz, jobject file, jint access_mode) {
+    return UnixFileSystem_checkAccess0(env, thiz, file, access_mode);
+}
+
+jlong Westlake_UnixFileSystem_getLastModifiedTime(JNIEnv* env, jobject thiz, jobject file) {
+    return UnixFileSystem_getLastModifiedTime0(env, thiz, file);
+}
+
+jlong Westlake_UnixFileSystem_getLength(JNIEnv* env, jobject thiz, jobject file) {
+    return UnixFileSystem_getLength0(env, thiz, file);
 }
 
 /* ==================== java.lang.Runtime natives ==================== */
@@ -1041,18 +1187,23 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
         if (cls) {
             JNINativeMethod methods[] = {
                 {"initIDs", "()V", (void*)UnixFileSystem_initIDs},
-                {"getBooleanAttributes0", "(Ljava/lang/String;)I", (void*)UnixFileSystem_getBooleanAttributes0},
+                {"getBooleanAttributes0", "(Ljava/io/File;)I", (void*)UnixFileSystem_getBooleanAttributes0},
                 {"canonicalize0", "(Ljava/lang/String;)Ljava/lang/String;", (void*)UnixFileSystem_canonicalize0},
                 {"canonicalize", "(Ljava/lang/String;)Ljava/lang/String;", (void*)UnixFileSystem_canonicalize0},
                 {"parentOrNull", "(Ljava/lang/String;)Ljava/lang/String;", (void*)UnixFileSystem_parentOrNull},
+                {"checkAccess0", "(Ljava/io/File;I)Z", (void*)UnixFileSystem_checkAccess0},
                 {"getLastModifiedTime0", "(Ljava/io/File;)J", (void*)UnixFileSystem_getLastModifiedTime0},
+                {"getLength0", "(Ljava/io/File;)J", (void*)UnixFileSystem_getLength0},
                 {"createFileExclusively0", "(Ljava/lang/String;)Z", (void*)UnixFileSystem_createFileExclusively0},
+                {"delete0", "(Ljava/io/File;)Z", (void*)UnixFileSystem_delete0},
                 {"createDirectory0", "(Ljava/io/File;)Z", (void*)UnixFileSystem_createDirectory0},
                 {"list0", "(Ljava/io/File;)[Ljava/lang/String;", (void*)UnixFileSystem_list0},
+                {"rename0", "(Ljava/io/File;Ljava/io/File;)Z", (void*)UnixFileSystem_rename0},
                 {"setPermission0", "(Ljava/io/File;IZZ)Z", (void*)UnixFileSystem_setPermission0},
                 {"setLastModifiedTime0", "(Ljava/io/File;J)Z", (void*)UnixFileSystem_setLastModifiedTime0},
                 {"setReadOnly0", "(Ljava/io/File;)Z", (void*)UnixFileSystem_setReadOnly0},
                 {"getSpace0", "(Ljava/io/File;I)J", (void*)UnixFileSystem_getSpace0},
+                {"getNameMax0", "(Ljava/lang/String;)J", (void*)UnixFileSystem_getNameMax0},
             };
             registerNativesOrSkip(env, cls, methods, sizeof(methods)/sizeof(methods[0]));
             (*env)->DeleteLocalRef(env, cls);

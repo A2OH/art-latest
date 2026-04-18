@@ -759,7 +759,7 @@ static int try_tcp_connect(int port) {
     return -1;
 }
 
-JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
+static jint OHBridge_JNI_OnLoad_Impl(JavaVM* vm, void* reserved) {
     g_vm = vm;
     sigbus_vm = vm;
     /* Record main thread for signal handler */
@@ -998,6 +998,14 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
     }
 
     return JNI_VERSION_1_6;
+}
+
+JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
+    return OHBridge_JNI_OnLoad_Impl(vm, reserved);
+}
+
+JNIEXPORT jint JNI_OnLoad_ohbridge_real(JavaVM* vm, void* reserved) {
+    return OHBridge_JNI_OnLoad_Impl(vm, reserved);
 }
 
 /* MessageQueue native stubs for Looper/Handler support */

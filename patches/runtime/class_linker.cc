@@ -3331,6 +3331,18 @@ bool ClassLinker::FindClassInBaseDexClassLoader(Thread* self,
                                                 size_t hash,
                                                 Handle<mirror::ClassLoader> class_loader,
                                                 /*out*/ ObjPtr<mirror::Class>* result) {
+  auto prefer_loader_dex_for_descriptor = [](const char* desc) {
+    return desc != nullptr &&
+           ((android::base::StartsWith(desc, "Landroidx/activity/") ||
+             android::base::StartsWith(desc, "Landroidx/appcompat/") ||
+             android::base::StartsWith(desc, "Landroidx/fragment/") ||
+             android::base::StartsWith(desc, "Landroidx/lifecycle/") ||
+             android::base::StartsWith(desc, "Landroidx/savedstate/")) ||
+            android::base::StartsWith(desc, "Lkotlin/") ||
+            android::base::StartsWith(desc, "Lkotlinx/") ||
+            android::base::StartsWith(desc, "Ldagger/") ||
+            android::base::StartsWith(desc, "Lcom/google/android/material/"));
+  };
   // Termination case: boot class loader.
   if (IsBootClassLoader(class_loader.Get())) {
     RETURN_IF_UNRECOGNIZED_OR_FOUND_OR_EXCEPTION(
@@ -3343,6 +3355,29 @@ bool ClassLinker::FindClassInBaseDexClassLoader(Thread* self,
     //    - parent
     //    - shared libraries
     //    - class loader dex files
+
+    if (prefer_loader_dex_for_descriptor(descriptor)) {
+      RETURN_IF_UNRECOGNIZED_OR_FOUND_OR_EXCEPTION(
+          FindClassInBaseDexClassLoaderClassPath(self, descriptor, hash, class_loader, result),
+          *result,
+          self);
+      RETURN_IF_UNRECOGNIZED_OR_FOUND_OR_EXCEPTION(
+          FindClassInSharedLibraries(self, descriptor, hash, class_loader, result),
+          *result,
+          self);
+
+      StackHandleScope<1> hs(self);
+      Handle<mirror::ClassLoader> h_parent(hs.NewHandle(class_loader->GetParent()));
+      RETURN_IF_UNRECOGNIZED_OR_FOUND_OR_EXCEPTION(
+          FindClassInBaseDexClassLoader(self, descriptor, hash, h_parent, result),
+          *result,
+          self);
+      RETURN_IF_UNRECOGNIZED_OR_FOUND_OR_EXCEPTION(
+          FindClassInSharedLibrariesAfter(self, descriptor, hash, class_loader, result),
+          *result,
+          self);
+      return true;
+    }
 
     // Create a handle as RegisterDexFile may allocate dex caches (and cause thread suspension).
     StackHandleScope<1> hs(self);

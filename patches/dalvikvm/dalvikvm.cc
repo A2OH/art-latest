@@ -18,10 +18,16 @@
 #include <execinfo.h>
 #endif
 #include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <math.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -69,6 +75,11 @@ Java_noop_return_true(JNIEnv*, jobject) {
 extern "C" JNIEXPORT jboolean JNICALL
 Java_noop_return_false(JNIEnv*, jobject) {
   return JNI_FALSE;
+}
+
+// Static no-op for void-returning methods.
+extern "C" JNIEXPORT void JNICALL
+Java_noop_return_void_static(JNIEnv*, jclass) {
 }
 
 // Static no-op that returns the second object argument (pass-through)
@@ -253,6 +264,14 @@ Java_java_lang_Double_toStringImpl(JNIEnv* env, jclass, jdouble val) {
   return env->NewStringUTF(buf);
 }
 
+// ThreadLocal.nextHashCode() bypass — avoid AtomicInteger/VarHandle boot image state.
+static std::atomic<jint> g_threadlocal_hash_counter{0};
+extern "C" JNIEXPORT jint JNICALL
+Java_java_lang_ThreadLocal_nextHashCode_native(JNIEnv*, jclass) {
+  static constexpr jint kHashIncrement = static_cast<jint>(0x61c88647u);
+  return g_threadlocal_hash_counter.fetch_add(kHashIncrement);
+}
+
 extern "C" JNIEXPORT jint JNICALL
 Java_art_io_Utf8Writer_nativeWrite(JNIEnv* env, jclass, jint fd, jbyteArray data, jint off, jint len) {
   fprintf(stderr, "[nativeWrite] fd=%d len=%d\n", fd, len); fflush(stderr);
@@ -276,6 +295,443 @@ Java_art_io_Utf8Writer_nativeWrite(JNIEnv* env, jclass, jint fd, jbyteArray data
 }
 
 namespace art {
+
+static std::vector<std::string> g_vm_property_options;
+static std::vector<std::string> g_main_args;
+static std::string g_vm_class_path;
+
+static jlong System_nanoTimeStandalone(JNIEnv*, jclass) {
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return static_cast<jlong>(now.tv_sec) * 1000000000LL + now.tv_nsec;
+}
+
+static jlong System_currentTimeMillisStandalone(JNIEnv*, jclass) {
+  struct timespec now;
+  clock_gettime(CLOCK_REALTIME, &now);
+  return static_cast<jlong>(now.tv_sec) * 1000LL + now.tv_nsec / 1000000LL;
+}
+
+static jint Linux_getuidStandalone(JNIEnv*, jobject) {
+  return static_cast<jint>(getuid());
+}
+
+static jint Linux_getpidStandalone(JNIEnv*, jobject) {
+  return static_cast<jint>(getpid());
+}
+
+static jint Linux_geteuidStandalone(JNIEnv*, jobject) {
+  return static_cast<jint>(geteuid());
+}
+
+static jint Linux_getegidStandalone(JNIEnv*, jobject) {
+  return static_cast<jint>(getegid());
+}
+
+static jint Linux_getgidStandalone(JNIEnv*, jobject) {
+  return static_cast<jint>(getgid());
+}
+
+static jint Linux_getppidStandalone(JNIEnv*, jobject) {
+  return static_cast<jint>(getppid());
+}
+
+static jlong Linux_sysconfStandalone(JNIEnv*, jobject, jint name) {
+  long result = sysconf(static_cast<int>(name));
+  if ((name == _SC_NPROCESSORS_CONF || name == _SC_NPROCESSORS_ONLN) &&
+      (result <= 0 || result > 64)) {
+    result = 4;
+  }
+  return static_cast<jlong>(result);
+}
+
+static jbyteArray NativeReadFileBytesStandalone(JNIEnv* env, jclass, jstring path_j) {
+  if (path_j == nullptr) {
+    return nullptr;
+  }
+  const char* path = env->GetStringUTFChars(path_j, nullptr);
+  if (path == nullptr) {
+    return nullptr;
+  }
+  int fd = open(path, O_RDONLY);
+  env->ReleaseStringUTFChars(path_j, path);
+  if (fd < 0) {
+    return nullptr;
+  }
+
+  std::vector<jbyte> bytes;
+  struct stat sb;
+  if (fstat(fd, &sb) == 0 && sb.st_size > 0 && sb.st_size <= (128 * 1024 * 1024)) {
+    bytes.reserve(static_cast<size_t>(sb.st_size));
+  }
+
+  jbyte chunk[8192];
+  while (true) {
+    ssize_t n = read(fd, chunk, sizeof(chunk));
+    if (n < 0 && errno == EINTR) {
+      continue;
+    }
+    if (n <= 0) {
+      break;
+    }
+    bytes.insert(bytes.end(), chunk, chunk + n);
+  }
+  close(fd);
+
+  jbyteArray out = env->NewByteArray(static_cast<jsize>(bytes.size()));
+  if (out == nullptr) {
+    return nullptr;
+  }
+  if (!bytes.empty()) {
+    env->SetByteArrayRegion(out, 0, static_cast<jsize>(bytes.size()), bytes.data());
+    if (env->ExceptionCheck()) {
+      return nullptr;
+    }
+  }
+  return out;
+}
+
+static jdouble Math_sinStandalone(JNIEnv*, jclass, jdouble value) {
+  return sin(value);
+}
+
+static jdouble Math_cosStandalone(JNIEnv*, jclass, jdouble value) {
+  return cos(value);
+}
+
+static jdouble Math_expStandalone(JNIEnv*, jclass, jdouble value) {
+  return exp(value);
+}
+
+static jdouble Math_logStandalone(JNIEnv*, jclass, jdouble value) {
+  return log(value);
+}
+
+static jdouble Math_log10Standalone(JNIEnv*, jclass, jdouble value) {
+  return log10(value);
+}
+
+static jdouble Math_sqrtStandalone(JNIEnv*, jclass, jdouble value) {
+  return sqrt(value);
+}
+
+static jdouble Math_floorStandalone(JNIEnv*, jclass, jdouble value) {
+  return floor(value);
+}
+
+static jdouble Math_ceilStandalone(JNIEnv*, jclass, jdouble value) {
+  return ceil(value);
+}
+
+static jdouble Math_atanStandalone(JNIEnv*, jclass, jdouble value) {
+  return atan(value);
+}
+
+static jdouble Math_atan2Standalone(JNIEnv*, jclass, jdouble lhs, jdouble rhs) {
+  return atan2(lhs, rhs);
+}
+
+static jdouble Math_powStandalone(JNIEnv*, jclass, jdouble lhs, jdouble rhs) {
+  return pow(lhs, rhs);
+}
+
+static jdouble Math_hypotStandalone(JNIEnv*, jclass, jdouble lhs, jdouble rhs) {
+  return hypot(lhs, rhs);
+}
+
+static jdouble Math_toDegreesStandalone(JNIEnv*, jclass, jdouble value) {
+  return value * (180.0 / 3.14159265358979323846);
+}
+
+static jdouble Math_toRadiansStandalone(JNIEnv*, jclass, jdouble value) {
+  return value * (3.14159265358979323846 / 180.0);
+}
+
+static void PatchMcDonaldsAppCoreUtils(JNIEnv* env) {
+  ScopedLocalRef<jclass> app_core_cls(
+      env, env->FindClass("com/mcdonalds/mcdcoreapp/common/util/AppCoreUtils"));
+  if (app_core_cls.get() == nullptr) {
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    fprintf(stderr, "[dalvikvm] AppCoreUtils patch skip (class missing)\n");
+    return;
+  }
+
+  bool patched_clinit = false;
+  bool patched_validate = false;
+  {
+    ScopedObjectAccess soa(Thread::Current());
+    ObjPtr<mirror::Class> cls = soa.Decode<mirror::Class>(app_core_cls.get());
+    if (cls != nullptr) {
+      for (ArtMethod& method : cls->GetDeclaredMethods(kRuntimePointerSize)) {
+        const char* name = method.GetName();
+        const std::string sig = method.GetSignature().ToString();
+        if (strcmp(name, "<clinit>") == 0 && sig == "()V") {
+          method.SetAccessFlags(method.GetAccessFlags() | kAccNative | kAccFastNative);
+          method.SetCodeItem(nullptr, false);
+          method.SetEntryPointFromJni(reinterpret_cast<void*>(Java_noop_return_void_static));
+          patched_clinit = true;
+        } else if (strcmp(name, "validateFromWhitelist") == 0 &&
+                   sig == "(Ljava/lang/String;)V") {
+          method.SetAccessFlags(method.GetAccessFlags() | kAccNative | kAccFastNative);
+          method.SetCodeItem(nullptr, false);
+          method.SetEntryPointFromJni(reinterpret_cast<void*>(Java_noop_return_void_static));
+          patched_validate = true;
+        }
+      }
+    }
+  }
+
+  jfieldID whitelist_field =
+      env->GetStaticFieldID(app_core_cls.get(), "whitelistClasses", "Ljava/util/HashSet;");
+  if (whitelist_field == nullptr) {
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    fprintf(stderr,
+            "[dalvikvm] AppCoreUtils patch: whitelist field missing"
+            " (clinit=%d validate=%d)\n",
+            patched_clinit ? 1 : 0,
+            patched_validate ? 1 : 0);
+    return;
+  }
+
+  ScopedLocalRef<jclass> hash_set_cls(env, env->FindClass("java/util/HashSet"));
+  if (hash_set_cls.get() == nullptr) {
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    fprintf(stderr,
+            "[dalvikvm] AppCoreUtils patch: HashSet class missing"
+            " (clinit=%d validate=%d)\n",
+            patched_clinit ? 1 : 0,
+            patched_validate ? 1 : 0);
+    return;
+  }
+
+  jmethodID hash_set_ctor = env->GetMethodID(hash_set_cls.get(), "<init>", "()V");
+  if (hash_set_ctor == nullptr) {
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    fprintf(stderr,
+            "[dalvikvm] AppCoreUtils patch: HashSet ctor missing"
+            " (clinit=%d validate=%d)\n",
+            patched_clinit ? 1 : 0,
+            patched_validate ? 1 : 0);
+    return;
+  }
+
+  ScopedLocalRef<jobject> whitelist(env, env->NewObject(hash_set_cls.get(), hash_set_ctor));
+  if (whitelist.get() == nullptr) {
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    fprintf(stderr,
+            "[dalvikvm] AppCoreUtils patch: HashSet alloc failed"
+            " (clinit=%d validate=%d)\n",
+            patched_clinit ? 1 : 0,
+            patched_validate ? 1 : 0);
+    return;
+  }
+
+  env->SetStaticObjectField(app_core_cls.get(), whitelist_field, whitelist.get());
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+    fprintf(stderr,
+            "[dalvikvm] AppCoreUtils patch: SetStaticObjectField failed"
+            " (clinit=%d validate=%d)\n",
+            patched_clinit ? 1 : 0,
+            patched_validate ? 1 : 0);
+    return;
+  }
+
+  fprintf(stderr,
+          "[dalvikvm] AppCoreUtils patched: clinit=%d validate=%d whitelist seeded\n",
+          patched_clinit ? 1 : 0,
+          patched_validate ? 1 : 0);
+}
+
+static void RegisterStandaloneNativeMethods(JNIEnv* env,
+                                            const char* class_name,
+                                            const JNINativeMethod* methods,
+                                            int method_count,
+                                            bool is_static) {
+  ScopedLocalRef<jclass> klass(env, env->FindClass(class_name));
+  if (klass.get() == nullptr) {
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    fprintf(stderr, "[dalvikvm] RegisterNatives skip %s (class missing)\n", class_name);
+    return;
+  }
+
+  int registered = 0;
+  int skipped = 0;
+  int failed = 0;
+  for (int i = 0; i < method_count; ++i) {
+    const JNINativeMethod& method = methods[i];
+    jmethodID probe = is_static
+        ? env->GetStaticMethodID(klass.get(), method.name, method.signature)
+        : env->GetMethodID(klass.get(), method.name, method.signature);
+    if (probe == nullptr) {
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      skipped++;
+      fprintf(stderr, "[dalvikvm] RegisterNatives skip %s.%s%s (method missing)\n",
+              class_name, method.name, method.signature);
+      continue;
+    }
+
+    int rc = env->RegisterNatives(klass.get(), &method, 1);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (rc == 0) {
+      registered++;
+    } else {
+      failed++;
+      fprintf(stderr, "[dalvikvm] RegisterNatives failed %s.%s%s\n",
+              class_name, method.name, method.signature);
+    }
+  }
+
+  fprintf(stderr, "[dalvikvm] RegisterNatives for %s: registered=%d skipped=%d failed=%d\n",
+          class_name, registered, skipped, failed);
+}
+
+static void ForceStandaloneNativeEntryPoint(const char* class_desc,
+                                            const char* method_name,
+                                            const char* signature,
+                                            void* native_func) {
+  Thread* self = Thread::Current();
+  if (self == nullptr) {
+    return;
+  }
+  ScopedObjectAccess soa(self);
+  StackHandleScope<1> hs(self);
+  Handle<mirror::Class> cls =
+      hs.NewHandle(Runtime::Current()->GetClassLinker()->FindSystemClass(self, class_desc));
+  if (cls == nullptr) {
+    if (self->IsExceptionPending()) self->ClearException();
+    fprintf(stderr, "[dalvikvm] ForceNative skip %s.%s%s (class missing)\n",
+            class_desc, method_name, signature);
+    return;
+  }
+
+  const char* old_cause = self->StartAssertNoThreadSuspension("ForceStandaloneNativeEntryPoint");
+  bool patched = false;
+  for (ArtMethod& method : cls->GetDeclaredMethods(kRuntimePointerSize)) {
+    if (strcmp(method.GetName(), method_name) == 0 &&
+        method.GetSignature().ToString() == signature) {
+      method.SetAccessFlags(method.GetAccessFlags() | kAccNative | kAccFastNative);
+      method.SetCodeItem(nullptr, false);
+      method.SetEntryPointFromJni(native_func);
+      patched = true;
+      break;
+    }
+  }
+  self->EndAssertNoThreadSuspension(old_cause);
+  if (self->IsExceptionPending()) self->ClearException();
+  fprintf(stderr, "[dalvikvm] ForceNative %s.%s%s => %s (%p)\n",
+          class_desc, method_name, signature, patched ? "patched" : "missing", native_func);
+}
+
+static void RegisterStandaloneCoreNatives(JNIEnv* env) {
+  JNINativeMethod system_methods[] = {
+      {"nanoTime", "()J", reinterpret_cast<void*>(System_nanoTimeStandalone)},
+      {"currentTimeMillis", "()J", reinterpret_cast<void*>(System_currentTimeMillisStandalone)},
+  };
+  RegisterStandaloneNativeMethods(env,
+                                  "java/lang/System",
+                                  system_methods,
+                                  sizeof(system_methods) / sizeof(system_methods[0]),
+                                  true);
+  ForceStandaloneNativeEntryPoint("Ljava/lang/System;",
+                                  "nanoTime",
+                                  "()J",
+                                  reinterpret_cast<void*>(System_nanoTimeStandalone));
+  ForceStandaloneNativeEntryPoint("Ljava/lang/System;",
+                                  "currentTimeMillis",
+                                  "()J",
+                                  reinterpret_cast<void*>(System_currentTimeMillisStandalone));
+
+  JNINativeMethod linux_methods[] = {
+      {"getuid", "()I", reinterpret_cast<void*>(Linux_getuidStandalone)},
+      {"nativeGetuid", "()I", reinterpret_cast<void*>(Linux_getuidStandalone)},
+      {"getpid", "()I", reinterpret_cast<void*>(Linux_getpidStandalone)},
+      {"nativeGetpid", "()I", reinterpret_cast<void*>(Linux_getpidStandalone)},
+      {"geteuid", "()I", reinterpret_cast<void*>(Linux_geteuidStandalone)},
+      {"nativeGeteuid", "()I", reinterpret_cast<void*>(Linux_geteuidStandalone)},
+      {"getegid", "()I", reinterpret_cast<void*>(Linux_getegidStandalone)},
+      {"nativeGetegid", "()I", reinterpret_cast<void*>(Linux_getegidStandalone)},
+      {"getgid", "()I", reinterpret_cast<void*>(Linux_getgidStandalone)},
+      {"nativeGetgid", "()I", reinterpret_cast<void*>(Linux_getgidStandalone)},
+      {"getppid", "()I", reinterpret_cast<void*>(Linux_getppidStandalone)},
+      {"nativeGetppid", "()I", reinterpret_cast<void*>(Linux_getppidStandalone)},
+      {"sysconf", "(I)J", reinterpret_cast<void*>(Linux_sysconfStandalone)},
+      {"nativeSysconf", "(I)J", reinterpret_cast<void*>(Linux_sysconfStandalone)},
+  };
+  RegisterStandaloneNativeMethods(env,
+                                  "libcore/io/Linux",
+                                  linux_methods,
+                                  sizeof(linux_methods) / sizeof(linux_methods[0]),
+                                  false);
+
+  JNINativeMethod apk_loader_methods[] = {
+      {"nativeReadFileBytes", "(Ljava/lang/String;)[B", reinterpret_cast<void*>(NativeReadFileBytesStandalone)},
+  };
+  RegisterStandaloneNativeMethods(env,
+                                  "android/app/ApkLoader",
+                                  apk_loader_methods,
+                                  sizeof(apk_loader_methods) / sizeof(apk_loader_methods[0]),
+                                  true);
+
+  JNINativeMethod math_methods[] = {
+      {"sin", "(D)D", reinterpret_cast<void*>(Math_sinStandalone)},
+      {"cos", "(D)D", reinterpret_cast<void*>(Math_cosStandalone)},
+      {"exp", "(D)D", reinterpret_cast<void*>(Math_expStandalone)},
+      {"log", "(D)D", reinterpret_cast<void*>(Math_logStandalone)},
+      {"log10", "(D)D", reinterpret_cast<void*>(Math_log10Standalone)},
+      {"sqrt", "(D)D", reinterpret_cast<void*>(Math_sqrtStandalone)},
+      {"floor", "(D)D", reinterpret_cast<void*>(Math_floorStandalone)},
+      {"ceil", "(D)D", reinterpret_cast<void*>(Math_ceilStandalone)},
+      {"atan", "(D)D", reinterpret_cast<void*>(Math_atanStandalone)},
+      {"atan2", "(DD)D", reinterpret_cast<void*>(Math_atan2Standalone)},
+      {"pow", "(DD)D", reinterpret_cast<void*>(Math_powStandalone)},
+      {"hypot", "(DD)D", reinterpret_cast<void*>(Math_hypotStandalone)},
+      {"toDegrees", "(D)D", reinterpret_cast<void*>(Math_toDegreesStandalone)},
+      {"toRadians", "(D)D", reinterpret_cast<void*>(Math_toRadiansStandalone)},
+  };
+  RegisterStandaloneNativeMethods(env,
+                                  "java/lang/Math",
+                                  math_methods,
+                                  sizeof(math_methods) / sizeof(math_methods[0]),
+                                  true);
+  RegisterStandaloneNativeMethods(env,
+                                  "java/lang/StrictMath",
+                                  math_methods,
+                                  sizeof(math_methods) / sizeof(math_methods[0]),
+                                  true);
+
+  struct ForcedMathNative {
+    const char* name;
+    const char* signature;
+    void* fn;
+  };
+  const ForcedMathNative forced_math[] = {
+      {"sin", "(D)D", reinterpret_cast<void*>(Math_sinStandalone)},
+      {"cos", "(D)D", reinterpret_cast<void*>(Math_cosStandalone)},
+      {"exp", "(D)D", reinterpret_cast<void*>(Math_expStandalone)},
+      {"log", "(D)D", reinterpret_cast<void*>(Math_logStandalone)},
+      {"log10", "(D)D", reinterpret_cast<void*>(Math_log10Standalone)},
+      {"sqrt", "(D)D", reinterpret_cast<void*>(Math_sqrtStandalone)},
+      {"floor", "(D)D", reinterpret_cast<void*>(Math_floorStandalone)},
+      {"ceil", "(D)D", reinterpret_cast<void*>(Math_ceilStandalone)},
+      {"atan", "(D)D", reinterpret_cast<void*>(Math_atanStandalone)},
+      {"atan2", "(DD)D", reinterpret_cast<void*>(Math_atan2Standalone)},
+      {"pow", "(DD)D", reinterpret_cast<void*>(Math_powStandalone)},
+      {"hypot", "(DD)D", reinterpret_cast<void*>(Math_hypotStandalone)},
+      {"toDegrees", "(D)D", reinterpret_cast<void*>(Math_toDegreesStandalone)},
+      {"toRadians", "(D)D", reinterpret_cast<void*>(Math_toRadiansStandalone)},
+  };
+  for (const ForcedMathNative& method : forced_math) {
+    ForceStandaloneNativeEntryPoint("Ljava/lang/Math;",
+                                    method.name,
+                                    method.signature,
+                                    method.fn);
+    ForceStandaloneNativeEntryPoint("Ljava/lang/StrictMath;",
+                                    method.name,
+                                    method.signature,
+                                    method.fn);
+  }
+}
 
 // Determine whether or not the specified method is public.
 static bool IsMethodPublic(JNIEnv* env, jclass c, jmethodID method_id) {
@@ -404,6 +860,13 @@ static jclass LoadClassFromClasspath(JNIEnv* env, const char* class_name_jni) {
 }
 
 static int InvokeMain(JNIEnv* env, char** argv) {
+  g_main_args.clear();
+  for (int i = 0; argv[i] != nullptr && i < 16; ++i) {
+    fprintf(stderr, "[dalvikvm] main argv[%d]=%s\n", i, argv[i]);
+    if (i > 0) {
+      g_main_args.emplace_back(argv[i]);
+    }
+  }
   // We want to call main() with a String array with our arguments in
   // it.  Create an array and populate it.  Note argv[0] is not
   // included.
@@ -450,6 +913,339 @@ static int InvokeMain(JNIEnv* env, char** argv) {
       if (!msg) return;
       const char* s = e->GetStringUTFChars(msg, nullptr);
       if (s) { write(STDERR_FILENO, s, strlen(s)); write(STDERR_FILENO, "\n", 1); e->ReleaseStringUTFChars(msg, s); }
+    };
+    static auto nativePatchClassNoop = +[](JNIEnv* e, jclass, jstring class_name_j,
+                                           jobject class_loader) -> jboolean {
+      if (class_name_j == nullptr || class_loader == nullptr) {
+        return JNI_FALSE;
+      }
+      jclass class_class = e->FindClass("java/lang/Class");
+      if (class_class == nullptr) {
+        if (e->ExceptionCheck()) e->ExceptionClear();
+        return JNI_FALSE;
+      }
+      jmethodID for_name = e->GetStaticMethodID(
+          class_class,
+          "forName",
+          "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;");
+      if (for_name == nullptr) {
+        if (e->ExceptionCheck()) e->ExceptionClear();
+        return JNI_FALSE;
+      }
+
+      ScopedLocalRef<jclass> cls(
+          e,
+          reinterpret_cast<jclass>(
+              e->CallStaticObjectMethod(class_class, for_name, class_name_j, JNI_FALSE, class_loader)));
+      if (cls.get() == nullptr || e->ExceptionCheck()) {
+        if (e->ExceptionCheck()) e->ExceptionClear();
+        return JNI_FALSE;
+      }
+
+      std::string class_name("<unknown>");
+      const char* class_name_c = e->GetStringUTFChars(class_name_j, nullptr);
+      if (class_name_c != nullptr) {
+        class_name.assign(class_name_c);
+        e->ReleaseStringUTFChars(class_name_j, class_name_c);
+      }
+
+      int patched = 0;
+      {
+        ScopedObjectAccess soa(Thread::Current());
+        ObjPtr<mirror::Class> mirror = soa.Decode<mirror::Class>(cls.get());
+        if (mirror == nullptr) {
+          return JNI_FALSE;
+        }
+        for (ArtMethod& m : mirror->GetDeclaredMethods(kRuntimePointerSize)) {
+          if (m.IsAbstract()) {
+            continue;
+          }
+          const char* method_name = m.GetName();
+          if (strcmp(method_name, "<init>") == 0) {
+            continue;
+          }
+          std::string sig = m.GetSignature().ToString();
+          void* entry = nullptr;
+          if (sig.find(")V") != std::string::npos) {
+            entry = m.IsStatic()
+                ? reinterpret_cast<void*>(Java_noop_return_void_static)
+                : reinterpret_cast<void*>(Java_java_lang_Throwable_printStackTrace_noop);
+          } else if (sig.find(")Z") != std::string::npos) {
+            entry = reinterpret_cast<void*>(Java_noop_return_false);
+          } else if (sig.find(")L") != std::string::npos ||
+                     sig.find(")[") != std::string::npos) {
+            entry = reinterpret_cast<void*>(Java_noop_return_null);
+          }
+          if (entry == nullptr) {
+            continue;
+          }
+          m.SetAccessFlags(m.GetAccessFlags() | kAccNative | kAccFastNative);
+          m.SetCodeItem(nullptr, false);
+          m.SetEntryPointFromJni(entry);
+          patched++;
+        }
+      }
+      if (patched > 0) {
+        fprintf(stderr, "[dalvikvm] nativePatchClassNoop %s patched=%d\n",
+                class_name.c_str(), patched);
+      }
+      return patched > 0 ? JNI_TRUE : JNI_FALSE;
+    };
+    static auto nativeCanOpenFile = +[](JNIEnv* e, jclass, jstring path_j) -> jboolean {
+      if (!path_j) return JNI_FALSE;
+      const char* path = e->GetStringUTFChars(path_j, nullptr);
+      if (!path) {
+        return JNI_FALSE;
+      }
+      int fd = open(path, O_RDONLY);
+      e->ReleaseStringUTFChars(path_j, path);
+      if (fd < 0) {
+        return JNI_FALSE;
+      }
+      close(fd);
+      return JNI_TRUE;
+    };
+    static auto nativeReadFileBytes = +[](JNIEnv* e, jclass, jstring path_j) -> jbyteArray {
+      if (!path_j) return nullptr;
+      const char* path = e->GetStringUTFChars(path_j, nullptr);
+      if (!path) {
+        return nullptr;
+      }
+      int fd = open(path, O_RDONLY);
+      e->ReleaseStringUTFChars(path_j, path);
+      if (fd < 0) {
+        return nullptr;
+      }
+
+      std::vector<jbyte> bytes;
+      struct stat sb;
+      if (fstat(fd, &sb) == 0 && sb.st_size > 0 && sb.st_size <= (128 * 1024 * 1024)) {
+        bytes.reserve(static_cast<size_t>(sb.st_size));
+      }
+
+      jbyte chunk[8192];
+      while (true) {
+        ssize_t n = read(fd, chunk, sizeof(chunk));
+        if (n == 0) {
+          break;
+        }
+        if (n < 0) {
+          if (errno == EINTR) {
+            continue;
+          }
+          close(fd);
+          return nullptr;
+        }
+        bytes.insert(bytes.end(), chunk, chunk + n);
+      }
+      close(fd);
+
+      jbyteArray out = e->NewByteArray(bytes.size());
+      if (!out) {
+        return nullptr;
+      }
+      if (!bytes.empty()) {
+        e->SetByteArrayRegion(out, 0, bytes.size(), bytes.data());
+        if (e->ExceptionCheck()) {
+          return nullptr;
+        }
+      }
+      return out;
+    };
+    static auto lookup_launch_value = +[](const char* key, std::string* out) -> bool {
+      if (key == nullptr || out == nullptr) {
+        return false;
+      }
+      const size_t key_len = strlen(key);
+      for (const std::string& opt_str : g_vm_property_options) {
+        const char* opt = opt_str.c_str();
+        if (opt == nullptr || strncmp(opt, "-D", 2) != 0) {
+          continue;
+        }
+        const char* entry = opt + 2;
+        if (strncmp(entry, key, key_len) != 0) {
+          continue;
+        }
+        if (entry[key_len] == '=') {
+          out->assign(entry + key_len + 1);
+          return true;
+        }
+        if (entry[key_len] == '\0') {
+          out->clear();
+          return true;
+        }
+      }
+      const char* arg_flag = nullptr;
+      if (strcmp(key, "westlake.apk.path") == 0) {
+        arg_flag = "--apk-path";
+      } else if (strcmp(key, "westlake.apk.activity") == 0) {
+        arg_flag = "--apk-activity";
+      } else if (strcmp(key, "westlake.apk.package") == 0) {
+        arg_flag = "--apk-package";
+      } else if (strcmp(key, "westlake.apk.resdir") == 0) {
+        arg_flag = "--apk-resdir";
+      } else if (strcmp(key, "westlake.apk.manifest") == 0) {
+        arg_flag = "--apk-manifest";
+      }
+      if (arg_flag != nullptr) {
+        for (size_t i = 0; i + 1 < g_main_args.size(); ++i) {
+          if (g_main_args[i] == arg_flag) {
+            out->assign(g_main_args[i + 1]);
+            return true;
+          }
+        }
+      }
+      int fd = open("/proc/self/cmdline", O_RDONLY);
+      if (fd >= 0) {
+        std::vector<char> cmdline(32768);
+        ssize_t n = TEMP_FAILURE_RETRY(read(fd, cmdline.data(), cmdline.size() - 1));
+        close(fd);
+        if (n > 0) {
+          cmdline[static_cast<size_t>(n)] = '\0';
+          size_t pos = 0;
+          while (pos < static_cast<size_t>(n)) {
+            const char* entry = cmdline.data() + pos;
+            size_t entry_len = strlen(entry);
+            if (entry_len == 0) {
+              ++pos;
+              continue;
+            }
+            if (entry[0] == '-' && entry[1] == 'D') {
+              const char* opt = entry + 2;
+              if (strncmp(opt, key, key_len) == 0) {
+                if (opt[key_len] == '=') {
+                  out->assign(opt + key_len + 1);
+                  return true;
+                }
+                if (opt[key_len] == '\0') {
+                  out->clear();
+                  return true;
+                }
+              }
+            }
+            pos += entry_len + 1;
+          }
+        }
+      }
+      std::string env_name;
+      env_name.reserve(key_len);
+      for (size_t i = 0; i < key_len; ++i) {
+        unsigned char ch = static_cast<unsigned char>(key[i]);
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) {
+          env_name.push_back(static_cast<char>(toupper(ch)));
+        } else {
+          env_name.push_back('_');
+        }
+      }
+      const char* env_value = getenv(env_name.c_str());
+      if (env_value != nullptr) {
+        out->assign(env_value);
+        return true;
+      }
+      return false;
+    };
+    static auto nativeVmProperty = +[](JNIEnv* e, jclass, jstring key_j) -> jstring {
+      if (key_j == nullptr) {
+        return nullptr;
+      }
+      const char* key = e->GetStringUTFChars(key_j, nullptr);
+      if (key == nullptr) {
+        return nullptr;
+      }
+      std::string value;
+      bool found = lookup_launch_value(key, &value);
+      e->ReleaseStringUTFChars(key_j, key);
+      if (!found) {
+        return nullptr;
+      }
+      return e->NewStringUTF(value.c_str());
+    };
+    static auto nativeVmArgCount = +[](JNIEnv*, jclass) -> jint {
+      return static_cast<jint>(g_main_args.size());
+    };
+    static auto nativeVmArg = +[](JNIEnv* e, jclass, jint index) -> jstring {
+      if (index < 0 || static_cast<size_t>(index) >= g_main_args.size()) {
+        return nullptr;
+      }
+      return e->NewStringUTF(g_main_args[static_cast<size_t>(index)].c_str());
+    };
+    static auto nativeSystemClassLoader = +[](JNIEnv* e, jclass) -> jobject {
+      jobject system_loader = Runtime::Current()->GetSystemClassLoader();
+      return system_loader != nullptr ? e->NewLocalRef(system_loader) : nullptr;
+    };
+    static auto nativeFindClass = +[](JNIEnv* e, jclass, jstring class_name_j) -> jclass {
+      if (class_name_j == nullptr) {
+        return nullptr;
+      }
+      const char* class_name = e->GetStringUTFChars(class_name_j, nullptr);
+      if (class_name == nullptr) {
+        return nullptr;
+      }
+      std::string descriptor(class_name);
+      e->ReleaseStringUTFChars(class_name_j, class_name);
+      if (descriptor.empty()) {
+        return nullptr;
+      }
+      if (descriptor[0] != '[') {
+        descriptor.insert(descriptor.begin(), 'L');
+        descriptor.push_back(';');
+      }
+      for (char& ch : descriptor) {
+        if (ch == '.') {
+          ch = '/';
+        }
+      }
+
+      ScopedObjectAccess soa(Thread::Current());
+      jobject system_loader = Runtime::Current()->GetSystemClassLoader();
+      StackHandleScope<1> hs(soa.Self());
+      Handle<mirror::ClassLoader> loader =
+          hs.NewHandle(system_loader != nullptr
+                           ? soa.Decode<mirror::ClassLoader>(system_loader)
+                           : ObjPtr<mirror::ClassLoader>(nullptr));
+      ObjPtr<mirror::Class> found =
+          Runtime::Current()->GetClassLinker()->FindClass(soa.Self(), descriptor.c_str(), loader);
+      if (found == nullptr) {
+        if (soa.Self()->IsExceptionPending()) {
+          soa.Self()->ClearException();
+        }
+        return nullptr;
+      }
+      return soa.AddLocalReference<jclass>(found);
+    };
+    static auto nativePrimeLaunchConfig = +[](JNIEnv* e, jclass clazz) {
+      struct FieldSpec {
+        const char* field_name;
+        const char* key;
+      };
+      const FieldSpec specs[] = {
+          {"sBootApkPath", "westlake.apk.path"},
+          {"sBootActivityName", "westlake.apk.activity"},
+          {"sBootPackageName", "westlake.apk.package"},
+          {"sBootManifestPath", "westlake.apk.manifest"},
+          {"sBootResDir", "westlake.apk.resdir"},
+      };
+      for (const FieldSpec& spec : specs) {
+        std::string value;
+        if (!lookup_launch_value(spec.key, &value) || value.empty()) {
+          continue;
+        }
+        jfieldID field = e->GetStaticFieldID(clazz, spec.field_name, "Ljava/lang/String;");
+        if (field == nullptr) {
+          if (e->ExceptionCheck()) e->ExceptionClear();
+          continue;
+        }
+        jstring value_j = e->NewStringUTF(value.c_str());
+        if (value_j == nullptr) {
+          if (e->ExceptionCheck()) e->ExceptionClear();
+          continue;
+        }
+        e->SetStaticObjectField(clazz, field, value_j);
+        if (e->ExceptionCheck()) {
+          e->ExceptionClear();
+          continue;
+        }
+      }
     };
     static auto setApkAssetsNative = +[](JNIEnv* e, jclass, jobject assetMgr, jobjectArray apkArr, jlong nativePtr) {
       // Call AssetManager.nativeSetApkAssets(long, ApkAssets[], boolean, boolean) from C
@@ -572,14 +1368,46 @@ static int InvokeMain(JNIEnv* env, char** argv) {
     JNINativeMethod methods[] = {
       {"nativeAllocInstance", "(Ljava/lang/Class;)Ljava/lang/Object;", (void*)+allocInstance},
       {"nativeLog", "(Ljava/lang/String;)V", (void*)+nativeLog},
+      {"nativeCanOpenFile", "(Ljava/lang/String;)Z", (void*)+nativeCanOpenFile},
+      {"nativeReadFileBytes", "(Ljava/lang/String;)[B", (void*)+nativeReadFileBytes},
+      {"nativeVmProperty", "(Ljava/lang/String;)Ljava/lang/String;", (void*)+nativeVmProperty},
+      {"nativeVmArgCount", "()I", (void*)+nativeVmArgCount},
+      {"nativeVmArg", "(I)Ljava/lang/String;", (void*)+nativeVmArg},
+      {"nativeSystemClassLoader", "()Ljava/lang/ClassLoader;", (void*)+nativeSystemClassLoader},
+      {"nativeFindClass", "(Ljava/lang/String;)Ljava/lang/Class;", (void*)+nativeFindClass},
+      {"nativePatchClassNoop", "(Ljava/lang/String;Ljava/lang/ClassLoader;)Z",
+          (void*)+nativePatchClassNoop},
+      {"nativePrimeLaunchConfig", "()V", (void*)+nativePrimeLaunchConfig},
       {"nativePrintException", "(Ljava/lang/Throwable;)V", (void*)+printException},
       {"nativeSetApkAssets", "(Ljava/lang/Object;[Ljava/lang/Object;J)V", (void*)+setApkAssetsNative},
     };
-    int rc = env->RegisterNatives(klass.get(), methods, 4);
-    if (env->ExceptionCheck()) env->ExceptionClear();
-    fprintf(stderr, "[dalvikvm] RegisterNatives for %s: %s\n", class_name.c_str(),
-            rc == 0 ? "OK" : "FAILED");
+    int registered = 0;
+    int skipped = 0;
+    int failed = 0;
+    for (const JNINativeMethod& method : methods) {
+      jmethodID probe = env->GetStaticMethodID(klass.get(), method.name, method.signature);
+      if (probe == nullptr) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        skipped++;
+        fprintf(stderr, "[dalvikvm] RegisterNatives skip %s.%s%s (method missing)\n",
+                class_name.c_str(), method.name, method.signature);
+        continue;
+      }
+      int rc = env->RegisterNatives(klass.get(), &method, 1);
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      if (rc == 0) {
+        registered++;
+      } else {
+        failed++;
+        fprintf(stderr, "[dalvikvm] RegisterNatives failed %s.%s%s\n",
+                class_name.c_str(), method.name, method.signature);
+      }
+    }
+    fprintf(stderr, "[dalvikvm] RegisterNatives for %s: registered=%d skipped=%d failed=%d\n",
+            class_name.c_str(), registered, skipped, failed);
   }
+
+  RegisterStandaloneCoreNatives(env);
 
   jmethodID method = env->GetStaticMethodID(klass.get(), "main", "([Ljava/lang/String;)V");
   if (method == nullptr) {
@@ -918,10 +1746,12 @@ static int InvokeMain(JNIEnv* env, char** argv) {
         }
       }
 
-      // ---- Fix System.props: create Properties object and populate it ----
-      // System.<clinit> fails in standalone builds, leaving System.props and
-      // System.unchangeableProps as null. This blocks Locale.getDefault() which
-      // blocks Activity/View initialization.
+      // ---- Rebuild System.props / System.unchangeableProps from scratch ----
+      // Reusing a partially initialized System.props object is unsafe here: if
+      // System.<clinit> failed mid-flight we may inherit a poisoned
+      // PropertiesWithNonOverrideableDefaults state where required keys still
+      // resolve to null. Build a fresh unchangeable map, then rebuild props on
+      // top of it so StaticProperty/File I/O sees the expected defaults chain.
       {
         jclass propsCls = env->FindClass("java/util/Properties");
         if (env->ExceptionCheck()) env->ExceptionClear();
@@ -930,15 +1760,126 @@ static int InvokeMain(JNIEnv* env, char** argv) {
           if (env->ExceptionCheck()) env->ExceptionClear();
           jmethodID propsPut = propsCls ? env->GetMethodID(propsCls, "setProperty",
               "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;") : nullptr;
+          jmethodID propsGet = propsCls ? env->GetMethodID(propsCls, "getProperty",
+              "(Ljava/lang/String;)Ljava/lang/String;") : nullptr;
           if (env->ExceptionCheck()) env->ExceptionClear();
 
-          if (propsInit && propsPut) {
-            jobject props = env->NewObject(propsCls, propsInit);
-            if (props && !env->ExceptionCheck()) {
+          if (propsInit && propsPut && propsGet) {
+            jclass propsWithDefaultsCls =
+                env->FindClass("java/lang/System$PropertiesWithNonOverrideableDefaults");
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            jmethodID propsWithDefaultsInit =
+                propsWithDefaultsCls
+                    ? env->GetMethodID(propsWithDefaultsCls, "<init>",
+                                       "(Ljava/util/Properties;)V")
+                    : nullptr;
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            jfieldID propsField = env->GetStaticFieldID(systemCls, "props", "Ljava/util/Properties;");
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            jfieldID ucPropsField = env->GetStaticFieldID(systemCls, "unchangeableProps", "Ljava/util/Properties;");
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            jmethodID setUnchangeableProp = env->GetStaticMethodID(
+                systemCls,
+                "setUnchangeableSystemProperty",
+                "(Ljava/lang/String;Ljava/lang/String;)V");
+            if (env->ExceptionCheck()) {
+              env->ExceptionClear();
+              setUnchangeableProp = nullptr;
+            }
+            jmethodID setProperties = env->GetStaticMethodID(
+                systemCls,
+                "setProperties",
+                "(Ljava/util/Properties;)V");
+            if (env->ExceptionCheck()) {
+              env->ExceptionClear();
+              setProperties = nullptr;
+            }
+
+            jobject ucProps = env->NewObject(propsCls, propsInit);
+            jobject seedProps = env->NewObject(propsCls, propsInit);
+            if (env->ExceptionCheck()) {
+              env->ExceptionClear();
+              ucProps = nullptr;
+              seedProps = nullptr;
+            }
+            if (ucProps && ucPropsField) {
+              env->SetStaticObjectField(systemCls, ucPropsField, ucProps);
+              if (env->ExceptionCheck()) env->ExceptionClear();
+            }
+            if (ucProps && seedProps && !env->ExceptionCheck()) {
+              auto put_prop = [&](jobject target, const char* key, const char* val) -> bool {
+                if (target == nullptr || key == nullptr || val == nullptr) {
+                  return false;
+                }
+                jstring k = env->NewStringUTF(key);
+                jstring v = env->NewStringUTF(val);
+                bool ok = false;
+                if (k != nullptr && v != nullptr && !env->ExceptionCheck()) {
+                  env->CallObjectMethod(target, propsPut, k, v);
+                  ok = !env->ExceptionCheck();
+                  if (!ok) env->ExceptionClear();
+                } else if (env->ExceptionCheck()) {
+                  env->ExceptionClear();
+                }
+                env->DeleteLocalRef(k);
+                env->DeleteLocalRef(v);
+                return ok;
+              };
+
+              auto set_unchangeable_prop = [&](const char* key, const char* val) {
+                if (key == nullptr || val == nullptr) {
+                  return;
+                }
+                if (setUnchangeableProp != nullptr) {
+                  jstring k = env->NewStringUTF(key);
+                  jstring v = env->NewStringUTF(val);
+                  if (k != nullptr && v != nullptr && !env->ExceptionCheck()) {
+                    env->CallStaticVoidMethod(systemCls, setUnchangeableProp, k, v);
+                    if (!env->ExceptionCheck()) {
+                      env->DeleteLocalRef(k);
+                      env->DeleteLocalRef(v);
+                      return;
+                    }
+                    env->ExceptionClear();
+                  } else if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                  }
+                  env->DeleteLocalRef(k);
+                  env->DeleteLocalRef(v);
+                }
+                put_prop(ucProps, key, val);
+              };
+
               // Get cwd for user.dir
               char cwdBuf[4096];
               const char* cwd = getcwd(cwdBuf, sizeof(cwdBuf));
               if (!cwd) cwd = "/";
+              const char* home = getenv("HOME");
+              if (home == nullptr || home[0] == '\0') home = "/";
+              const char* user = getenv("USER");
+              if (user == nullptr || user[0] == '\0') user = "westlake";
+              const char* tmpdir = getenv("TMPDIR");
+              if (tmpdir == nullptr || tmpdir[0] == '\0') tmpdir = "/tmp";
+              const char* art_root = getenv("ANDROID_ART_ROOT");
+              if (art_root == nullptr || art_root[0] == '\0') art_root = "/apex/com.android.art";
+              if (art_root[0] == '\0') art_root = "/";
+              const char* class_path = getenv("CLASSPATH");
+              if (class_path == nullptr) class_path = "";
+              const char* library_path = getenv("LD_LIBRARY_PATH");
+              if (library_path == nullptr || library_path[0] == '\0') {
+                library_path =
+                    "/data/local/tmp/westlake:/apex/com.android.runtime/lib64:"
+                    "/apex/com.android.art/lib64:/system/lib64:/vendor/lib64";
+              }
+#if defined(__aarch64__)
+              const char* os_arch = "aarch64";
+#elif defined(__x86_64__)
+              const char* os_arch = "x86_64";
+#elif defined(__arm__)
+              const char* os_arch = "arm";
+#else
+              const char* os_arch = "unknown";
+#endif
 
               struct { const char* key; const char* val; } sysProps[] = {
                 {"user.language", "en"},
@@ -951,46 +1892,164 @@ static int InvokeMain(JNIEnv* env, char** argv) {
                 {"file.separator", "/"},
                 {"path.separator", ":"},
                 {"line.separator", "\n"},
-                {"user.home", "/"},
+                {"user.home", home},
                 {"user.dir", cwd},
-                {"java.io.tmpdir", "/tmp"},
+                {"user.name", user},
+                {"java.io.tmpdir", tmpdir},
                 {"os.name", "Linux"},
-                {"os.arch", "x86_64"},
-                {"java.class.path", ""},
-                {"java.library.path", ""},
-                {"java.home", "/"},
+                {"os.arch", os_arch},
+                {"java.class.path", class_path},
+                {"java.library.path", library_path},
+                {"java.home", art_root},
                 {"java.vm.name", "Dalvik"},
                 {"java.vm.version", "2.1.0"},
                 {"java.specification.version", "1.8"},
               };
 
               for (auto& sp : sysProps) {
-                jstring k = env->NewStringUTF(sp.key);
-                jstring v = env->NewStringUTF(sp.val);
-                env->CallObjectMethod(props, propsPut, k, v);
+                set_unchangeable_prop(sp.key, sp.val);
+              }
+
+              for (const std::string& opt_str : g_vm_property_options) {
+                const char* opt = opt_str.c_str();
+                if (opt == nullptr || strncmp(opt, "-D", 2) != 0) {
+                  continue;
+                }
+                const char* key_start = opt + 2;
+                if (*key_start == '\0') {
+                  continue;
+                }
+                const char* eq = strchr(key_start, '=');
+                std::string key;
+                std::string value;
+                if (eq == nullptr) {
+                  key.assign(key_start);
+                  value.assign("");
+                } else {
+                  key.assign(key_start, eq - key_start);
+                  value.assign(eq + 1);
+                }
+                if (!key.empty()) {
+                  set_unchangeable_prop(key.c_str(), value.c_str());
+                }
+              }
+
+              jobject rebuiltProps = nullptr;
+              bool rebuiltViaSystemApi = false;
+              if (setProperties != nullptr) {
+                env->CallStaticVoidMethod(systemCls, setProperties, seedProps);
+                if (!env->ExceptionCheck()) {
+                  rebuiltViaSystemApi = true;
+                  rebuiltProps = propsField ? env->GetStaticObjectField(systemCls, propsField) : nullptr;
+                  if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                    rebuiltProps = nullptr;
+                  }
+                } else {
+                  fprintf(stderr, "[dalvikvm] WARN: System.setProperties threw during repair\n");
+                  env->ExceptionClear();
+                }
+              }
+              if (rebuiltProps == nullptr && propsWithDefaultsInit != nullptr) {
+                rebuiltProps = env->NewObject(propsWithDefaultsCls, propsWithDefaultsInit, ucProps);
+                if (env->ExceptionCheck()) {
+                  env->ExceptionClear();
+                  rebuiltProps = nullptr;
+                }
+                if (rebuiltProps != nullptr && propsField) {
+                  env->SetStaticObjectField(systemCls, propsField, rebuiltProps);
+                  if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                    rebuiltProps = nullptr;
+                  }
+                }
+              }
+              if (rebuiltProps == nullptr && propsField) {
+                rebuiltProps = env->NewObject(propsCls, propsInit);
+                if (env->ExceptionCheck()) {
+                  env->ExceptionClear();
+                  rebuiltProps = nullptr;
+                }
+                if (rebuiltProps != nullptr) {
+                  for (auto& sp : sysProps) {
+                    put_prop(rebuiltProps, sp.key, sp.val);
+                  }
+                  for (const std::string& opt_str : g_vm_property_options) {
+                    const char* opt = opt_str.c_str();
+                    if (opt == nullptr || strncmp(opt, "-D", 2) != 0) {
+                      continue;
+                    }
+                    const char* key_start = opt + 2;
+                    if (*key_start == '\0') {
+                      continue;
+                    }
+                    const char* eq = strchr(key_start, '=');
+                    std::string key;
+                    std::string value;
+                    if (eq == nullptr) {
+                      key.assign(key_start);
+                      value.assign("");
+                    } else {
+                      key.assign(key_start, eq - key_start);
+                      value.assign(eq + 1);
+                    }
+                    if (!key.empty()) {
+                      put_prop(rebuiltProps, key.c_str(), value.c_str());
+                    }
+                  }
+                  env->SetStaticObjectField(systemCls, propsField, rebuiltProps);
+                  if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                    rebuiltProps = nullptr;
+                  }
+                }
+              }
+
+              if (ucPropsField && ucProps != nullptr) {
+                env->SetStaticObjectField(systemCls, ucPropsField, ucProps);
                 if (env->ExceptionCheck()) env->ExceptionClear();
+              }
+
+              if (rebuiltProps != nullptr) {
+                fprintf(stderr,
+                        "[dalvikvm] System.props rebuilt (%s) and VM -D properties preserved\n",
+                        rebuiltViaSystemApi ? "System.setProperties" : "manual");
+              } else {
+                fprintf(stderr, "[dalvikvm] WARN: System.props rebuild failed\n");
+              }
+
+              auto log_resolved_prop = [&](const char* key) {
+                if (rebuiltProps == nullptr || key == nullptr) {
+                  return;
+                }
+                jstring k = env->NewStringUTF(key);
+                if (k == nullptr || env->ExceptionCheck()) {
+                  env->ExceptionClear();
+                  env->DeleteLocalRef(k);
+                  return;
+                }
+                jstring value = (jstring)env->CallObjectMethod(rebuiltProps, propsGet, k);
+                if (env->ExceptionCheck()) {
+                  env->ExceptionClear();
+                  value = nullptr;
+                }
+                const char* value_utf = value ? env->GetStringUTFChars(value, nullptr) : nullptr;
+                fprintf(stderr, "[dalvikvm]   %s=%s\n", key, value_utf ? value_utf : "(null)");
+                if (value && value_utf) env->ReleaseStringUTFChars(value, value_utf);
+                env->DeleteLocalRef(value);
                 env->DeleteLocalRef(k);
-                env->DeleteLocalRef(v);
-              }
+              };
+              log_resolved_prop("user.name");
+              log_resolved_prop("user.dir");
+              log_resolved_prop("user.home");
+              log_resolved_prop("java.io.tmpdir");
+              log_resolved_prop("java.library.path");
+              log_resolved_prop("java.class.path");
+              log_resolved_prop("java.home");
 
-              // Set System.props
-              jfieldID propsField = env->GetStaticFieldID(systemCls, "props", "Ljava/util/Properties;");
-              if (env->ExceptionCheck()) env->ExceptionClear();
-              if (propsField) {
-                env->SetStaticObjectField(systemCls, propsField, props);
-                fprintf(stderr, "[dalvikvm] System.props set with %d properties\n",
-                        (int)(sizeof(sysProps) / sizeof(sysProps[0])));
-              }
-
-              // Set System.unchangeableProps (same object is fine for standalone)
-              jfieldID ucPropsField = env->GetStaticFieldID(systemCls, "unchangeableProps", "Ljava/util/Properties;");
-              if (env->ExceptionCheck()) env->ExceptionClear();
-              if (ucPropsField) {
-                env->SetStaticObjectField(systemCls, ucPropsField, props);
-                fprintf(stderr, "[dalvikvm] System.unchangeableProps set OK\n");
-              }
-
-              env->DeleteLocalRef(props);
+              env->DeleteLocalRef(seedProps);
+              env->DeleteLocalRef(ucProps);
+              env->DeleteLocalRef(rebuiltProps);
             }
             if (env->ExceptionCheck()) env->ExceptionClear();
           }
@@ -2143,6 +3202,59 @@ static int InvokeMain(JNIEnv* env, char** argv) {
     if (env->ExceptionCheck()) env->ExceptionClear();
   }
 
+  // Route ThreadLocal.nextHashCode() to a simple native counter.
+  {
+    art::ScopedObjectAccess soa(art::Thread::Current());
+    art::ObjPtr<art::mirror::Class> tlClass = art::Runtime::Current()->GetClassLinker()->
+        FindSystemClass(art::Thread::Current(), "Ljava/lang/ThreadLocal;");
+    if (tlClass != nullptr) {
+      for (art::ArtMethod& m : tlClass->GetDeclaredMethods(art::kRuntimePointerSize)) {
+        if (strcmp(m.GetName(), "nextHashCode") == 0 &&
+            m.GetSignature().ToString() == "()I" &&
+            !m.IsNative()) {
+          m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+          m.SetEntryPointFromJni(reinterpret_cast<void*>(
+              Java_java_lang_ThreadLocal_nextHashCode_native));
+          fprintf(stderr, "[dalvikvm] Patched ThreadLocal.nextHashCode → native\n");
+          break;
+        }
+      }
+    }
+    if (art::Thread::Current()->IsExceptionPending()) {
+      art::Thread::Current()->ClearException();
+    }
+  }
+
+  // Seed ThreadLocal.nextHashCode with a fresh AtomicInteger.
+  // The relocated boot image sometimes leaves this static field null, which
+  // makes BlockGuard/Looper/View clinits fail immediately.
+  {
+    jclass tlCls = env->FindClass("java/lang/ThreadLocal");
+    jclass aiCls = env->FindClass("java/util/concurrent/atomic/AtomicInteger");
+    if (env->ExceptionCheck()) { env->ExceptionClear(); tlCls = nullptr; aiCls = nullptr; }
+    if (tlCls && aiCls) {
+      jfieldID nextHashCodeF = env->GetStaticFieldID(
+          tlCls, "nextHashCode", "Ljava/util/concurrent/atomic/AtomicInteger;");
+      jfieldID valueF = env->GetFieldID(aiCls, "value", "I");
+      if (env->ExceptionCheck()) { env->ExceptionClear(); nextHashCodeF = nullptr; valueF = nullptr; }
+      if (nextHashCodeF && valueF) {
+        jobject nextHashCode = env->GetStaticObjectField(tlCls, nextHashCodeF);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); nextHashCode = nullptr; }
+        if (nextHashCode == nullptr) {
+          nextHashCode = env->AllocObject(aiCls);
+          if (env->ExceptionCheck()) { env->ExceptionClear(); nextHashCode = nullptr; }
+          if (nextHashCode != nullptr) {
+            env->SetIntField(nextHashCode, valueF, 0);
+            env->SetStaticObjectField(tlCls, nextHashCodeF, nextHashCode);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            fprintf(stderr, "[dalvikvm] Seeded ThreadLocal.nextHashCode\n");
+          }
+        }
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
+
   // Force-initialize BlockGuard class so threadPolicy ThreadLocal is created
   // With verify-only boot image, <clinit> wasn't run during image generation
   {
@@ -2661,52 +3773,18 @@ static int InvokeMain(JNIEnv* env, char** argv) {
     }
   }
 
-  // Patch Resources.obtainStyledAttributes to handle null attrs
-  // The "inAttrs" NPE comes from Preconditions check in TypedArray.obtain
+  // Leave Resources.obtainStyledAttributes in Java.
+  // The shim implementation already returns an empty TypedArray when host
+  // theming is unavailable; forcing these methods native/null only breaks
+  // View construction later.
   {
-    jclass resCls = env->FindClass("android/content/res/Resources");
-    if (env->ExceptionCheck()) env->ExceptionClear();
-    if (resCls) {
-      art::ScopedObjectAccess soa(art::Thread::Current());
-      art::ObjPtr<art::mirror::Class> mirror = soa.Decode<art::mirror::Class>(resCls);
-      if (mirror != nullptr) {
-        for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
-          if (strcmp(m.GetName(), "obtainStyledAttributes") == 0 && !m.IsNative()) {
-            std::string sig = m.GetSignature().ToString();
-            // Return null (TypedArray) for all obtainStyledAttributes variants
-            m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
-            m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_noop_return_null));
-          }
-        }
-        // Also patch obtainAttributes
-        for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
-          if (strcmp(m.GetName(), "obtainAttributes") == 0 && !m.IsNative()) {
-            m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
-            m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_noop_return_null));
-          }
-        }
-        fprintf(stderr, "[dalvikvm] Patched Resources.obtainStyledAttributes/obtainAttributes → null\n");
-      }
-    }
+    fprintf(stderr, "[dalvikvm] Leaving Resources.obtainStyledAttributes/obtainAttributes unpatched\n");
     if (env->ExceptionCheck()) env->ExceptionClear();
   }
 
-  // Also patch Context.obtainStyledAttributes (called from View constructors)
+  // Leave Context.obtainStyledAttributes in Java for the same reason.
   {
-    jclass ctxCls = env->FindClass("android/content/Context");
-    if (env->ExceptionCheck()) env->ExceptionClear();
-    if (ctxCls) {
-      art::ScopedObjectAccess soa(art::Thread::Current());
-      art::ObjPtr<art::mirror::Class> mirror = soa.Decode<art::mirror::Class>(ctxCls);
-      if (mirror != nullptr) {
-        for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
-          if (strcmp(m.GetName(), "obtainStyledAttributes") == 0 && !m.IsNative()) {
-            m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
-            m.SetEntryPointFromJni(reinterpret_cast<void*>(Java_noop_return_null));
-          }
-        }
-      }
-    }
+    fprintf(stderr, "[dalvikvm] Leaving Context.obtainStyledAttributes unpatched\n");
     if (env->ExceptionCheck()) env->ExceptionClear();
   }
 
@@ -3272,8 +4350,58 @@ static int InvokeMain(JNIEnv* env, char** argv) {
     if (env->ExceptionCheck()) env->ExceptionClear();
   }
 
-  // Hilt DI: let it run with unlimited stack (no longer skipped)
-  fprintf(stderr, "[dalvikvm] Hilt_SplashActivity.onCreate NOT patched — DI will run\n");
+  // McDonald's splash boot still trips Hilt/account-profile work that Westlake
+  // does not need. We already queue HomeDashboardActivity directly, so bypass
+  // the DI wrapper and the splash-only home navigation path.
+  {
+    struct SplashPatch {
+      const char* class_name;
+      const char* method_name;
+      const char* signature;
+      void* entry;
+    } patches[] = {
+      {"com/mcdonalds/mcdcoreapp/common/activity/Hilt_SplashActivity",
+       "onCreate",
+       "(Landroid/os/Bundle;)V",
+       (void*)Java_java_lang_Throwable_printStackTrace_noop},
+      {"com/mcdonalds/mcdcoreapp/common/activity/SplashActivity",
+       "launchHome",
+       "()V",
+       (void*)Java_java_lang_Throwable_printStackTrace_noop},
+      {nullptr, nullptr, nullptr, nullptr},
+    };
+    int patched = 0;
+    for (int pi = 0; patches[pi].class_name != nullptr; ++pi) {
+      jclass patchCls = env->FindClass(patches[pi].class_name);
+      if (env->ExceptionCheck()) env->ExceptionClear();
+      if (!patchCls) {
+        continue;
+      }
+      art::ScopedObjectAccess soa(art::Thread::Current());
+      art::ObjPtr<art::mirror::Class> mirror = soa.Decode<art::mirror::Class>(patchCls);
+      if (mirror == nullptr) {
+        continue;
+      }
+      for (art::ArtMethod& m : mirror->GetDeclaredMethods(art::kRuntimePointerSize)) {
+        if (m.IsNative() || m.IsAbstract() || m.IsConstructor()) {
+          continue;
+        }
+        if (strcmp(m.GetName(), patches[pi].method_name) == 0 &&
+            m.GetSignature().ToString() == patches[pi].signature) {
+          m.SetAccessFlags(m.GetAccessFlags() | art::kAccNative);
+          m.SetEntryPointFromJni(reinterpret_cast<void*>(patches[pi].entry));
+          patched++;
+          fprintf(stderr, "[dalvikvm] Patched %s.%s%s\n",
+                  patches[pi].class_name,
+                  patches[pi].method_name,
+                  patches[pi].signature);
+          break;
+        }
+      }
+    }
+    fprintf(stderr, "[dalvikvm] Splash bootstrap patches applied=%d\n", patched);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+  }
 
   // Patch MCD analytics methods to no-ops (they cause NPE from null config strings)
   // PerfAnalyticsInteractor.h() and PerfAnalyticsInteractor.u() are performance tracking —
@@ -3305,6 +4433,11 @@ static int InvokeMain(JNIEnv* env, char** argv) {
     }
     if (env->ExceptionCheck()) env->ExceptionClear();
   }
+
+  // AppCoreUtils static init currently trips a broken HashSet(Arrays.asList(...))
+  // path in standalone ART. Seed a non-null whitelist and bypass the private
+  // validator so SplashActivity.getExtraIntentData() can continue.
+  PatchMcDonaldsAppCoreUtils(env);
 
   // FINAL FIXUP: re-set ConcurrentHashMap.U right before main()
   // Earlier setting might have been overwritten by class loading/init during pre-init phase.
@@ -3637,7 +4770,7 @@ static int dalvikvm(int argc, char** argv) {
   //
   // We're over-allocating, because this includes the options to the runtime
   // plus the options to the program.
-  int option_count = argc;
+  int option_count = argc + 2; // extra slots for -Xss and -Xms
   std::unique_ptr<JavaVMOption[]> options(new JavaVMOption[option_count]());
 
   // Copy options over.  Everything up to the name of the class starts
@@ -3648,9 +4781,15 @@ static int dalvikvm(int argc, char** argv) {
   const char* lib = nullptr;
   const char* what = nullptr;
   int curr_opt, arg_idx;
+  bool capture_class_path_value = false;
+  g_vm_class_path.clear();
   for (curr_opt = arg_idx = 0; arg_idx < argc; arg_idx++) {
     if (argv[arg_idx][0] != '-' && !need_extra) {
       break;
+    }
+    if (capture_class_path_value) {
+      g_vm_class_path.assign(argv[arg_idx]);
+      capture_class_path_value = false;
     }
     if (strncmp(argv[arg_idx], "-XXlib:", strlen("-XXlib:")) == 0) {
       lib = argv[arg_idx] + strlen("-XXlib:");
@@ -3664,6 +4803,7 @@ static int dalvikvm(int argc, char** argv) {
     if (strcmp(argv[arg_idx], "-classpath") == 0 || strcmp(argv[arg_idx], "-cp") == 0) {
       need_extra = true;
       what = argv[arg_idx];
+      capture_class_path_value = true;
     }
   }
 
@@ -3672,10 +4812,31 @@ static int dalvikvm(int argc, char** argv) {
     return EXIT_FAILURE;
   }
 
+  // Inject large thread stack for interpreted Hilt DI (needs ~64MB)
+  options[curr_opt++].optionString = const_cast<char*>("-XX:mainThreadStackSize=67108864"); // 64MB
+  fprintf(stderr, "[dalvikvm] Injected -Xss_64m (thread stack = 64MB)\n");
+
   if (curr_opt > option_count) {
     fprintf(stderr, "curr_opt(%d) > option_count(%d)\n", curr_opt, option_count);
     abort();
     return EXIT_FAILURE;
+  }
+
+  g_vm_property_options.clear();
+  if (g_vm_class_path.empty()) {
+    const char* env_class_path = getenv("CLASSPATH");
+    if (env_class_path != nullptr) {
+      g_vm_class_path.assign(env_class_path);
+    }
+  } else {
+    setenv("CLASSPATH", g_vm_class_path.c_str(), 1);
+    fprintf(stderr, "[dalvikvm] Captured -classpath=%s\n", g_vm_class_path.c_str());
+  }
+  for (int opt_idx = 0; opt_idx < curr_opt; ++opt_idx) {
+    const char* opt = options[opt_idx].optionString;
+    if (opt != nullptr && strncmp(opt, "-D", 2) == 0) {
+      g_vm_property_options.emplace_back(opt);
+    }
   }
 
   // Find the JNI_CreateJavaVM implementation.
@@ -3710,7 +4871,31 @@ static int dalvikvm(int argc, char** argv) {
     return EXIT_FAILURE;
   }
 
-  int rc = InvokeMain(env, &argv[arg_idx]);
+  // Run InvokeMain on a NEW thread with 64MB stack (interpreter needs deep stack for Hilt DI)
+  struct MainArgs { JNIEnv* env; char** argv; int argc; int rc; JavaVM* vm; };
+  MainArgs margs = {env, &argv[arg_idx], argc - arg_idx, 0, vm};
+  pthread_t main_thread;
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, 64 * 1024 * 1024); // 64MB
+  fprintf(stderr, "[dalvikvm] Spawning main thread with 64MB stack\n");
+  int pt_rc = pthread_create(&main_thread, &attr, [](void* arg) -> void* {
+    MainArgs* ma = (MainArgs*)arg;
+    // Attach this thread to the VM
+    JNIEnv* env2 = nullptr;
+    JavaVMAttachArgs attach_args = {JNI_VERSION_1_6, "main-64mb", nullptr};
+    ma->vm->AttachCurrentThread(&env2, &attach_args);
+    ma->rc = InvokeMain(env2, ma->argv);
+    return nullptr;
+  }, &margs);
+  pthread_attr_destroy(&attr);
+  if (pt_rc == 0) {
+    pthread_join(main_thread, nullptr);
+  } else {
+    fprintf(stderr, "[dalvikvm] pthread_create failed (%d), using original thread\n", pt_rc);
+    margs.rc = InvokeMain(env, &argv[arg_idx]);
+  }
+  int rc = margs.rc;
 
   // In standalone builds, VM shutdown (DestroyJavaVM) crashes because thread groups
   // and daemon threads aren't fully initialized. Just exit directly.

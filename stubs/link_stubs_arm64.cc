@@ -255,8 +255,12 @@ STUB_ENTRYPOINT(art_quick_invoke_polymorphic_with_hidden_receiver)
 void* NativeBridgeGetTrampoline2(void*, const char*, const char*, uint32_t) { return nullptr; }
 
 // OHBridge JNI_OnLoad stub
+extern int JNI_OnLoad_ohbridge_real(void* vm, void* reserved) __attribute__((weak));
 int JNI_OnLoad_ohbridge(void* vm, void* reserved) {
-    fprintf(stderr, "[STUB] JNI_OnLoad_ohbridge called (no-op)\n");
+    if (JNI_OnLoad_ohbridge_real) {
+        return JNI_OnLoad_ohbridge_real(vm, reserved);
+    }
+    fprintf(stderr, "[STUB] JNI_OnLoad_ohbridge called (fallback no-op)\n");
     fflush(stderr);
     return 0x00010006;  // JNI_VERSION_1_6
 }

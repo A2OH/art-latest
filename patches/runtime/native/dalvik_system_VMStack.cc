@@ -130,13 +130,40 @@ static jobject VMStack_getClosestUserClassLoader(JNIEnv* env, jclass) {
 // Returns the class of the caller's caller's caller.
 static jclass VMStack_getStackClass2(JNIEnv* env, jclass) {
   ScopedFastNativeObjectAccess soa(env);
-  NthCallerVisitor visitor(soa.Self(), 3);
+  struct StackClass2Visitor : public StackVisitor {
+    explicit StackClass2Visitor(Thread* thread)
+        : StackVisitor(thread, nullptr, StackVisitor::StackWalkKind::kIncludeInlinedFrames),
+          result(nullptr) {}
+
+    bool VisitFrame() override REQUIRES_SHARED(Locks::mutator_lock_) {
+      ArtMethod* method = GetMethod();
+      if (method == nullptr || method->IsRuntimeMethod()) {
+        return true;
+      }
+      ObjPtr<mirror::Class> klass = method->GetDeclaringClass();
+      if (klass == nullptr) {
+        return true;
+      }
+      if (klass->DescriptorEquals("Ldalvik/system/VMStack;") ||
+          klass->DescriptorEquals("Ljava/lang/invoke/MethodHandles;") ||
+          klass->DescriptorEquals("Ljava/lang/invoke/MethodHandles$Lookup;") ||
+          klass->DescriptorEquals("Lsun/reflect/Reflection;")) {
+        return true;
+      }
+      result = klass;
+      return false;
+    }
+
+    ObjPtr<mirror::Class> result;
+  };
+
+  StackClass2Visitor visitor(soa.Self());
   visitor.WalkStack();
-  if (UNLIKELY(visitor.caller == nullptr)) {
+  if (UNLIKELY(visitor.result == nullptr)) {
     // The caller is an attached native thread.
     return nullptr;
   }
-  return soa.AddLocalReference<jclass>(visitor.caller->GetDeclaringClass());
+  return soa.AddLocalReference<jclass>(visitor.result);
 }
 
 static jobjectArray VMStack_getThreadStackTrace(JNIEnv* env, jclass, jobject javaThread) {

@@ -159,7 +159,13 @@ ObjPtr<ClassExt> Class::EnsureExtDataPresent(Handle<Class> h_this, Thread* self)
 template <typename T>
 static void CheckSetStatus(Thread* self, T thiz, ClassStatus new_status, ClassStatus old_status)
     REQUIRES_SHARED(Locks::mutator_lock_) {
-  if (UNLIKELY(new_status <= old_status && new_status != ClassStatus::kErrorUnresolved &&
+  // Westlake can pre-mark classes as visibly initialized to bypass problematic
+  // <clinit> paths. ART may later attempt to write the same terminal status again.
+  // Treat identical status writes as harmless no-ops instead of aborting.
+  if (UNLIKELY(new_status == old_status)) {
+    return;
+  }
+  if (UNLIKELY(new_status < old_status && new_status != ClassStatus::kErrorUnresolved &&
                new_status != ClassStatus::kErrorResolved && new_status != ClassStatus::kRetired)) {
     LOG(FATAL) << "Unexpected change back of class status for " << thiz->PrettyClass() << " "
                << old_status << " -> " << new_status;
