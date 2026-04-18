@@ -6451,12 +6451,41 @@ static void ThrowSignatureMismatch(Handle<mirror::Class> klass,
                     error_msg.c_str());
 }
 
+static bool IsWestlakeDescriptorNeedingRelaxedCrossLoaderValidation(const std::string& desc) {
+  return android::base::StartsWith(desc, "Landroidx/lifecycle/") ||
+         android::base::StartsWith(desc, "Landroidx/savedstate/") ||
+         android::base::StartsWith(desc, "Lkotlin/") ||
+         android::base::StartsWith(desc, "Lkotlinx/");
+}
+
+static bool ShouldSkipWestlakeCrossLoaderSignatureValidation(Handle<mirror::Class> klass,
+                                                             Handle<mirror::Class> super_klass)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (klass.Get() == nullptr || super_klass.Get() == nullptr) {
+    return false;
+  }
+  if (klass->GetClassLoader() == nullptr ||
+      klass->GetClassLoader() == super_klass->GetClassLoader()) {
+    return false;
+  }
+  std::string klass_desc_storage;
+  const char* klass_desc = klass->GetDescriptor(&klass_desc_storage);
+  return IsWestlakeDescriptorNeedingRelaxedCrossLoaderValidation(klass_desc);
+}
+
 static bool HasSameSignatureWithDifferentClassLoaders(Thread* self,
                                                       Handle<mirror::Class> klass,
                                                       Handle<mirror::Class> super_klass,
                                                       ArtMethod* method1,
                                                       ArtMethod* method2)
     REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (UNLIKELY(ShouldSkipWestlakeCrossLoaderSignatureValidation(klass, super_klass))) {
+    LOG(WARNING) << "Westlake: bypassing cross-loader signature validation for "
+                 << mirror::Class::PrettyDescriptor(klass.Get())
+                 << " against "
+                 << mirror::Class::PrettyDescriptor(super_klass.Get());
+    return true;
+  }
   {
     StackHandleScope<1> hs(self);
     Handle<mirror::Class> return_type(hs.NewHandle(method1->ResolveReturnType()));
@@ -6549,6 +6578,9 @@ bool ClassLinker::ValidateSuperClassDescriptors(Handle<mirror::Class> klass) {
   if (klass->HasSuperClass() &&
       klass->GetClassLoader() != klass->GetSuperClass()->GetClassLoader()) {
     super_klass.Assign(klass->GetSuperClass());
+    if (UNLIKELY(ShouldSkipWestlakeCrossLoaderSignatureValidation(klass, super_klass))) {
+      return true;
+    }
     for (int i = klass->GetSuperClass()->GetVTableLength() - 1; i >= 0; --i) {
       auto* m = klass->GetVTableEntry(i, image_pointer_size_);
       auto* super_m = klass->GetSuperClass()->GetVTableEntry(i, image_pointer_size_);
@@ -6567,6 +6599,9 @@ bool ClassLinker::ValidateSuperClassDescriptors(Handle<mirror::Class> klass) {
   for (int32_t i = 0; i < klass->GetIfTableCount(); ++i) {
     super_klass.Assign(klass->GetIfTable()->GetInterface(i));
     if (klass->GetClassLoader() != super_klass->GetClassLoader()) {
+      if (UNLIKELY(ShouldSkipWestlakeCrossLoaderSignatureValidation(klass, super_klass))) {
+        return true;
+      }
       uint32_t num_methods = super_klass->NumVirtualMethods();
       for (uint32_t j = 0; j < num_methods; ++j) {
         auto* m = klass->GetIfTable()->GetMethodArray(i)->GetElementPtrSize<ArtMethod*>(
