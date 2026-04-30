@@ -16,6 +16,8 @@
 
 #include "interpreter.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <string_view>
 
@@ -24,11 +26,15 @@
 #include "common_dex_operations.h"
 #include "common_throws.h"
 #include "dex/dex_file_types.h"
+#include "handle_scope.h"
 #include "interpreter_common.h"
 #include "interpreter_switch_impl.h"
 #include "jit/jit.h"
 #include "jit/jit_code_cache.h"
 #include "jvalue-inl.h"
+#include "mirror/class-inl.h"
+#include "mirror/method_handles_lookup.h"
+#include "mirror/object-inl.h"
 #include "mirror/string-inl.h"
 #include "nativehelper/scoped_local_ref.h"
 #include "scoped_thread_state_change-inl.h"
@@ -48,6 +54,12 @@ ALWAYS_INLINE static ObjPtr<mirror::Object> ObjArg(uint32_t arg)
   return reinterpret_cast<mirror::Object*>(arg);
 }
 
+static bool WestlakeTraceTimeZoneBridge() {
+  const char* value = getenv("WESTLAKE_TRACE_TZ");
+  return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0 &&
+         strcmp(value, "false") != 0 && strcmp(value, "FALSE") != 0;
+}
+
 static void InterpreterJni(Thread* self,
                            ArtMethod* method,
                            std::string_view shorty,
@@ -55,6 +67,19 @@ static void InterpreterJni(Thread* self,
                            uint32_t* args,
                            JValue* result)
     REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (!method->IsStatic() &&
+      shorty == "CI" &&
+      strcmp(method->GetName(), "charAt") == 0 &&
+      method->GetDeclaringClass()->DescriptorEquals("Ljava/lang/String;")) {
+    if (receiver == nullptr) {
+      ThrowNullPointerExceptionFromInterpreter();
+      result->SetJ(0);
+      return;
+    }
+    result->SetC(receiver->AsString()->CharAt(static_cast<int32_t>(args[0])));
+    return;
+  }
+
   // Resolve the native function if it hasn't been registered yet.
   // The JNI entry point may be the dlsym lookup stub (an assembly routine),
   // which can't be called as a C function. We must resolve to the actual native.
@@ -62,6 +87,11 @@ static void InterpreterJni(Thread* self,
     const void* jni_entry = method->GetEntryPointFromJni();
     const void* dlsym_stub = GetJniDlsymLookupStub();
     const void* dlsym_critical_stub = GetJniDlsymLookupCriticalStub();
+    static constexpr uintptr_t kPFCutStaleNativeEntry = 0xfffffffffffffb17ULL;
+    if (reinterpret_cast<uintptr_t>(jni_entry) == kPFCutStaleNativeEntry) {
+      method->SetEntryPointFromJniPtrSize(nullptr, kRuntimePointerSize);
+      jni_entry = nullptr;
+    }
     if (jni_entry == dlsym_stub || jni_entry == dlsym_critical_stub || jni_entry == nullptr) {
       // Need to resolve the native method via JNI name lookup
       JavaVMExt* vm = down_cast<JNIEnvExt*>(self->GetJniEnv())->GetVm();
@@ -74,6 +104,17 @@ static void InterpreterJni(Thread* self,
       }
       // Register the resolved native code
       Runtime::Current()->GetClassLinker()->RegisterNative(self, method, native_code);
+    }
+    jni_entry = method->GetEntryPointFromJni();
+    if (jni_entry == dlsym_stub ||
+        jni_entry == dlsym_critical_stub ||
+        jni_entry == nullptr ||
+        reinterpret_cast<uintptr_t>(jni_entry) == kPFCutStaleNativeEntry) {
+      method->SetEntryPointFromJniPtrSize(nullptr, kRuntimePointerSize);
+      self->ThrowNewExceptionF("Ljava/lang/UnsatisfiedLinkError;",
+                               "unresolved or stale native entry for %s",
+                               method->PrettyMethod().c_str());
+      return;
     }
   }
 
@@ -143,19 +184,68 @@ static void InterpreterJni(Thread* self,
 
   // Regular JNI dispatch (JNIEnv + jclass/jobject)
   regular_jni:
+  const bool trace_tz_native =
+      WestlakeTraceTimeZoneBridge() &&
+      method->GetDeclaringClassDescriptor() != nullptr &&
+      strcmp(method->GetDeclaringClassDescriptor(), "Ljava/util/TimeZone;") == 0 &&
+      (strcmp(method->GetName(), "getDefault") == 0 ||
+       strcmp(method->GetName(), "getDefaultRef") == 0);
+  if (trace_tz_native) {
+    fprintf(stderr,
+            "[WESTLAKE-TZ-JNI] before SOA method=%s shorty=%.*s quick=%p jni=%p self=%p env=%p\n",
+            method->PrettyMethod().c_str(),
+            static_cast<int>(shorty.size()),
+            shorty.data(),
+            method->GetEntryPointFromQuickCompiledCode(),
+            method->GetEntryPointFromJni(),
+            self,
+            self != nullptr ? self->GetJniEnv() : nullptr);
+    fflush(stderr);
+  }
   ScopedObjectAccessUnchecked soa(self);
+  if (trace_tz_native) {
+    fprintf(stderr,
+            "[WESTLAKE-TZ-JNI] after SOA env=%p method=%s\n",
+            soa.Env(),
+            method->PrettyMethod().c_str());
+    fflush(stderr);
+  }
   if (method->IsStatic()) {
     if (shorty == "L") {
       using fntype = jobject(JNIEnv*, jclass);
       fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      if (trace_tz_native) {
+        fprintf(stderr,
+                "[WESTLAKE-TZ-JNI] static L before klass local fn=%p env=%p declaring=%p\n",
+                reinterpret_cast<void*>(fn),
+                soa.Env(),
+                method->GetDeclaringClass().Ptr());
+        fflush(stderr);
+      }
       ScopedLocalRef<jclass> klass(soa.Env(),
                                    soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
+      if (trace_tz_native) {
+        fprintf(stderr,
+                "[WESTLAKE-TZ-JNI] static L before call klass=%p fn=%p env=%p\n",
+                klass.get(),
+                reinterpret_cast<void*>(fn),
+                soa.Env());
+        fflush(stderr);
+      }
       jobject jresult;
       {
         // No state transition: stay in kRunnable for FastNative compat + nonconcurrent GC
         jresult = fn(soa.Env(), klass.get());
       }
+      if (trace_tz_native) {
+        fprintf(stderr, "[WESTLAKE-TZ-JNI] static L after call result=%p\n", jresult);
+        fflush(stderr);
+      }
       result->SetL(soa.Decode<mirror::Object>(jresult));
+      if (trace_tz_native) {
+        fprintf(stderr, "[WESTLAKE-TZ-JNI] static L after decode\n");
+        fflush(stderr);
+      }
     } else if (shorty == "V") {
       using fntype = void(JNIEnv*, jclass);
       fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
@@ -429,7 +519,23 @@ static void InterpreterJni(Thread* self,
       ScopedLocalRef<jclass> klass(soa.Env(),
                                    soa.AddLocalReference<jclass>(method->GetDeclaringClass()));
       jlong arg0 = *reinterpret_cast<jlong*>(&args[0]);
-      result->SetJ(fn(soa.Env(), klass.get(), arg0, args[2], args[3]));
+      const int pending_before = soa.Env()->ExceptionCheck() ? 1 : 0;
+      fprintf(stderr,
+              "[PF202N] interpreter JJII entry fn=%p handle=%lld a2=%d a3=%d pending_before=%d\n",
+              reinterpret_cast<void*>(fn),
+              static_cast<long long>(arg0),
+              static_cast<int>(args[2]),
+              static_cast<int>(args[3]),
+              pending_before);
+      fflush(stderr);
+      const jlong native_result = fn(soa.Env(), klass.get(), arg0, args[2], args[3]);
+      const int pending_after = soa.Env()->ExceptionCheck() ? 1 : 0;
+      fprintf(stderr,
+              "[PF202N] interpreter JJII return result=%lld pending_after=%d\n",
+              static_cast<long long>(native_result),
+              pending_after);
+      fflush(stderr);
+      result->SetJ(native_result);
     } else if (shorty == "VJF") {
       // void fn(JNIEnv*, jclass, long, float) — OHBridge.fontSetSize / penSetWidth
       using fntype = void(JNIEnv*, jclass, jlong, jfloat);
@@ -1378,6 +1484,13 @@ static void InterpreterJni(Thread* self,
       ScopedLocalRef<jobject> rcvr(soa.Env(), soa.AddLocalReference<jobject>(receiver));
       jlong arg0 = *reinterpret_cast<jlong*>(&args[0]);
       fn(soa.Env(), rcvr.get(), arg0);
+    } else if (shorty == "VZJ") {
+      // void fn(JNIEnv*, jobject, boolean, long) — Unsafe.park(boolean, long)
+      using fntype = void(JNIEnv*, jobject, jboolean, jlong);
+      fntype* const fn = reinterpret_cast<fntype*>(method->GetEntryPointFromJni());
+      ScopedLocalRef<jobject> rcvr(soa.Env(), soa.AddLocalReference<jobject>(receiver));
+      jlong arg1 = *reinterpret_cast<jlong*>(&args[1]);
+      fn(soa.Env(), rcvr.get(), static_cast<jboolean>(args[0]), arg1);
     } else if (shorty == "VLF") {
       // void fn(JNIEnv*, jobject, Object, float) — Field.setFloat
       using fntype = void(JNIEnv*, jobject, jobject, jfloat);
@@ -1431,6 +1544,28 @@ static JValue ExecuteSwitch(Thread* self,
                             JValue result_register,
                             bool interpret_one_instruction) REQUIRES_SHARED(Locks::mutator_lock_) {
   Runtime* runtime = Runtime::Current();
+  ArtMethod* method = shadow_frame.GetMethod();
+  UNUSED(method);
+  const bool pfc_fm_trace = false;
+  if (UNLIKELY(pfc_fm_trace && !runtime->IsActiveTransaction())) {
+    fprintf(stderr,
+            "[PFCUT-FM] ExecuteSwitch bypassing asm wrapper method=%s insns=%p "
+            "interpret_one=%d\n",
+            method->PrettyMethod().c_str(),
+            accessor.Insns(),
+            interpret_one_instruction ? 1 : 0);
+    fflush(stderr);
+    SwitchImplContext ctx {
+      .self = self,
+      .accessor = accessor,
+      .shadow_frame = shadow_frame,
+      .result_register = result_register,
+      .interpret_one_instruction = interpret_one_instruction,
+      .result = JValue(),
+    };
+    ExecuteSwitchImplCpp</*transaction_active=*/ false>(&ctx);
+    return ctx.result;
+  }
   auto switch_impl_cpp = runtime->IsActiveTransaction()
       ? runtime->GetClassLinker()->GetTransactionalInterpreter()
       : reinterpret_cast<const void*>(&ExecuteSwitchImplCpp</*transaction_active=*/ false>);
@@ -1446,8 +1581,27 @@ static inline JValue Execute(
     JValue result_register,
     bool stay_in_interpreter = false,
     bool from_deoptimize = false) REQUIRES_SHARED(Locks::mutator_lock_) {
+  ArtMethod* pfc_execute_method = shadow_frame.GetMethod();
+  UNUSED(pfc_execute_method);
+  const bool pfc_fm_trace = false;
+  if (pfc_fm_trace) {
+    fprintf(stderr,
+            "[PFCUT-FM] Execute enter method=%s stay=%d deopt=%d dex_pc=%u "
+            "top_shadow=%p top_quick=%p\n",
+            pfc_execute_method->PrettyMethod().c_str(),
+            stay_in_interpreter ? 1 : 0,
+            from_deoptimize ? 1 : 0,
+            shadow_frame.GetDexPC(),
+            self->GetManagedStack()->GetTopShadowFrame(),
+            self->GetManagedStack()->GetTopQuickFrame());
+    fflush(stderr);
+  }
   DCHECK(!shadow_frame.GetMethod()->IsAbstract());
   DCHECK(!shadow_frame.GetMethod()->IsNative());
+  if (pfc_fm_trace) {
+    fprintf(stderr, "[PFCUT-FM] Execute after DCHECK\n");
+    fflush(stderr);
+  }
 
   // We cache the result of NeedsDexPcEvents in the shadow frame so we don't need to call
   // NeedsDexPcEvents on every instruction for better performance. NeedsDexPcEvents only gets
@@ -1455,6 +1609,12 @@ static inline JValue Execute(
   // new value. So it is safe to cache it here.
   shadow_frame.SetNotifyDexPcMoveEvents(
       Runtime::Current()->GetInstrumentation()->NeedsDexPcEvents(shadow_frame.GetMethod(), self));
+  if (pfc_fm_trace) {
+    fprintf(stderr,
+            "[PFCUT-FM] Execute after SetNotifyDexPcMoveEvents notify=%d\n",
+            shadow_frame.GetNotifyDexPcMoveEvents() ? 1 : 0);
+    fflush(stderr);
+  }
 
   if (LIKELY(!from_deoptimize)) {  // Entering the method, but not via deoptimization.
     if (kIsDebugBuild) {
@@ -1462,6 +1622,14 @@ static inline JValue Execute(
       self->AssertNoPendingException();
     }
     ArtMethod *method = shadow_frame.GetMethod();
+    if (pfc_fm_trace) {
+      fprintf(stderr,
+              "[PFCUT-FM] Execute method-entry block listeners=%d force_pop=%d force_interp=%d\n",
+              Runtime::Current()->GetInstrumentation()->HasMethodEntryListeners() ? 1 : 0,
+              shadow_frame.GetForcePopFrame() ? 1 : 0,
+              self->IsForceInterpreter() ? 1 : 0);
+      fflush(stderr);
+    }
 
     // If we can continue in JIT and have JITed code available execute JITed code.
     if (!stay_in_interpreter &&
@@ -1520,11 +1688,31 @@ static inline JValue Execute(
         return ret;
       }
     }
+    if (pfc_fm_trace) {
+      fprintf(stderr,
+              "[PFCUT-FM] Execute after method-entry block pending=%d\n",
+              self->IsExceptionPending() ? 1 : 0);
+      fflush(stderr);
+    }
   }
 
   ArtMethod* method = shadow_frame.GetMethod();
 
+  if (pfc_fm_trace) {
+    fprintf(stderr,
+            "[PFCUT-FM] Execute before DCheckStaticState class=%p flags=0x%x\n",
+            method->GetDeclaringClass().Ptr(),
+            method->GetAccessFlags());
+    fflush(stderr);
+  }
   DCheckStaticState(self, method);
+  if (pfc_fm_trace) {
+    fprintf(stderr,
+            "[PFCUT-FM] Execute before ExecuteSwitch insns=%p pending=%d\n",
+            accessor.Insns(),
+            self->IsExceptionPending() ? 1 : 0);
+    fflush(stderr);
+  }
 
   // Lock counting is a special version of accessibility checks, and for simplicity and
   // reduction of template parameters, we gate it behind access-checks mode.
@@ -1565,6 +1753,38 @@ void EnterInterpreterFromInvoke(Thread* self,
   if (UNLIKELY(method->IsObsolete())) {
     ThrowInternalError("Attempting to invoke obsolete version of '%s'.",
                        method->PrettyMethod().c_str());
+    return;
+  }
+
+  if (method->IsNative() &&
+      method->IsStatic() &&
+      method->GetDeclaringClassDescriptor() != nullptr &&
+      strcmp(method->GetDeclaringClassDescriptor(), "Ljava/util/TimeZone;") == 0 &&
+      (strcmp(method->GetName(), "getDefault") == 0 ||
+       strcmp(method->GetName(), "getDefaultRef") == 0) &&
+      method->GetInterfaceMethodIfProxy(kRuntimePointerSize)->GetShortyView() == "L") {
+    using FnType = jobject (*)(JNIEnv*, jclass);
+    FnType fn = reinterpret_cast<FnType>(const_cast<void*>(method->GetEntryPointFromJni()));
+    JNIEnvExt* env = down_cast<JNIEnvExt*>(self->GetJniEnv());
+    const bool trace_tz = WestlakeTraceTimeZoneBridge();
+    if (trace_tz) {
+      fprintf(stderr,
+              "[WESTLAKE-TZ-EARLY] direct native invoke method=%s fn=%p env=%p\n",
+              method->PrettyMethod().c_str(),
+              reinterpret_cast<void*>(fn),
+              env);
+      fflush(stderr);
+    }
+    jobject jresult = fn(env, nullptr);
+    if (trace_tz) {
+      fprintf(stderr, "[WESTLAKE-TZ-EARLY] direct native invoke result=%p\n", jresult);
+      fflush(stderr);
+    }
+    result->SetL(self->DecodeJObject(jresult));
+    if (trace_tz) {
+      fprintf(stderr, "[WESTLAKE-TZ-EARLY] direct native invoke decoded\n");
+      fflush(stderr);
+    }
     return;
   }
 
@@ -1722,6 +1942,27 @@ void EnterInterpreterFromInvoke(Thread* self,
   }
   self->PushShadowFrame(shadow_frame);
   if (LIKELY(!method->IsNative())) {
+    std::string class_desc_storage;
+    const char* class_desc = method->GetDeclaringClass()->GetDescriptor(&class_desc_storage);
+    const char* method_name = method->GetName();
+    if (class_desc != nullptr &&
+        strcmp(class_desc, "Ljava/lang/invoke/MethodHandles;") == 0 &&
+        method_name != nullptr &&
+        strcmp(method_name, "lookup") == 0) {
+      ShadowFrame* caller_frame = shadow_frame->GetLink();
+      ObjPtr<mirror::Class> caller_class = caller_frame != nullptr
+          ? caller_frame->GetMethod()->GetDeclaringClass()
+          : method->GetDeclaringClass();
+      StackHandleScope<1> hs(self);
+      Handle<mirror::Class> lookup_class(hs.NewHandle(caller_class));
+      ObjPtr<mirror::MethodHandlesLookup> lookup =
+          mirror::MethodHandlesLookup::Create(self, lookup_class);
+      if (result != nullptr) {
+        result->SetL(lookup);
+      }
+      self->PopShadowFrame();
+      return;
+    }
     JValue r = Execute(self, accessor, *shadow_frame, JValue(), stay_in_interpreter);
     if (result != nullptr) {
       *result = r;
@@ -1740,6 +1981,13 @@ void EnterInterpreterFromInvoke(Thread* self,
     } else {
       InterpreterJni(self, method, shorty, receiver, args, result);
     }
+  }
+  if (method->GetDexMethodIndex() == 861) {
+    ShadowFrame* top = self->GetManagedStack()->GetTopShadowFrame();
+    ShadowFrame* link = shadow_frame->GetLink();
+    UNUSED(top);
+    self->SetTopOfShadowStack(link);
+    return;
   }
   self->PopShadowFrame();
 }
@@ -1888,6 +2136,23 @@ void ArtInterpreterToInterpreterBridge(Thread* self,
                                        const CodeItemDataAccessor& accessor,
                                        ShadowFrame* shadow_frame,
                                        JValue* result) {
+  ArtMethod* pfc_method = shadow_frame != nullptr ? shadow_frame->GetMethod() : nullptr;
+  UNUSED(pfc_method);
+  const bool pfc_fm_trace = false;
+  if (pfc_fm_trace) {
+    fprintf(stderr,
+            "[PFCUT-FM] bridge enter method=%s frame=%p code_item=%p insns=%p regs=%u ins=%u "
+            "top_shadow=%p top_quick=%p\n",
+            pfc_method->PrettyMethod().c_str(),
+            shadow_frame,
+            pfc_method->GetCodeItem(),
+            accessor.Insns(),
+            accessor.RegistersSize(),
+            accessor.InsSize(),
+            self->GetManagedStack()->GetTopShadowFrame(),
+            self->GetManagedStack()->GetTopQuickFrame());
+    fflush(stderr);
+  }
   bool implicit_check = Runtime::Current()->GetImplicitStackOverflowChecks();
   if (UNLIKELY(__builtin_frame_address(0) < self->GetStackEndForInterpreter(implicit_check))) {
     ThrowStackOverflowError(self);
@@ -1895,12 +2160,61 @@ void ArtInterpreterToInterpreterBridge(Thread* self,
   }
 
   self->PushShadowFrame(shadow_frame);
+  if (pfc_fm_trace) {
+    fprintf(stderr,
+            "[PFCUT-FM] bridge after push top_shadow=%p top_quick=%p\n",
+            self->GetManagedStack()->GetTopShadowFrame(),
+            self->GetManagedStack()->GetTopQuickFrame());
+    fflush(stderr);
+  }
 
   if (LIKELY(!shadow_frame->GetMethod()->IsNative())) {
     result->SetJ(Execute(self, accessor, *shadow_frame, JValue()).GetJ());
+    if (pfc_fm_trace) {
+      fprintf(stderr,
+              "[PFCUT-FM] bridge after Execute result=%p pending=%d top_shadow=%p top_quick=%p\n",
+              result != nullptr ? result->GetL() : nullptr,
+              self->IsExceptionPending() ? 1 : 0,
+              self->GetManagedStack()->GetTopShadowFrame(),
+              self->GetManagedStack()->GetTopQuickFrame());
+      fflush(stderr);
+    }
   } else {
     // We don't expect to be asked to interpret native code (which is entered via a JNI compiler
     // generated stub) except during testing and image writing.
+    ArtMethod* native_method = shadow_frame->GetMethod();
+    if (native_method->IsStatic() &&
+        native_method->GetDeclaringClassDescriptor() != nullptr &&
+        strcmp(native_method->GetDeclaringClassDescriptor(), "Ljava/util/TimeZone;") == 0 &&
+        (strcmp(native_method->GetName(), "getDefault") == 0 ||
+         strcmp(native_method->GetName(), "getDefaultRef") == 0) &&
+        native_method->GetInterfaceMethodIfProxy(kRuntimePointerSize)->GetShortyView() == "L") {
+      using FnType = jobject (*)(JNIEnv*, jclass);
+      FnType fn = reinterpret_cast<FnType>(
+          const_cast<void*>(native_method->GetEntryPointFromJni()));
+      JNIEnvExt* env = down_cast<JNIEnvExt*>(self->GetJniEnv());
+      const bool trace_tz = WestlakeTraceTimeZoneBridge();
+      if (trace_tz) {
+        fprintf(stderr,
+                "[WESTLAKE-TZ-INVOKE] direct native invoke method=%s fn=%p env=%p\n",
+                native_method->PrettyMethod().c_str(),
+                reinterpret_cast<void*>(fn),
+                env);
+        fflush(stderr);
+      }
+      jobject jresult = fn(env, nullptr);
+      if (trace_tz) {
+        fprintf(stderr, "[WESTLAKE-TZ-INVOKE] direct native invoke result=%p\n", jresult);
+        fflush(stderr);
+      }
+      result->SetL(self->DecodeJObject(jresult));
+      if (trace_tz) {
+        fprintf(stderr, "[WESTLAKE-TZ-INVOKE] direct native invoke decoded\n");
+        fflush(stderr);
+      }
+      self->PopShadowFrame();
+      return;
+    }
     CHECK(!Runtime::Current()->IsStarted());
     bool is_static = shadow_frame->GetMethod()->IsStatic();
     ObjPtr<mirror::Object> receiver = is_static ? nullptr : shadow_frame->GetVRegReference(0);

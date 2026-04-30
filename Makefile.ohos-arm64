@@ -232,7 +232,8 @@ RUNTIME_EXCLUDE = %backtrace_helper.cc \
   %oat/image.cc \
   %runtime/var_handles.cc \
   %runtime/hidden_api.cc \
-  %quick/quick_throw_entrypoints.cc
+  %quick/quick_throw_entrypoints.cc \
+  %quick/quick_trampoline_entrypoints.cc
 
 # Exclude ALL runtime/native/*.cc -- we compile patched copies from patches/runtime/native/
 RUNTIME_NATIVE_ORIG = $(filter-out %_test.cc %_fuzzer.cc %_bench.cc,$(wildcard $(ART)/runtime/native/*.cc))
@@ -358,6 +359,14 @@ $(QTHROW_PATCH_OBJ): $(QTHROW_PATCH_SRC)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -I$(ART)/runtime/entrypoints -I$(ART)/runtime/entrypoints/quick -c $< -o $@ 2>&1 && echo "OK: quick_throw_entrypoints.cc (A11-compat)" || { echo "FAIL: quick_throw_entrypoints.cc"; rm -f $@; }
 RUNTIME_OBJS += $(QTHROW_PATCH_OBJ)
+
+# Patched quick_trampoline_entrypoints.cc (portable TimeZone bridge logging)
+QTRAMP_PATCH_SRC = patches/runtime/entrypoints/quick/quick_trampoline_entrypoints.cc
+QTRAMP_PATCH_OBJ = $(BUILDDIR)/runtime/entrypoints/quick/quick_trampoline_entrypoints.o
+$(QTRAMP_PATCH_OBJ): $(QTRAMP_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -I$(ART)/runtime/entrypoints -I$(ART)/runtime/entrypoints/quick -c $< -o $@ 2>&1 && echo "OK: quick_trampoline_entrypoints.cc (patched)" || { echo "FAIL: quick_trampoline_entrypoints.cc"; rm -f $@; }
+RUNTIME_OBJS += $(QTRAMP_PATCH_OBJ)
 
 # Patched runtime/native/*.cc (tolerant JNI registration)
 NATIVE_PATCH_SRCS = $(wildcard patches/runtime/native/*.cc)
@@ -649,6 +658,13 @@ jni-stubs:
 	    -DJNI_OnLoad=JNI_OnLoad_ohbridge \
 	    -c $(STUBS)/ohbridge_stub.c \
 	    -o $(BUILDDIR)/jni_stubs/ohbridge_stub.o 2>&1 && echo "OK: ohbridge_stub.c" || echo "FAIL: ohbridge_stub.c"
+	@$(CC) $(TARGET_FLAGS) -fPIC -O2 -w \
+	    -I$(AOSP)/libnativehelper/include_jni \
+	    -I$(AOSP)/system/core/libcutils/include \
+	    -I$(AOSP)/system/core/libutils/include \
+	    -I$(AOSP)/system/core/liblog/include \
+	    -c $(STUBS)/framework_native_stubs.c \
+	    -o $(BUILDDIR)/jni_stubs/framework_native_stubs.o 2>&1 && echo "OK: framework_native_stubs.c" || echo "FAIL: framework_native_stubs.c"
 
 # ============ link-runtime (dalvikvm without dex2oat) ============
 link-runtime: all ziparchive sigchain nativehelper dalvikvm-main fault-handler-stubs template-instantiations jni-stubs asm sve-stub metrics-stubs fmtlib tinyxml2
@@ -684,6 +700,7 @@ link-runtime: all ziparchive sigchain nativehelper dalvikvm-main fault-handler-s
 	  $(BUILDDIR)/jni_stubs/javacore_stub.o \
 	  $(BUILDDIR)/jni_stubs/openjdk_stub.o \
 	  $(BUILDDIR)/jni_stubs/ohbridge_stub.o \
+	  $(BUILDDIR)/jni_stubs/framework_native_stubs.o \
 	  $(OHOS_SYSROOT)/usr/lib/libc++.a \
 	  $(OHOS_SYSROOT)/usr/lib/libc++abi.a \
 	  $(OHOS_SYSROOT)/usr/lib/libz.a \
@@ -849,6 +866,7 @@ link-dex2oat: all dex2oat-build ziparchive sigchain nativehelper fault-handler-s
 	  $(BUILDDIR)/jni_stubs/javacore_stub.o \
 	  $(BUILDDIR)/jni_stubs/openjdk_stub.o \
 	  $(BUILDDIR)/jni_stubs/ohbridge_stub.o \
+	  $(BUILDDIR)/jni_stubs/framework_native_stubs.o \
 	  $(OHOS_SYSROOT)/usr/lib/libc++.a \
 	  $(OHOS_SYSROOT)/usr/lib/libc++abi.a \
 	  $(OHOS_SYSROOT)/usr/lib/libz.a \

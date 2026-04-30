@@ -16,6 +16,9 @@
 
 #include "runtime.h"
 
+#include <atomic>
+#include <ctime>
+#include <errno.h>
 #include <optional>
 #include <utility>
 
@@ -27,7 +30,11 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/mount.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/stat.h>
+#include <strings.h>
+#include <unistd.h>
 
 #if defined(__APPLE__)
 #include <crt_externs.h>  // for _NSGetEnviron
@@ -98,6 +105,7 @@
 #include "jit/jit.h"
 #include "jit/jit_code_cache.h"
 #include "jit/profile_saver.h"
+#include "jni/jni_env_ext.h"
 #include "jni/java_vm_ext.h"
 #include "jni/jni_id_manager.h"
 #include "jni_id_type.h"
@@ -204,11 +212,821 @@ extern "C" int JNI_OnLoad_framework(void* vm, void* reserved);
 
 namespace art HIDDEN {
 
+void register_java_lang_Character(JNIEnv* env);
+
 extern "C" jint Westlake_UnixFileSystem_getBooleanAttributes(JNIEnv*, jobject, jobject);
 extern "C" jboolean Westlake_UnixFileSystem_hasBooleanAttributes(JNIEnv*, jobject, jobject, jint);
 extern "C" jboolean Westlake_UnixFileSystem_checkAccess(JNIEnv*, jobject, jobject, jint);
 extern "C" jlong Westlake_UnixFileSystem_getLastModifiedTime(JNIEnv*, jobject, jobject);
 extern "C" jlong Westlake_UnixFileSystem_getLength(JNIEnv*, jobject, jobject);
+extern "C" jobjectArray Westlake_UnixFileSystem_list(JNIEnv*, jobject, jobject);
+
+static std::atomic<jint> g_westlake_threadlocal_hash_counter{0};
+
+extern "C" jint Westlake_ThreadLocal_nextHashCode(JNIEnv*, jclass) {
+  static constexpr jint kHashIncrement = static_cast<jint>(0x61c88647u);
+  return g_westlake_threadlocal_hash_counter.fetch_add(kHashIncrement);
+}
+
+static void Westlake_ThrowErrnoException(JNIEnv* env, const char* function_name, int errnum) {
+  jclass cls = env->FindClass("android/system/ErrnoException");
+  if (cls == nullptr || env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return;
+  }
+  jmethodID ctor = env->GetMethodID(cls, "<init>", "(Ljava/lang/String;I)V");
+  if (ctor == nullptr || env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return;
+  }
+  jstring name = env->NewStringUTF(function_name);
+  if (name == nullptr || env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return;
+  }
+  jobject exc = env->NewObject(cls, ctor, name, static_cast<jint>(errnum));
+  if (exc == nullptr || env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return;
+  }
+  env->Throw(reinterpret_cast<jthrowable>(exc));
+}
+
+static jint Westlake_GetFileDescriptor(JNIEnv* env, jobject fd_obj) {
+  if (fd_obj == nullptr) {
+    return -1;
+  }
+  jclass fd_cls = env->GetObjectClass(fd_obj);
+  if (fd_cls == nullptr || env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return -1;
+  }
+  jfieldID descriptor = env->GetFieldID(fd_cls, "descriptor", "I");
+  if (descriptor == nullptr || env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return -1;
+  }
+  return env->GetIntField(fd_obj, descriptor);
+}
+
+static jobject Westlake_MakeFileDescriptor(JNIEnv* env, int fd) {
+  jclass fd_cls = env->FindClass("java/io/FileDescriptor");
+  if (fd_cls == nullptr || env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return nullptr;
+  }
+  jmethodID ctor = env->GetMethodID(fd_cls, "<init>", "()V");
+  if (ctor == nullptr || env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return nullptr;
+  }
+  jobject fd_obj = env->NewObject(fd_cls, ctor);
+  if (fd_obj == nullptr || env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return nullptr;
+  }
+  jfieldID descriptor = env->GetFieldID(fd_cls, "descriptor", "I");
+  if (descriptor == nullptr || env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return nullptr;
+  }
+  env->SetIntField(fd_obj, descriptor, static_cast<jint>(fd));
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return nullptr;
+  }
+  return fd_obj;
+}
+
+static jobject Westlake_MakeStructStat(JNIEnv* env, const struct stat& sb) {
+  jclass cls = env->FindClass("android/system/StructStat");
+  if (cls == nullptr || env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return nullptr;
+  }
+  jmethodID ctor = env->GetMethodID(cls, "<init>", "(JJIJIIJJJJJJJ)V");
+  if (ctor == nullptr || env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return nullptr;
+  }
+  return env->NewObject(cls,
+                        ctor,
+                        static_cast<jlong>(sb.st_dev),
+                        static_cast<jlong>(sb.st_ino),
+                        static_cast<jint>(sb.st_mode),
+                        static_cast<jlong>(sb.st_nlink),
+                        static_cast<jint>(sb.st_uid),
+                        static_cast<jint>(sb.st_gid),
+                        static_cast<jlong>(sb.st_rdev),
+                        static_cast<jlong>(sb.st_size),
+                        static_cast<jlong>(sb.st_atime),
+                        static_cast<jlong>(sb.st_mtime),
+                        static_cast<jlong>(sb.st_ctime),
+                        static_cast<jlong>(sb.st_blksize),
+                        static_cast<jlong>(sb.st_blocks));
+}
+
+static jobject Westlake_MakeStructLinger(JNIEnv* env, int onoff, int seconds) {
+  jclass cls = env->FindClass("android/system/StructLinger");
+  if (cls == nullptr || env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return nullptr;
+  }
+  jmethodID ctor = env->GetMethodID(cls, "<init>", "(II)V");
+  if (ctor == nullptr || env->ExceptionCheck()) {
+    env->ExceptionClear();
+    return nullptr;
+  }
+  return env->NewObject(cls, ctor, static_cast<jint>(onoff), static_cast<jint>(seconds));
+}
+
+extern "C" jobject Westlake_Linux_open(JNIEnv* env, jobject, jstring path_j, jint flags, jint mode) {
+  if (path_j == nullptr) {
+    Westlake_ThrowErrnoException(env, "open", EINVAL);
+    return nullptr;
+  }
+  const char* path = env->GetStringUTFChars(path_j, nullptr);
+  if (path == nullptr) {
+    return nullptr;
+  }
+  int fd = ::open(path, static_cast<int>(flags), static_cast<mode_t>(mode));
+  int saved_errno = errno;
+  env->ReleaseStringUTFChars(path_j, path);
+  if (fd < 0) {
+    Westlake_ThrowErrnoException(env, "open", saved_errno);
+    return nullptr;
+  }
+  jobject fd_obj = Westlake_MakeFileDescriptor(env, fd);
+  if (fd_obj == nullptr) {
+    ::close(fd);
+  }
+  return fd_obj;
+}
+
+extern "C" void Westlake_Linux_close(JNIEnv* env, jobject, jobject fd_obj) {
+  int fd = Westlake_GetFileDescriptor(env, fd_obj);
+  if (fd >= 0 && ::close(fd) != 0) {
+    Westlake_ThrowErrnoException(env, "close", errno);
+  }
+}
+
+extern "C" jint Westlake_Linux_readBytes(JNIEnv* env,
+                                          jobject,
+                                          jobject fd_obj,
+                                          jobject buffer,
+                                          jint offset,
+                                          jint byte_count) {
+  int fd = Westlake_GetFileDescriptor(env, fd_obj);
+  if (fd < 0) {
+    Westlake_ThrowErrnoException(env, "read", EBADF);
+    return -1;
+  }
+  if (buffer == nullptr || offset < 0 || byte_count < 0) {
+    Westlake_ThrowErrnoException(env, "read", EINVAL);
+    return -1;
+  }
+  jbyteArray byte_array = reinterpret_cast<jbyteArray>(buffer);
+  jsize length = env->GetArrayLength(byte_array);
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+    Westlake_ThrowErrnoException(env, "read", EINVAL);
+    return -1;
+  }
+  if (offset > length || byte_count > length - offset) {
+    Westlake_ThrowErrnoException(env, "read", EINVAL);
+    return -1;
+  }
+  jbyte* bytes = env->GetByteArrayElements(byte_array, nullptr);
+  if (bytes == nullptr) {
+    return -1;
+  }
+  ssize_t n = ::read(fd, bytes + offset, static_cast<size_t>(byte_count));
+  int saved_errno = errno;
+  env->ReleaseByteArrayElements(byte_array, bytes, 0);
+  if (n < 0) {
+    Westlake_ThrowErrnoException(env, "read", saved_errno);
+    return -1;
+  }
+  return static_cast<jint>(n);
+}
+
+extern "C" jint Westlake_Linux_writeBytes(JNIEnv* env,
+                                           jobject,
+                                           jobject fd_obj,
+                                           jobject buffer,
+                                           jint offset,
+                                           jint byte_count) {
+  int fd = Westlake_GetFileDescriptor(env, fd_obj);
+  if (fd < 0) {
+    Westlake_ThrowErrnoException(env, "write", EBADF);
+    return -1;
+  }
+  if (buffer == nullptr || offset < 0 || byte_count < 0) {
+    Westlake_ThrowErrnoException(env, "write", EINVAL);
+    return -1;
+  }
+  jbyteArray byte_array = reinterpret_cast<jbyteArray>(buffer);
+  jsize length = env->GetArrayLength(byte_array);
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+    Westlake_ThrowErrnoException(env, "write", EINVAL);
+    return -1;
+  }
+  if (offset > length || byte_count > length - offset) {
+    Westlake_ThrowErrnoException(env, "write", EINVAL);
+    return -1;
+  }
+  jbyte* bytes = env->GetByteArrayElements(byte_array, nullptr);
+  if (bytes == nullptr) {
+    return -1;
+  }
+  ssize_t n = ::write(fd, bytes + offset, static_cast<size_t>(byte_count));
+  int saved_errno = errno;
+  env->ReleaseByteArrayElements(byte_array, bytes, JNI_ABORT);
+  if (n < 0) {
+    Westlake_ThrowErrnoException(env, "write", saved_errno);
+    return -1;
+  }
+  return static_cast<jint>(n);
+}
+
+extern "C" jobject Westlake_Linux_fstat(JNIEnv* env, jobject, jobject fd_obj) {
+  int fd = Westlake_GetFileDescriptor(env, fd_obj);
+  struct stat sb;
+  if (fd < 0 || ::fstat(fd, &sb) != 0) {
+    Westlake_ThrowErrnoException(env, "fstat", fd < 0 ? EBADF : errno);
+    return nullptr;
+  }
+  return Westlake_MakeStructStat(env, sb);
+}
+
+extern "C" jobject Westlake_Linux_stat(JNIEnv* env, jobject, jstring path_j) {
+  if (path_j == nullptr) {
+    Westlake_ThrowErrnoException(env, "stat", EINVAL);
+    return nullptr;
+  }
+  const char* path = env->GetStringUTFChars(path_j, nullptr);
+  if (path == nullptr) {
+    return nullptr;
+  }
+  struct stat sb;
+  int rc = ::stat(path, &sb);
+  int saved_errno = errno;
+  env->ReleaseStringUTFChars(path_j, path);
+  if (rc != 0) {
+    Westlake_ThrowErrnoException(env, "stat", saved_errno);
+    return nullptr;
+  }
+  return Westlake_MakeStructStat(env, sb);
+}
+
+extern "C" jobject Westlake_Linux_lstat(JNIEnv* env, jobject, jstring path_j) {
+  if (path_j == nullptr) {
+    Westlake_ThrowErrnoException(env, "lstat", EINVAL);
+    return nullptr;
+  }
+  const char* path = env->GetStringUTFChars(path_j, nullptr);
+  if (path == nullptr) {
+    return nullptr;
+  }
+  struct stat sb;
+  int rc = ::lstat(path, &sb);
+  int saved_errno = errno;
+  env->ReleaseStringUTFChars(path_j, path);
+  if (rc != 0) {
+    Westlake_ThrowErrnoException(env, "lstat", saved_errno);
+    return nullptr;
+  }
+  return Westlake_MakeStructStat(env, sb);
+}
+
+extern "C" jboolean Westlake_Linux_access(JNIEnv* env, jobject, jstring path_j, jint mode) {
+  if (path_j == nullptr) {
+    Westlake_ThrowErrnoException(env, "access", EINVAL);
+    return JNI_FALSE;
+  }
+  const char* path = env->GetStringUTFChars(path_j, nullptr);
+  if (path == nullptr) {
+    return JNI_FALSE;
+  }
+  int rc = ::access(path, static_cast<int>(mode));
+  int saved_errno = errno;
+  env->ReleaseStringUTFChars(path_j, path);
+  if (rc != 0) {
+    Westlake_ThrowErrnoException(env, "access", saved_errno);
+    return JNI_FALSE;
+  }
+  return JNI_TRUE;
+}
+
+extern "C" jobject Westlake_Linux_getsockoptLinger(JNIEnv* env,
+                                                    jobject,
+                                                    jobject fd_obj,
+                                                    jint level,
+                                                    jint option) {
+  int fd = Westlake_GetFileDescriptor(env, fd_obj);
+  if (fd < 0) {
+    return Westlake_MakeStructLinger(env, 0, 0);
+  }
+
+  struct stat sb;
+  if (::fstat(fd, &sb) != 0 || !S_ISSOCK(sb.st_mode)) {
+    return Westlake_MakeStructLinger(env, 0, 0);
+  }
+
+  struct linger linger_value {};
+  socklen_t len = sizeof(linger_value);
+  if (::getsockopt(fd,
+                   static_cast<int>(level),
+                   static_cast<int>(option),
+                   &linger_value,
+                   &len) != 0) {
+    return Westlake_MakeStructLinger(env, 0, 0);
+  }
+  return Westlake_MakeStructLinger(env, linger_value.l_onoff, linger_value.l_linger);
+}
+
+namespace {
+
+struct WestlakePortableTimeZone {
+  const char* id;
+  jint raw_offset_ms;
+  bool use_daylight;
+  jint dst_savings_ms;
+};
+
+static bool Westlake_TraceTimeZone() {
+  const char* value = getenv("WESTLAKE_TRACE_TZ");
+  return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0 &&
+         strcasecmp(value, "false") != 0;
+}
+
+static const char* Westlake_NormalizeTimeZoneId(const char* id) {
+  if (id == nullptr || id[0] == '\0') {
+    return "UTC";
+  }
+  if (id[0] == ':' && id[1] != '\0') {
+    ++id;
+  }
+  if (strcmp(id, "Etc/UTC") == 0 || strcmp(id, "Etc/GMT") == 0 ||
+      strcmp(id, "GMT0") == 0) {
+    return "UTC";
+  }
+  return id;
+}
+
+static jint Westlake_ClampOffsetMillis(double seconds) {
+  const double millis = seconds * 1000.0;
+  if (millis > static_cast<double>(std::numeric_limits<jint>::max())) {
+    return std::numeric_limits<jint>::max();
+  }
+  if (millis < static_cast<double>(std::numeric_limits<jint>::min())) {
+    return std::numeric_limits<jint>::min();
+  }
+  return static_cast<jint>(millis);
+}
+
+static WestlakePortableTimeZone Westlake_ResolvePortableTimeZone() {
+  WestlakePortableTimeZone tz = {
+      Westlake_NormalizeTimeZoneId(getenv("WESTLAKE_TIMEZONE_ID")),
+      0,
+      false,
+      0,
+  };
+  if (strcmp(tz.id, "UTC") == 0) {
+    tz.id = Westlake_NormalizeTimeZoneId(getenv("TZ"));
+  }
+
+  tzset();
+  time_t now = time(nullptr);
+  struct tm local_tm {};
+  struct tm utc_tm {};
+  if (now != static_cast<time_t>(-1) &&
+      localtime_r(&now, &local_tm) != nullptr &&
+      gmtime_r(&now, &utc_tm) != nullptr) {
+    struct tm local_copy = local_tm;
+    struct tm utc_copy = utc_tm;
+    const time_t local_epoch = mktime(&local_copy);
+    const time_t utc_as_local_epoch = mktime(&utc_copy);
+    if (local_epoch != static_cast<time_t>(-1) &&
+        utc_as_local_epoch != static_cast<time_t>(-1)) {
+      tz.raw_offset_ms = Westlake_ClampOffsetMillis(difftime(local_epoch, utc_as_local_epoch));
+    }
+    if (local_tm.tm_isdst > 0) {
+      tz.use_daylight = true;
+      tz.dst_savings_ms = 60 * 60 * 1000;
+    }
+  }
+  return tz;
+}
+
+static ObjPtr<mirror::Object> Westlake_CreatePortableTimeZone(Thread* self,
+                                                              ClassLinker* class_linker)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (self == nullptr || class_linker == nullptr) {
+    return nullptr;
+  }
+
+  WestlakePortableTimeZone resolved = Westlake_ResolvePortableTimeZone();
+  StackHandleScope<4> hs(self);
+  Handle<mirror::Class> simple_cls(hs.NewHandle(
+      class_linker->FindSystemClass(self, "Ljava/util/SimpleTimeZone;")));
+  if (self->IsExceptionPending()) {
+    self->ClearException();
+  }
+  if (simple_cls == nullptr) {
+    return nullptr;
+  }
+
+  Handle<mirror::Object> tz(hs.NewHandle(simple_cls->AllocObject(self)));
+  if (self->IsExceptionPending()) {
+    self->ClearException();
+  }
+  if (tz == nullptr) {
+    return nullptr;
+  }
+
+  Handle<mirror::String> id(
+      hs.NewHandle(mirror::String::AllocFromModifiedUtf8(self, resolved.id)));
+  if (self->IsExceptionPending()) {
+    self->ClearException();
+  }
+
+  Handle<mirror::Class> time_zone_cls(hs.NewHandle(
+      class_linker->FindSystemClass(self, "Ljava/util/TimeZone;")));
+  if (self->IsExceptionPending()) {
+    self->ClearException();
+  }
+  if (time_zone_cls != nullptr && id != nullptr) {
+    ArtField* id_field = time_zone_cls->FindInstanceField("ID", "Ljava/lang/String;");
+    if (id_field != nullptr) {
+      id_field->SetObject<false>(tz.Get(), id.Get());
+    }
+    if (self->IsExceptionPending()) {
+      self->ClearException();
+    }
+  }
+
+  ArtField* raw_offset = simple_cls->FindInstanceField("rawOffset", "I");
+  if (raw_offset != nullptr && !self->IsExceptionPending()) {
+    raw_offset->SetInt<false>(tz.Get(), resolved.raw_offset_ms);
+  }
+  if (self->IsExceptionPending()) {
+    self->ClearException();
+  }
+
+  ArtField* use_daylight = simple_cls->FindInstanceField("useDaylight", "Z");
+  if (use_daylight != nullptr && !self->IsExceptionPending()) {
+    use_daylight->SetBoolean<false>(tz.Get(), resolved.use_daylight);
+  }
+  if (self->IsExceptionPending()) {
+    self->ClearException();
+  }
+
+  ArtField* dst_savings = simple_cls->FindInstanceField("dstSavings", "I");
+  if (dst_savings != nullptr && !self->IsExceptionPending()) {
+    dst_savings->SetInt<false>(tz.Get(), resolved.dst_savings_ms);
+  }
+  if (self->IsExceptionPending()) {
+    self->ClearException();
+  }
+
+  if (Westlake_TraceTimeZone()) {
+    fprintf(stderr,
+            "[WESTLAKE-TZ] id=%s rawOffsetMs=%d useDaylight=%d dstSavingsMs=%d object=%p\n",
+            resolved.id,
+            resolved.raw_offset_ms,
+            resolved.use_daylight ? 1 : 0,
+            resolved.dst_savings_ms,
+            tz.Get());
+    fflush(stderr);
+  }
+  return tz.Get();
+}
+
+}  // namespace
+
+extern "C" jobject Westlake_TimeZone_getDefault(JNIEnv* env, jclass) {
+  Thread* self = Thread::Current();
+  if (self == nullptr) {
+    return nullptr;
+  }
+  JNIEnvExt* env_ext = down_cast<JNIEnvExt*>(self->GetJniEnv());
+  if (env_ext == nullptr) {
+    return nullptr;
+  }
+  ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
+  ObjPtr<mirror::Object> tz = Westlake_CreatePortableTimeZone(self, class_linker);
+  if (tz == nullptr) {
+    return nullptr;
+  }
+  return env_ext->AddLocalReference<jobject>(tz.Ptr());
+}
+
+extern "C" void* Westlake_TimeZone_getDefaultObjectForQuick() {
+  Thread* self = Thread::Current();
+  if (self == nullptr) {
+    return nullptr;
+  }
+  ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
+  if (class_linker == nullptr) {
+    return nullptr;
+  }
+  ObjPtr<mirror::Object> tz = Westlake_CreatePortableTimeZone(self, class_linker);
+  return tz.Ptr();
+}
+
+extern "C" void* Westlake_NumberingSystem_newDefaultForQuick() {
+  Thread* self = Thread::Current();
+  if (self == nullptr) {
+    return nullptr;
+  }
+  ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
+  if (class_linker == nullptr) {
+    return nullptr;
+  }
+
+  StackHandleScope<3> hs(self);
+  Handle<mirror::Class> numbering_cls(hs.NewHandle(
+      class_linker->FindSystemClass(self, "Landroid/icu/text/NumberingSystem;")));
+  if (self->IsExceptionPending()) {
+    self->ClearException();
+  }
+  if (numbering_cls == nullptr) {
+    return nullptr;
+  }
+
+  Handle<mirror::Object> numbering(hs.NewHandle(numbering_cls->AllocObject(self)));
+  if (self->IsExceptionPending()) {
+    self->ClearException();
+  }
+  if (numbering == nullptr) {
+    return nullptr;
+  }
+
+  Handle<mirror::String> latn(hs.NewHandle(mirror::String::AllocFromModifiedUtf8(self, "latn")));
+  if (self->IsExceptionPending()) {
+    self->ClearException();
+  }
+  Handle<mirror::String> digits(hs.NewHandle(
+      mirror::String::AllocFromModifiedUtf8(self, "0123456789")));
+  if (self->IsExceptionPending()) {
+    self->ClearException();
+  }
+
+  ArtField* radix = numbering_cls->FindInstanceField("radix", "I");
+  if (radix != nullptr) {
+    radix->SetInt<false>(numbering.Get(), 10);
+  }
+  if (self->IsExceptionPending()) {
+    self->ClearException();
+  }
+
+  ArtField* algorithmic = numbering_cls->FindInstanceField("algorithmic", "Z");
+  if (algorithmic != nullptr) {
+    algorithmic->SetBoolean<false>(numbering.Get(), false);
+  }
+  if (self->IsExceptionPending()) {
+    self->ClearException();
+  }
+
+  ArtField* name = numbering_cls->FindInstanceField("name", "Ljava/lang/String;");
+  if (name != nullptr && latn != nullptr) {
+    name->SetObject<false>(numbering.Get(), latn.Get());
+  }
+  if (self->IsExceptionPending()) {
+    self->ClearException();
+  }
+
+  ArtField* desc = numbering_cls->FindInstanceField("desc", "Ljava/lang/String;");
+  if (desc != nullptr && digits != nullptr) {
+    desc->SetObject<false>(numbering.Get(), digits.Get());
+  }
+  if (self->IsExceptionPending()) {
+    self->ClearException();
+  }
+
+  fprintf(stderr, "[PFCUT-ICU] return default NumberingSystem object=%p\n", numbering.Get());
+  fflush(stderr);
+  return numbering.Get();
+}
+
+struct WestlakeRegexPatternState {
+  std::string pattern;
+  jint flags;
+};
+
+struct WestlakeRegexMatcherState {
+  WestlakeRegexPatternState* pattern;
+  std::string input;
+  jint last_end;
+};
+
+static void Westlake_IcuRegexPatternFinalizer(void* ptr) {
+  delete reinterpret_cast<WestlakeRegexPatternState*>(ptr);
+}
+
+static void Westlake_IcuRegexMatcherFinalizer(void* ptr) {
+  delete reinterpret_cast<WestlakeRegexMatcherState*>(ptr);
+}
+
+static std::string Westlake_JStringToUtf8(JNIEnv* env, jstring value) {
+  if (env == nullptr || value == nullptr) {
+    return std::string();
+  }
+  const char* chars = env->GetStringUTFChars(value, nullptr);
+  if (chars == nullptr) {
+    return std::string();
+  }
+  std::string result(chars);
+  env->ReleaseStringUTFChars(value, chars);
+  return result;
+}
+
+static bool WestlakeRegexFind(WestlakeRegexMatcherState* state,
+                              jint start,
+                              jint* match_start,
+                              jint* match_end) {
+  if (state == nullptr || state->pattern == nullptr || match_start == nullptr ||
+      match_end == nullptr) {
+    return false;
+  }
+  const std::string& pattern = state->pattern->pattern;
+  const std::string& input = state->input;
+  if (start < 0) {
+    start = 0;
+  }
+  if (static_cast<size_t>(start) > input.size()) {
+    return false;
+  }
+  if (pattern == "^und(?=$|[_-])") {
+    const bool matched =
+        start == 0 &&
+        input.size() >= 3 &&
+        strncasecmp(input.c_str(), "und", 3) == 0 &&
+        (input.size() == 3 || input[3] == '_' || input[3] == '-');
+    if (!matched) {
+      return false;
+    }
+    *match_start = 0;
+    *match_end = 3;
+    return true;
+  }
+  std::string needle = pattern;
+  if (!needle.empty() && needle[0] == '^') {
+    needle.erase(0, 1);
+    size_t dollar = needle.find('$');
+    if (dollar != std::string::npos) {
+      needle.erase(dollar);
+    }
+    if (input.compare(static_cast<size_t>(start), needle.size(), needle) != 0) {
+      return false;
+    }
+    *match_start = start;
+    *match_end = start + static_cast<jint>(needle.size());
+    return true;
+  }
+  size_t pos = input.find(needle, static_cast<size_t>(start));
+  if (pos == std::string::npos) {
+    return false;
+  }
+  *match_start = static_cast<jint>(pos);
+  *match_end = static_cast<jint>(pos + needle.size());
+  return true;
+}
+
+static void WestlakeRegexSetOffsets(JNIEnv* env, jintArray offsets, jint start, jint end) {
+  if (env == nullptr || offsets == nullptr) {
+    return;
+  }
+  jint values[2] = {start, end};
+  env->SetIntArrayRegion(offsets, 0, 2, values);
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+  }
+}
+
+extern "C" jlong Westlake_PatternNative_getNativeFinalizer(JNIEnv*, jclass) {
+  return reinterpret_cast<jlong>(&Westlake_IcuRegexPatternFinalizer);
+}
+
+extern "C" jlong Westlake_PatternNative_compileImpl(JNIEnv* env,
+                                                     jclass,
+                                                     jstring pattern,
+                                                     jint flags) {
+  WestlakeRegexPatternState* state = new WestlakeRegexPatternState();
+  state->pattern = Westlake_JStringToUtf8(env, pattern);
+  state->flags = flags;
+  fprintf(stderr,
+          "[PFCUT-ICU-REGEX] PatternNative.compileImpl pattern='%s' flags=%d state=%p\n",
+          state->pattern.c_str(),
+          flags,
+          state);
+  fflush(stderr);
+  return reinterpret_cast<jlong>(state);
+}
+
+extern "C" jlong Westlake_PatternNative_openMatcherImpl(JNIEnv*,
+                                                         jclass,
+                                                         jlong pattern_addr) {
+  WestlakeRegexMatcherState* state = new WestlakeRegexMatcherState();
+  state->pattern = reinterpret_cast<WestlakeRegexPatternState*>(pattern_addr);
+  state->last_end = 0;
+  fprintf(stderr,
+          "[PFCUT-ICU-REGEX] PatternNative.openMatcherImpl pattern=%p matcher=%p\n",
+          state->pattern,
+          state);
+  fflush(stderr);
+  return reinterpret_cast<jlong>(state);
+}
+
+extern "C" jint Westlake_PatternNative_getMatchedGroupIndexImpl(JNIEnv*,
+                                                                 jclass,
+                                                                 jlong,
+                                                                 jstring) {
+  return -1;
+}
+
+extern "C" jlong Westlake_MatcherNative_getNativeFinalizer(JNIEnv*, jclass) {
+  return reinterpret_cast<jlong>(&Westlake_IcuRegexMatcherFinalizer);
+}
+
+extern "C" void Westlake_MatcherNative_setInputImpl(JNIEnv* env,
+                                                     jclass,
+                                                     jlong matcher_addr,
+                                                     jstring input,
+                                                     jint,
+                                                     jint) {
+  WestlakeRegexMatcherState* state = reinterpret_cast<WestlakeRegexMatcherState*>(matcher_addr);
+  if (state == nullptr) {
+    return;
+  }
+  state->input = Westlake_JStringToUtf8(env, input);
+  state->last_end = 0;
+}
+
+extern "C" jboolean Westlake_MatcherNative_findImpl(JNIEnv* env,
+                                                     jclass,
+                                                     jlong matcher_addr,
+                                                     jint start,
+                                                     jintArray offsets) {
+  WestlakeRegexMatcherState* state = reinterpret_cast<WestlakeRegexMatcherState*>(matcher_addr);
+  jint match_start = 0;
+  jint match_end = 0;
+  if (!WestlakeRegexFind(state, start, &match_start, &match_end)) {
+    return JNI_FALSE;
+  }
+  state->last_end = match_end;
+  WestlakeRegexSetOffsets(env, offsets, match_start, match_end);
+  return JNI_TRUE;
+}
+
+extern "C" jboolean Westlake_MatcherNative_findNextImpl(JNIEnv* env,
+                                                         jclass,
+                                                         jlong matcher_addr,
+                                                         jintArray offsets) {
+  WestlakeRegexMatcherState* state = reinterpret_cast<WestlakeRegexMatcherState*>(matcher_addr);
+  const jint start = state != nullptr ? state->last_end : 0;
+  return Westlake_MatcherNative_findImpl(env, nullptr, matcher_addr, start, offsets);
+}
+
+extern "C" jint Westlake_MatcherNative_groupCountImpl(JNIEnv*, jclass, jlong) {
+  return 0;
+}
+
+extern "C" jboolean Westlake_MatcherNative_lookingAtImpl(JNIEnv* env,
+                                                          jclass,
+                                                          jlong matcher_addr,
+                                                          jintArray offsets) {
+  return Westlake_MatcherNative_findImpl(env, nullptr, matcher_addr, 0, offsets);
+}
+
+extern "C" jboolean Westlake_MatcherNative_matchesImpl(JNIEnv* env,
+                                                        jclass,
+                                                        jlong matcher_addr,
+                                                        jintArray offsets) {
+  WestlakeRegexMatcherState* state = reinterpret_cast<WestlakeRegexMatcherState*>(matcher_addr);
+  jint match_start = 0;
+  jint match_end = 0;
+  if (!WestlakeRegexFind(state, 0, &match_start, &match_end) ||
+      static_cast<size_t>(match_end) != state->input.size()) {
+    return JNI_FALSE;
+  }
+  WestlakeRegexSetOffsets(env, offsets, match_start, match_end);
+  return JNI_TRUE;
+}
+
+extern "C" jboolean Westlake_MatcherNative_hitEndImpl(JNIEnv*, jclass, jlong) {
+  return JNI_FALSE;
+}
+
+extern "C" jboolean Westlake_MatcherNative_requireEndImpl(JNIEnv*, jclass, jlong) {
+  return JNI_FALSE;
+}
+
+extern "C" void Westlake_MatcherNative_useAnchoringBoundsImpl(JNIEnv*, jclass, jlong, jboolean) {}
+
+extern "C" void Westlake_MatcherNative_useTransparentBoundsImpl(JNIEnv*, jclass, jlong, jboolean) {}
 
 extern "C" jobject Westlake_HashMap_put(JNIEnv* env, jobject thiz, jobject key, jobject value) {
   struct HashMapIds {
@@ -1380,6 +2198,44 @@ bool Runtime::Start() {
   RegisterRuntimeNativeMethods(self->GetJniEnv());
   fprintf(stderr, "[RT] RegisterRuntimeNativeMethods done\n"); fflush(stderr);
 
+  auto patch_runtime_native_method =
+      [&](ArtMethod* method, const void* fn, uint32_t extra_flags, const char* label) {
+        if (method == nullptr) {
+          return;
+        }
+        method->SetAccessFlags(method->GetAccessFlags() | kAccNative | extra_flags);
+        method->SetCodeItem(nullptr, false);
+        Runtime::Current()->GetInstrumentation()->InitializeMethodsCode(
+            method, /*aot_code=*/nullptr);
+        method->SetEntryPointFromJni(fn);
+        if (label != nullptr) {
+          fprintf(stderr, "[RT] %s -> native quick=%p jni=%p\n",
+                  label,
+                  method->GetEntryPointFromQuickCompiledCode(),
+                  method->GetEntryPointFromJni());
+          fflush(stderr);
+        }
+      };
+
+  // PATCH: Route ThreadLocal.nextHashCode directly to a native counter.
+  // The dalvikvm-side ArtMethod rewrite is not surviving the full runtime start
+  // path on the accepted phone build, which sends control back into
+  // AtomicInteger/Unsafe before Application.onCreate().
+  {
+    ScopedObjectAccess soa(self);
+    ObjPtr<mirror::Class> thread_local_class =
+        class_linker_->FindSystemClass(self, "Ljava/lang/ThreadLocal;");
+    if (thread_local_class != nullptr) {
+      ArtMethod* next_hash_code = thread_local_class->FindClassMethod(
+          "nextHashCode", "()I", class_linker_->GetImagePointerSize());
+      patch_runtime_native_method(next_hash_code,
+                                  reinterpret_cast<const void*>(&Westlake_ThreadLocal_nextHashCode),
+                                  kAccFastNative,
+                                  "ThreadLocal.nextHashCode()");
+    }
+    if (self->IsExceptionPending()) self->ClearException();
+  }
+
   // PATCH: Replace Unsafe.objectFieldOffset(Class, String) Java method with native IMMEDIATELY
   // after native registration. Must be before ANY class init that uses ConcurrentHashMap.
   {
@@ -1392,13 +2248,46 @@ bool Runtime::Start() {
       if (java_method != nullptr && !java_method->IsNative()) {
         // Directly set native entry point (bypass RegisterNatives which checks DEX flags)
         extern jlong Unsafe_objectFieldOffsetClassString(JNIEnv*, jobject, jclass, jstring);
-        java_method->SetAccessFlags(java_method->GetAccessFlags() | kAccNative | kAccFastNative);
-        java_method->SetCodeItem(nullptr, false);
-        java_method->SetEntryPointFromJni(
-            reinterpret_cast<const void*>(&Unsafe_objectFieldOffsetClassString));
-        fprintf(stderr, "[RT] Unsafe.objectFieldOffset(Class,String) → native jni=%p\n",
-                java_method->GetEntryPointFromJni());
-        fflush(stderr);
+        patch_runtime_native_method(java_method,
+                                    reinterpret_cast<const void*>(&Unsafe_objectFieldOffsetClassString),
+                                    kAccFastNative,
+                                    "Unsafe.objectFieldOffset(Class,String)");
+      }
+    }
+    if (self->IsExceptionPending()) self->ClearException();
+  }
+
+  // PATCH: Android 11 libcore exposes sun.misc.Unsafe array-offset wrappers.
+  // Route them directly to ART-side natives so the wrapper bytecode does not
+  // cross stale libcore/ART bootstrap paths.
+  {
+    ScopedObjectAccess soa(self);
+    ObjPtr<mirror::Class> unsafe_class = class_linker_->FindSystemClass(self, "Lsun/misc/Unsafe;");
+    if (unsafe_class != nullptr) {
+      struct NativePatch {
+        const char* name;
+        const char* sig;
+        const void* fn;
+        const char* label;
+      };
+      extern jint Unsafe_arrayBaseOffset(JNIEnv*, jobject, jclass);
+      extern jint Unsafe_arrayIndexScale(JNIEnv*, jobject, jclass);
+      extern jlong Unsafe_objectFieldOffset(JNIEnv*, jobject, jobject);
+      const NativePatch methods[] = {
+          {"arrayBaseOffset", "(Ljava/lang/Class;)I",
+           reinterpret_cast<const void*>(&Unsafe_arrayBaseOffset),
+           "sun.misc.Unsafe.arrayBaseOffset(Class)"},
+          {"arrayIndexScale", "(Ljava/lang/Class;)I",
+           reinterpret_cast<const void*>(&Unsafe_arrayIndexScale),
+           "sun.misc.Unsafe.arrayIndexScale(Class)"},
+          {"objectFieldOffset", "(Ljava/lang/reflect/Field;)J",
+           reinterpret_cast<const void*>(&Unsafe_objectFieldOffset),
+           "sun.misc.Unsafe.objectFieldOffset(Field)"},
+      };
+      for (const NativePatch& patch : methods) {
+        ArtMethod* method = unsafe_class->FindClassMethod(
+            patch.name, patch.sig, class_linker_->GetImagePointerSize());
+        patch_runtime_native_method(method, patch.fn, kAccFastNative, patch.label);
       }
     }
     if (self->IsExceptionPending()) self->ClearException();
@@ -1427,39 +2316,35 @@ bool Runtime::Start() {
            reinterpret_cast<const void*>(&Westlake_UnixFileSystem_getLastModifiedTime)},
           {"getLength", "(Ljava/io/File;)J",
            reinterpret_cast<const void*>(&Westlake_UnixFileSystem_getLength)},
+          {"list", "(Ljava/io/File;)[Ljava/lang/String;",
+           reinterpret_cast<const void*>(&Westlake_UnixFileSystem_list)},
       };
       for (const NativePatch& patch : methods) {
         ArtMethod* method = unixfs_class->FindClassMethod(
             patch.name, patch.sig, class_linker_->GetImagePointerSize());
-        if (method != nullptr) {
-          method->SetAccessFlags(method->GetAccessFlags() | kAccNative);
-          method->SetCodeItem(nullptr, false);
-          method->SetEntryPointFromJni(patch.fn);
-          fprintf(stderr, "[RT] UnixFileSystem.%s%s -> native jni=%p\n",
-                  patch.name, patch.sig, method->GetEntryPointFromJni());
-        }
+        std::string label = std::string("UnixFileSystem.") + patch.name + patch.sig;
+        patch_runtime_native_method(method, patch.fn, /*extra_flags=*/0u, label.c_str());
       }
     }
     if (self->IsExceptionPending()) self->ClearException();
   }
 
   // PATCH: Route HashMap.put directly to JNI.
-  // The standalone interpreter still corrupts the receiver on some core
-  // HashMap puts during Locale/VMRuntime/Charset initialization.
+  // This is now opt-in only. The controlled canary proves the native rewrite
+  // can itself become the first crash owner on the standalone path.
   {
     ScopedObjectAccess soa(self);
-    ObjPtr<mirror::Class> hash_map_class = class_linker_->FindSystemClass(self, "Ljava/util/HashMap;");
-    if (hash_map_class != nullptr) {
+    const bool enable_hashmap_put_native = getenv("WESTLAKE_ENABLE_HASHMAP_PUT_NATIVE") != nullptr;
+    ObjPtr<mirror::Class> hash_map_class =
+        class_linker_->FindSystemClass(self, "Ljava/util/HashMap;");
+    if (enable_hashmap_put_native && hash_map_class != nullptr) {
       ArtMethod* put_method = hash_map_class->FindClassMethod(
           "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
           class_linker_->GetImagePointerSize());
-      if (put_method != nullptr) {
-        put_method->SetAccessFlags(put_method->GetAccessFlags() | kAccNative);
-        put_method->SetCodeItem(nullptr, false);
-        put_method->SetEntryPointFromJni(reinterpret_cast<const void*>(&Westlake_HashMap_put));
-        fprintf(stderr, "[RT] HashMap.put(Ljava/lang/Object;Ljava/lang/Object;) -> native\n");
-        fflush(stderr);
-      }
+      patch_runtime_native_method(put_method,
+                                  reinterpret_cast<const void*>(&Westlake_HashMap_put),
+                                  /*extra_flags=*/0u,
+                                  "HashMap.put(Ljava/lang/Object;Ljava/lang/Object;)");
       ObjPtr<mirror::PointerArray> vtable = hash_map_class->GetVTableDuringLinking();
       if (vtable != nullptr) {
         const int count = vtable->GetLength();
@@ -1468,18 +2353,23 @@ bool Runtime::Start() {
           if (vm != nullptr &&
               strcmp(vm->GetName(), "put") == 0 &&
               vm->GetSignature().ToString() == "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;") {
-            vm->SetAccessFlags(vm->GetAccessFlags() | kAccNative);
-            vm->SetCodeItem(nullptr, false);
-            vm->SetEntryPointFromJni(reinterpret_cast<const void*>(&Westlake_HashMap_put));
+            patch_runtime_native_method(vm,
+                                        reinterpret_cast<const void*>(&Westlake_HashMap_put),
+                                        /*extra_flags=*/0u,
+                                        /*label=*/nullptr);
           }
         }
       }
+    } else if (!enable_hashmap_put_native) {
+      fprintf(stderr, "[RT] HashMap.put native patch disabled\n");
+      fflush(stderr);
     }
     if (self->IsExceptionPending()) self->ClearException();
   }
 
-  // PATCH: Route early libcore.io.Linux identity/sysconf wrappers directly to native.
-  // System.<clinit> can hit these before dalvikvm.cc gets a chance to register them.
+  // PATCH: Route early libcore.io.Linux wrappers directly to native.
+  // System.<clinit> and stock app startup can hit these before launcher-side
+  // RegisterNatives has a stable path, so patch the boot ArtMethods here.
   {
     ScopedObjectAccess soa(self);
     ObjPtr<mirror::Class> linux_class = class_linker_->FindSystemClass(self, "Llibcore/io/Linux;");
@@ -1493,32 +2383,72 @@ bool Runtime::Start() {
       static auto sysconf_fn = +[](JNIEnv*, jobject, jint name) -> jlong {
         errno = 0;
         long value = sysconf(name);
+        if ((name == _SC_NPROCESSORS_CONF || name == _SC_NPROCESSORS_ONLN) &&
+            (value <= 0 || value > 64)) {
+          value = 4;
+        }
         return value < 0 ? static_cast<jlong>(-1) : static_cast<jlong>(value);
       };
       struct LinuxPatch {
         const char* name;
         const char* sig;
         const void* fn;
+        const char* label;
       };
       const LinuxPatch methods[] = {
-          {"nativeGetuid", "()I", reinterpret_cast<const void*>(+getuid_fn)},
-          {"nativeGeteuid", "()I", reinterpret_cast<const void*>(+geteuid_fn)},
-          {"nativeGetgid", "()I", reinterpret_cast<const void*>(+getgid_fn)},
-          {"nativeGetegid", "()I", reinterpret_cast<const void*>(+getegid_fn)},
-          {"nativeGetpid", "()I", reinterpret_cast<const void*>(+getpid_fn)},
-          {"nativeGetppid", "()I", reinterpret_cast<const void*>(+getppid_fn)},
-          {"nativeSysconf", "(I)J", reinterpret_cast<const void*>(+sysconf_fn)},
+          {"nativeGetuid", "()I", reinterpret_cast<const void*>(+getuid_fn), nullptr},
+          {"nativeGeteuid", "()I", reinterpret_cast<const void*>(+geteuid_fn), nullptr},
+          {"nativeGetgid", "()I", reinterpret_cast<const void*>(+getgid_fn), nullptr},
+          {"nativeGetegid", "()I", reinterpret_cast<const void*>(+getegid_fn), nullptr},
+          {"nativeGetpid", "()I", reinterpret_cast<const void*>(+getpid_fn), nullptr},
+          {"nativeGetppid", "()I", reinterpret_cast<const void*>(+getppid_fn), nullptr},
+          {"getuid", "()I", reinterpret_cast<const void*>(+getuid_fn), nullptr},
+          {"geteuid", "()I", reinterpret_cast<const void*>(+geteuid_fn), nullptr},
+          {"getgid", "()I", reinterpret_cast<const void*>(+getgid_fn), nullptr},
+          {"getegid", "()I", reinterpret_cast<const void*>(+getegid_fn), nullptr},
+          {"getpid", "()I", reinterpret_cast<const void*>(+getpid_fn), nullptr},
+          {"getppid", "()I", reinterpret_cast<const void*>(+getppid_fn), nullptr},
+          {"sysconf", "(I)J", reinterpret_cast<const void*>(+sysconf_fn), nullptr},
+          {"nativeSysconf", "(I)J", reinterpret_cast<const void*>(+sysconf_fn), nullptr},
+          {"open", "(Ljava/lang/String;II)Ljava/io/FileDescriptor;",
+              reinterpret_cast<const void*>(&Westlake_Linux_open), "Linux.open"},
+          {"close", "(Ljava/io/FileDescriptor;)V",
+              reinterpret_cast<const void*>(&Westlake_Linux_close), "Linux.close"},
+          {"readBytes", "(Ljava/io/FileDescriptor;Ljava/lang/Object;II)I",
+              reinterpret_cast<const void*>(&Westlake_Linux_readBytes), "Linux.readBytes"},
+          {"writeBytes", "(Ljava/io/FileDescriptor;Ljava/lang/Object;II)I",
+              reinterpret_cast<const void*>(&Westlake_Linux_writeBytes), "Linux.writeBytes"},
+          {"fstat", "(Ljava/io/FileDescriptor;)Landroid/system/StructStat;",
+              reinterpret_cast<const void*>(&Westlake_Linux_fstat), "Linux.fstat"},
+          {"stat", "(Ljava/lang/String;)Landroid/system/StructStat;",
+              reinterpret_cast<const void*>(&Westlake_Linux_stat), "Linux.stat"},
+          {"lstat", "(Ljava/lang/String;)Landroid/system/StructStat;",
+              reinterpret_cast<const void*>(&Westlake_Linux_lstat), "Linux.lstat"},
+          {"access", "(Ljava/lang/String;I)Z",
+              reinterpret_cast<const void*>(&Westlake_Linux_access), "Linux.access"},
+          {"getsockoptLinger",
+              "(Ljava/io/FileDescriptor;II)Landroid/system/StructLinger;",
+              reinterpret_cast<const void*>(&Westlake_Linux_getsockoptLinger),
+              "Linux.getsockoptLinger"},
       };
       for (const LinuxPatch& patch : methods) {
         ArtMethod* method = linux_class->FindClassMethod(
             patch.name, patch.sig, class_linker_->GetImagePointerSize());
-        if (method != nullptr) {
-          method->SetAccessFlags(method->GetAccessFlags() | kAccNative);
-          method->SetCodeItem(nullptr, false);
-          method->SetEntryPointFromJni(patch.fn);
+        patch_runtime_native_method(method, patch.fn, /*extra_flags=*/0u, patch.label);
+        ObjPtr<mirror::PointerArray> vtable = linux_class->GetVTableDuringLinking();
+        if (vtable != nullptr) {
+          const int count = vtable->GetLength();
+          for (int i = 0; i < count; ++i) {
+            ArtMethod* vm = vtable->GetElementPtrSize<ArtMethod*>(i, kRuntimePointerSize);
+            if (vm != nullptr &&
+                strcmp(vm->GetName(), patch.name) == 0 &&
+                vm->GetSignature().ToString() == patch.sig) {
+              patch_runtime_native_method(vm, patch.fn, /*extra_flags=*/0u, /*label=*/nullptr);
+            }
+          }
         }
       }
-      fprintf(stderr, "[RT] libcore.io.Linux identity natives patched early\n");
+      fprintf(stderr, "[RT] libcore.io.Linux natives patched early\n");
       fflush(stderr);
     }
     if (self->IsExceptionPending()) self->ClearException();
@@ -1539,11 +2469,10 @@ bool Runtime::Start() {
       }
       ArtMethod* method = klass->FindClassMethod(
           "toString", "()Ljava/lang/String;", class_linker_->GetImagePointerSize());
-      if (method != nullptr) {
-        method->SetAccessFlags(method->GetAccessFlags() | kAccNative);
-        method->SetCodeItem(nullptr, false);
-        method->SetEntryPointFromJni(reinterpret_cast<const void*>(+loader_to_string));
-      }
+      patch_runtime_native_method(method,
+                                  reinterpret_cast<const void*>(+loader_to_string),
+                                  /*extra_flags=*/0u,
+                                  /*label=*/nullptr);
       ObjPtr<mirror::PointerArray> vtable = klass->GetVTableDuringLinking();
       if (vtable != nullptr) {
         const int count = vtable->GetLength();
@@ -1552,9 +2481,10 @@ bool Runtime::Start() {
           if (vm != nullptr &&
               strcmp(vm->GetName(), "toString") == 0 &&
               vm->GetSignature().ToString() == "()Ljava/lang/String;") {
-            vm->SetAccessFlags(vm->GetAccessFlags() | kAccNative);
-            vm->SetCodeItem(nullptr, false);
-            vm->SetEntryPointFromJni(reinterpret_cast<const void*>(+loader_to_string));
+            patch_runtime_native_method(vm,
+                                        reinterpret_cast<const void*>(+loader_to_string),
+                                        /*extra_flags=*/0u,
+                                        /*label=*/nullptr);
           }
         }
       }
@@ -1562,6 +2492,138 @@ bool Runtime::Start() {
     patch_to_string("Ldalvik/system/BaseDexClassLoader;");
     patch_to_string("Ldalvik/system/PathClassLoader;");
     patch_to_string("Ldalvik/system/DexPathList;");
+    if (self->IsExceptionPending()) self->ClearException();
+  }
+
+  // PATCH: Keep default timezone lookup in-process and portable. Android's
+  // libcore implementation reads host timezone files through libcore.io.Linux;
+  // until boot quick-code deopt is complete, route the stock API to a UTC
+  // SimpleTimeZone object instead of entering the Linux.open compiled path.
+  {
+    ScopedObjectAccess soa(self);
+    ObjPtr<mirror::Class> time_zone_class =
+        class_linker_->FindSystemClass(self, "Ljava/util/TimeZone;");
+    if (time_zone_class != nullptr) {
+      const char* methods[][2] = {
+          {"getDefault", "()Ljava/util/TimeZone;"},
+          {"getDefaultRef", "()Ljava/util/TimeZone;"},
+      };
+      for (const auto& method_info : methods) {
+        ArtMethod* method = time_zone_class->FindClassMethod(
+            method_info[0], method_info[1], class_linker_->GetImagePointerSize());
+        patch_runtime_native_method(method,
+                                    reinterpret_cast<const void*>(&Westlake_TimeZone_getDefault),
+                                    /*extra_flags=*/0u,
+                                    "TimeZone.default");
+        if (method != nullptr) {
+          method->SetEntryPointFromQuickCompiledCode(GetQuickToInterpreterBridge());
+          fprintf(stderr,
+                  "[RT] TimeZone.default quick forced to interpreter bridge method=%s quick=%p jni=%p\n",
+                  method->PrettyMethod().c_str(),
+                  method->GetEntryPointFromQuickCompiledCode(),
+                  method->GetEntryPointFromJni());
+          fflush(stderr);
+        }
+      }
+      fprintf(stderr, "[RT] TimeZone default patched to UTC SimpleTimeZone\n");
+      fflush(stderr);
+    }
+    if (self->IsExceptionPending()) self->ClearException();
+  }
+
+  // PATCH: Keep Android ICU regex boot natives portable enough for locale/date
+  // startup. Stock McDonald's reaches these through Kochava -> SimpleDateFormat
+  // -> ULocale before first UI.
+  {
+    ScopedObjectAccess soa(self);
+    struct IcuRegexPatch {
+      const char* class_desc;
+      const char* name;
+      const char* sig;
+      const void* fn;
+      const char* label;
+    };
+    const IcuRegexPatch methods[] = {
+        {"Lcom/android/icu/util/regex/PatternNative;", "compileImpl",
+            "(Ljava/lang/String;I)J",
+            reinterpret_cast<const void*>(&Westlake_PatternNative_compileImpl),
+            "PatternNative.compileImpl"},
+        {"Lcom/android/icu/util/regex/PatternNative;", "getNativeFinalizer",
+            "()J",
+            reinterpret_cast<const void*>(&Westlake_PatternNative_getNativeFinalizer),
+            "PatternNative.getNativeFinalizer"},
+        {"Lcom/android/icu/util/regex/PatternNative;", "openMatcherImpl",
+            "(J)J",
+            reinterpret_cast<const void*>(&Westlake_PatternNative_openMatcherImpl),
+            "PatternNative.openMatcherImpl"},
+        {"Lcom/android/icu/util/regex/PatternNative;", "getMatchedGroupIndexImpl",
+            "(JLjava/lang/String;)I",
+            reinterpret_cast<const void*>(&Westlake_PatternNative_getMatchedGroupIndexImpl),
+            "PatternNative.getMatchedGroupIndexImpl"},
+        {"Lcom/android/icu/util/regex/MatcherNative;", "findImpl",
+            "(JI[I)Z",
+            reinterpret_cast<const void*>(&Westlake_MatcherNative_findImpl),
+            "MatcherNative.findImpl"},
+        {"Lcom/android/icu/util/regex/MatcherNative;", "findNextImpl",
+            "(J[I)Z",
+            reinterpret_cast<const void*>(&Westlake_MatcherNative_findNextImpl),
+            "MatcherNative.findNextImpl"},
+        {"Lcom/android/icu/util/regex/MatcherNative;", "getNativeFinalizer",
+            "()J",
+            reinterpret_cast<const void*>(&Westlake_MatcherNative_getNativeFinalizer),
+            "MatcherNative.getNativeFinalizer"},
+        {"Lcom/android/icu/util/regex/MatcherNative;", "groupCountImpl",
+            "(J)I",
+            reinterpret_cast<const void*>(&Westlake_MatcherNative_groupCountImpl),
+            "MatcherNative.groupCountImpl"},
+        {"Lcom/android/icu/util/regex/MatcherNative;", "hitEndImpl",
+            "(J)Z",
+            reinterpret_cast<const void*>(&Westlake_MatcherNative_hitEndImpl),
+            "MatcherNative.hitEndImpl"},
+        {"Lcom/android/icu/util/regex/MatcherNative;", "lookingAtImpl",
+            "(J[I)Z",
+            reinterpret_cast<const void*>(&Westlake_MatcherNative_lookingAtImpl),
+            "MatcherNative.lookingAtImpl"},
+        {"Lcom/android/icu/util/regex/MatcherNative;", "matchesImpl",
+            "(J[I)Z",
+            reinterpret_cast<const void*>(&Westlake_MatcherNative_matchesImpl),
+            "MatcherNative.matchesImpl"},
+        {"Lcom/android/icu/util/regex/MatcherNative;", "requireEndImpl",
+            "(J)Z",
+            reinterpret_cast<const void*>(&Westlake_MatcherNative_requireEndImpl),
+            "MatcherNative.requireEndImpl"},
+        {"Lcom/android/icu/util/regex/MatcherNative;", "setInputImpl",
+            "(JLjava/lang/String;II)V",
+            reinterpret_cast<const void*>(&Westlake_MatcherNative_setInputImpl),
+            "MatcherNative.setInputImpl"},
+        {"Lcom/android/icu/util/regex/MatcherNative;", "useAnchoringBoundsImpl",
+            "(JZ)V",
+            reinterpret_cast<const void*>(&Westlake_MatcherNative_useAnchoringBoundsImpl),
+            "MatcherNative.useAnchoringBoundsImpl"},
+        {"Lcom/android/icu/util/regex/MatcherNative;", "useTransparentBoundsImpl",
+            "(JZ)V",
+            reinterpret_cast<const void*>(&Westlake_MatcherNative_useTransparentBoundsImpl),
+            "MatcherNative.useTransparentBoundsImpl"},
+    };
+    const char* current_desc = nullptr;
+    ObjPtr<mirror::Class> current_class = nullptr;
+    for (const IcuRegexPatch& patch : methods) {
+      if (current_desc == nullptr || strcmp(current_desc, patch.class_desc) != 0) {
+        current_desc = patch.class_desc;
+        current_class = class_linker_->FindSystemClass(self, patch.class_desc);
+        if (self->IsExceptionPending()) {
+          self->ClearException();
+        }
+      }
+      if (current_class == nullptr) {
+        continue;
+      }
+      ArtMethod* method = current_class->FindClassMethod(
+          patch.name, patch.sig, class_linker_->GetImagePointerSize());
+      patch_runtime_native_method(method, patch.fn, /*extra_flags=*/0u, patch.label);
+    }
+    fprintf(stderr, "[RT] ICU regex portable native patch pass complete\n");
+    fflush(stderr);
     if (self->IsExceptionPending()) self->ClearException();
   }
 
@@ -1589,8 +2651,6 @@ bool Runtime::Start() {
       "Ljava/nio/charset/CharsetEncoder;",
       "Ljava/nio/charset/CharsetDecoder;",
       "Ljava/nio/charset/CodingErrorAction;",
-      "Ljava/lang/ThreadLocal;",
-      "Ljava/util/concurrent/atomic/AtomicInteger;",
       nullptr
     };
     for (int i = 0; io_classes[i]; i++) {
@@ -1604,6 +2664,8 @@ bool Runtime::Start() {
 
     // Set Charset.defaultCharset to UTF-8 so PrintStream can encode strings
     ObjPtr<mirror::Class> charset_class = class_linker_->FindSystemClass(self, "Ljava/nio/charset/Charset;");
+    ObjPtr<mirror::Class> standard_charsets_class =
+        class_linker_->FindSystemClass(self, "Ljava/nio/charset/StandardCharsets;");
     ObjPtr<mirror::Class> utf8_class = class_linker_->FindSystemClass(self, "Lsun/nio/cs/UTF_8;");
     if (charset_class != nullptr && utf8_class != nullptr) {
       // Create a UTF_8 Charset instance
@@ -1616,6 +2678,14 @@ bool Runtime::Start() {
           ObjPtr<mirror::String> utf8_name = mirror::String::AllocFromModifiedUtf8(self, "UTF-8");
           if (utf8_name != nullptr) {
             name_field->SetObject<false>(utf8_obj, utf8_name);
+          }
+        }
+        if (standard_charsets_class != nullptr) {
+          ArtField* utf8_field = standard_charsets_class->FindDeclaredStaticField(
+              "UTF_8", "Ljava/nio/charset/Charset;");
+          if (utf8_field != nullptr) {
+            utf8_field->SetObject<false>(standard_charsets_class, utf8_obj);
+            fprintf(stderr, "[RT] Set StandardCharsets.UTF_8\n"); fflush(stderr);
           }
         }
         // Set Charset.defaultCharset static field
@@ -1673,16 +2743,106 @@ bool Runtime::Start() {
           class_linker_->GetImagePointerSize());
       if (locale_method != nullptr && !locale_method->IsNative()) {
         // Make it native no-op
-        locale_method->SetAccessFlags(locale_method->GetAccessFlags() | kAccNative);
-        locale_method->SetCodeItem(nullptr, false);
         // Set JNI entry to a simple void function that does nothing
         // We can use any void(*)(JNIEnv*, jclass) function — use System.log's stub
         // or just set it to a known no-op. The simplest: just use the dlsym lookup stub
         // which will find nothing and return (for void methods, returning is a no-op).
         // Actually, let's use a real no-op:
         static auto noop_fn = +[](JNIEnv*, jclass) -> void {};
-        locale_method->SetEntryPointFromJni(reinterpret_cast<const void*>(noop_fn));
-        fprintf(stderr, "[RT] System.addLegacyLocaleSystemProperties → native no-op\n");
+        patch_runtime_native_method(locale_method,
+                                    reinterpret_cast<const void*>(noop_fn),
+                                    /*extra_flags=*/0u,
+                                    "System.addLegacyLocaleSystemProperties");
+      }
+    }
+    if (self->IsExceptionPending()) self->ClearException();
+  }
+
+  // PATCH: Early-noop Throwable.printStackTrace() before guest Java bootstrap.
+  // The standalone guest still hits fragile PrintStream internals while reporting
+  // exceptions, which hides the real failure behind reporter crashes.
+  {
+    ScopedObjectAccess soa(self);
+    ObjPtr<mirror::Class> throwable_class =
+        class_linker_->FindSystemClass(self, "Ljava/lang/Throwable;");
+    if (throwable_class != nullptr) {
+      ArtMethod* print_method = throwable_class->FindClassMethod(
+          "printStackTrace", "()V", class_linker_->GetImagePointerSize());
+      if (print_method != nullptr && !print_method->IsNative()) {
+        static auto log_throwable = +[](JNIEnv* env, jobject thiz) -> void {
+          if (thiz == nullptr) {
+            fprintf(stderr, "[RT] Throwable.printStackTrace(null)\n");
+            fflush(stderr);
+            return;
+          }
+          jclass throwable_cls = env->FindClass("java/lang/Throwable");
+          if (env->ExceptionCheck()) env->ExceptionClear();
+          jclass class_cls = env->FindClass("java/lang/Class");
+          if (env->ExceptionCheck()) env->ExceptionClear();
+          jmethodID get_name = class_cls != nullptr
+              ? env->GetMethodID(class_cls, "getNameNative", "()Ljava/lang/String;")
+              : nullptr;
+          if (env->ExceptionCheck()) { env->ExceptionClear(); get_name = nullptr; }
+          jfieldID msg_field = throwable_cls != nullptr
+              ? env->GetFieldID(throwable_cls, "detailMessage", "Ljava/lang/String;")
+              : nullptr;
+          if (env->ExceptionCheck()) { env->ExceptionClear(); msg_field = nullptr; }
+          jclass exc_cls = env->GetObjectClass(thiz);
+          if (env->ExceptionCheck()) env->ExceptionClear();
+          jstring name_j = (get_name != nullptr && exc_cls != nullptr)
+              ? reinterpret_cast<jstring>(env->CallObjectMethod(exc_cls, get_name))
+              : nullptr;
+          if (env->ExceptionCheck()) { env->ExceptionClear(); name_j = nullptr; }
+          const char* name = name_j != nullptr ? env->GetStringUTFChars(name_j, nullptr) : nullptr;
+          jstring msg_j = msg_field != nullptr
+              ? reinterpret_cast<jstring>(env->GetObjectField(thiz, msg_field))
+              : nullptr;
+          if (env->ExceptionCheck()) { env->ExceptionClear(); msg_j = nullptr; }
+          const char* msg = msg_j != nullptr ? env->GetStringUTFChars(msg_j, nullptr) : nullptr;
+          fprintf(stderr, "[RT] Throwable.printStackTrace -> %s: %s\n",
+                  name != nullptr ? name : "<unknown>",
+                  msg != nullptr ? msg : "<no message>");
+          fflush(stderr);
+          if (msg_j != nullptr && msg != nullptr) {
+            env->ReleaseStringUTFChars(msg_j, msg);
+          }
+          if (name_j != nullptr && name != nullptr) {
+            env->ReleaseStringUTFChars(name_j, name);
+          }
+        };
+        patch_runtime_native_method(print_method,
+                                    reinterpret_cast<const void*>(log_throwable),
+                                    /*extra_flags=*/0u,
+                                    "Throwable.printStackTrace()");
+      }
+    }
+    if (self->IsExceptionPending()) self->ClearException();
+  }
+
+  // PATCH: Keep System.<clinit> off the fragile timezone ICU path. On the standalone
+  // guest path, TimeZoneDataFiles.generateIcuDataPath() can NPE inside String.join()
+  // before the app gets to real startup. This rewrite is now opt-in because it can
+  // also become the first crashing native handoff on the control canary path.
+  {
+    ScopedObjectAccess soa(self);
+    ObjPtr<mirror::Class> tz_class =
+        class_linker_->FindSystemClass(self, "Llibcore/timezone/TimeZoneDataFiles;");
+    if (tz_class != nullptr) {
+      ArtMethod* icu_path_method = tz_class->FindClassMethod(
+          "generateIcuDataPath", "()Ljava/lang/String;",
+          class_linker_->GetImagePointerSize());
+      if (icu_path_method != nullptr &&
+          !icu_path_method->IsNative() &&
+          getenv("WESTLAKE_ENABLE_ICU_DATA_PATH_NATIVE") != nullptr) {
+        static auto empty_icu_path = +[](JNIEnv* env, jclass) -> jstring {
+          return env->NewStringUTF("");
+        };
+        patch_runtime_native_method(icu_path_method,
+                                    reinterpret_cast<const void*>(empty_icu_path),
+                                    /*extra_flags=*/0u,
+                                    "TimeZoneDataFiles.generateIcuDataPath");
+      } else if (icu_path_method != nullptr) {
+        fprintf(stderr, "[RT] TimeZoneDataFiles.generateIcuDataPath native patch disabled\n");
         fflush(stderr);
       }
     }
@@ -2015,18 +3175,28 @@ bool Runtime::Start() {
   fprintf(stderr, "[RT] kStart phase done\n"); fflush(stderr);
 
   if (!standalone_class_path.empty()) {
+    fprintf(stderr, "[RT] Creating standalone app PathClassLoader for %zu dex files\n",
+            standalone_class_path.size());
+    fflush(stderr);
     jobject app_class_loader = class_linker_->CreatePathClassLoader(self, standalone_class_path);
+    fprintf(stderr, "[RT] CreatePathClassLoader returned %p exception=%d\n",
+            app_class_loader, self->IsExceptionPending());
+    fflush(stderr);
     if (app_class_loader != nullptr) {
-      system_class_loader_ = app_class_loader;
       {
         ScopedObjectAccess soa(self);
         ObjPtr<mirror::ClassLoader> loader = soa.Decode<mirror::ClassLoader>(app_class_loader);
+        system_class_loader_ = soa.Vm()->AddGlobalRef(self, loader);
+        fprintf(stderr, "[RT] Decoded standalone loader=%p peer=%p\n",
+                loader.Ptr(), soa.Self()->GetPeer());
+        fflush(stderr);
         ObjPtr<mirror::Class> thread_class = WellKnownClasses::java_lang_Thread.Get();
         ArtField* context_class_loader = thread_class->FindDeclaredInstanceField(
             "contextClassLoader",
             "Ljava/lang/ClassLoader;");
         CHECK(context_class_loader != nullptr);
         context_class_loader->SetObject<false>(soa.Self()->GetPeer(), loader);
+        fprintf(stderr, "[RT] Installed standalone contextClassLoader\n"); fflush(stderr);
       }
       fprintf(stderr, "[RT] Installed standalone app PathClassLoader (%zu dex files)\n",
               standalone_class_path.size());
@@ -2764,6 +3934,15 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
     // null and we don't create the jit.
     jit_options_->SetUseJitCompilation(false);
     jit_options_->SetSaveProfilingInfo(false);
+  } else {
+    // Westlake's portable runtime target is interpreter-first and must not depend
+    // on Android JIT code-cache behavior. Keep all app/framework Java dispatch on
+    // interpreter/GenericJNI bridges while the standalone entrypoint model is being
+    // made OHOS-safe.
+    jit_options_->SetUseJitCompilation(false);
+    jit_options_->SetSaveProfilingInfo(false);
+    fprintf(stderr, "[PFCUT] Standalone runtime forcing JIT/profiling off\n");
+    fflush(stderr);
   }
 
   // Use MemMap arena pool for jit, malloc otherwise. Malloc arenas are faster to allocate but
@@ -3155,33 +4334,6 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
     dlopen(plugin_name, RTLD_NOW | RTLD_LOCAL);
   }
 
-  // DEBUG: Dump Thread entry points at OAT trampoline offsets
-  {
-    auto* self = Thread::Current();
-    if (self) {
-      uint8_t* base = reinterpret_cast<uint8_t*>(self);
-      fprintf(stderr, "DEBUG: Thread self=%p\n", (void*)self);
-      // OAT trampoline offsets (decoded from boot.oat .text section):
-      int offsets[] = {0x190, 0x198, 0x330, 0x490, 0x498, 0x4A0};
-      const char* names[] = {"jni_dlsym", "?", "generic_jni", "resolution", "imt_conflict", "interp_bridge"};
-      for (int i = 0; i < 6; i++) {
-        void* val = *reinterpret_cast<void**>(base + offsets[i]);
-        fprintf(stderr, "DEBUG: Thread+0x%03x (%s) = %p%s\n",
-                offsets[i], names[i], val,
-                val == reinterpret_cast<void*>(0xfffffffffffffb17ULL) ? " *** STALE ***" : "");
-      }
-      // Also scan full range
-      int suspicious = 0;
-      for (int off = 0; off <= 0x800; off += 8) {
-        void* val = *reinterpret_cast<void**>(base + off);
-        if (reinterpret_cast<uintptr_t>(val) == 0xfffffffffffffb17ULL) {
-          fprintf(stderr, "DEBUG: Thread+0x%x = %p  *** EXACT MATCH ***\n", off, val);
-          suspicious++;
-        }
-      }
-      fprintf(stderr, "DEBUG: Found %d suspicious values in Thread\n", suspicious);
-    }
-  }
   VLOG(startup) << "Runtime::Init exiting";
 
   return true;
@@ -3399,6 +4551,7 @@ void Runtime::RegisterRuntimeNativeMethods(JNIEnv* env) {
   TRY_REGISTER(register_dalvik_system_VMStack);
   TRY_REGISTER(register_dalvik_system_ZygoteHooks);
   TRY_REGISTER(register_java_lang_Class);
+  TRY_REGISTER(register_java_lang_Character);
   TRY_REGISTER(register_java_lang_Object);
   TRY_REGISTER(register_java_lang_invoke_MethodHandle);
   TRY_REGISTER(register_java_lang_invoke_MethodHandleImpl);

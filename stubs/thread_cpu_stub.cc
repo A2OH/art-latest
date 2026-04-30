@@ -7,6 +7,8 @@ namespace art {
 class Thread;
 }
 extern "C" {
+char _DYNAMIC[1] = {};
+
 // art::Thread::InitCpu()
 void __attribute__((weak)) _ZN3art6Thread7InitCpuEv(void* self) {}
 // art::Thread::CleanupCpu()
@@ -59,6 +61,16 @@ extern "C" ssize_t _ZN7android4base24SendFileDescriptorVectorENS0_11borrowed_fdE
 }
 
 extern "C" ssize_t _ZN7android4base27ReceiveFileDescriptorVectorENS0_11borrowed_fdEPvmmPNSt6__ndk16vectorINS0_14unique_fd_implINS0_13DefaultCloserEEENS3_9allocatorIS7_EEEE(
+    void*, void*, unsigned long, unsigned long, void*) {
+  return -1;
+}
+
+extern "C" ssize_t _ZN7android4base24SendFileDescriptorVectorENS0_11borrowed_fdEPKvmRKNSt3__h6vectorIiNS4_9allocatorIiEEEE(
+    void*, const void*, unsigned long, const void*) {
+  return -1;
+}
+
+extern "C" ssize_t _ZN7android4base27ReceiveFileDescriptorVectorENS0_11borrowed_fdEPvmmPNSt3__h6vectorINS0_14unique_fd_implINS0_13DefaultCloserEEENS3_9allocatorIS7_EEEE(
     void*, void*, unsigned long, unsigned long, void*) {
   return -1;
 }
