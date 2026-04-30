@@ -1,12 +1,16 @@
+#include <cstddef>
+#include <cstdint>
+#include <sys/types.h>
+
 // Minimal stubs - no ART headers needed
 namespace art {
 class Thread;
 }
 extern "C" {
 // art::Thread::InitCpu()
-void _ZN3art6Thread7InitCpuEv(void* self) {}
+void __attribute__((weak)) _ZN3art6Thread7InitCpuEv(void* self) {}
 // art::Thread::CleanupCpu()
-void _ZN3art6Thread10CleanupCpuEv(void* self) {}
+void __attribute__((weak)) _ZN3art6Thread10CleanupCpuEv(void* self) {}
 // art::ArtMethod::IsProxyMethod()
 bool _ZN3art9ArtMethod13IsProxyMethodEv(void* self) { return false; }
 // art::ArtMethod::GetShorty()
@@ -17,6 +21,9 @@ int _ZNK3art9ExecUtils4ExecERKNSt6__ndk16vectorINS1_12basic_stringIcNS1_11char_t
 int artCriticalNativeOutArgsSize(void* method) { return 0; }
 // create_disassembler
 void* create_disassembler(int isa, void* output) { return 0; }
+// libwebp is not linked in the current portable static runtime. Returning
+// null lets the Java image path fall back without leaving a strong symbol.
+uint8_t* WebPDecodeRGBA(const uint8_t* data, size_t data_size, int* w, int* h) { return nullptr; }
 }
 
 // android::base stubs
@@ -45,6 +52,16 @@ namespace android { namespace base {
 int SendFileDescriptorVector(int fd, const void* data, unsigned long len, const void* fds) { return -1; }
 int ReceiveFileDescriptorVector(int fd, void* data, unsigned long len, unsigned long maxfds, void* out) { return -1; }
 }}
+
+extern "C" ssize_t _ZN7android4base24SendFileDescriptorVectorENS0_11borrowed_fdEPKvmRKNSt6__ndk16vectorIiNS4_9allocatorIiEEEE(
+    void*, const void*, unsigned long, const void*) {
+  return -1;
+}
+
+extern "C" ssize_t _ZN7android4base27ReceiveFileDescriptorVectorENS0_11borrowed_fdEPvmmPNSt6__ndk16vectorINS0_14unique_fd_implINS0_13DefaultCloserEEENS3_9allocatorIS7_EEEE(
+    void*, void*, unsigned long, unsigned long, void*) {
+  return -1;
+}
 
 // Log error write
 extern "C" int __android_log_error_write(int tag, const char* subTag, int uid, const char* data, int dataLen) { return 0; }

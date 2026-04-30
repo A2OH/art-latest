@@ -204,8 +204,6 @@ RUNTIME_EXCLUDE = %backtrace_helper.cc \
   %arch/arm/context_arm.cc \
   %arch/arm/fault_handler_arm.cc \
   %arch/arm/quick_entrypoints_cc_arm.cc \
-  %arch/arm64/thread_arm64.cc \
-  %arch/arm64/entrypoints_init_arm64.cc \
   %arch/arm64/fault_handler_arm64.cc \
   %arch/x86/thread_x86.cc \
   %arch/x86/entrypoints_init_x86.cc \
@@ -227,6 +225,7 @@ RUNTIME_EXCLUDE = %backtrace_helper.cc \
   %runtime/class_linker.cc \
   %runtime/thread.cc \
   %runtime/runtime.cc \
+  %runtime/common_throws.cc \
   %interpreter/unstarted_runtime.cc \
   %interpreter/interpreter.cc \
   %interpreter/interpreter_common.cc \
@@ -234,6 +233,7 @@ RUNTIME_EXCLUDE = %backtrace_helper.cc \
   %mirror/class.cc \
   %oat/stack_map.cc \
   %oat/image.cc \
+  %runtime/var_handles.cc \
   %runtime/hidden_api.cc \
   %runtime/instrumentation.cc \
   %quick/quick_throw_entrypoints.cc
@@ -314,6 +314,14 @@ $(HIDDENAPI_PATCH_OBJ): $(HIDDENAPI_PATCH_SRC)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@ 2>&1 && echo "OK: hidden_api.cc (patched)" || { echo "FAIL: hidden_api.cc (patched)"; rm -f $@; }
 RUNTIME_OBJS += $(HIDDENAPI_PATCH_OBJ)
+
+# Patched var_handles.cc (zero-mask FieldVarHandle access-mode support)
+VARHANDLES_PATCH_SRC = patches/runtime/var_handles.cc
+VARHANDLES_PATCH_OBJ = $(BUILDDIR)/runtime/var_handles.o
+$(VARHANDLES_PATCH_OBJ): $(VARHANDLES_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@ 2>&1 && echo "OK: var_handles.cc (patched)" || { echo "FAIL: var_handles.cc (patched)"; rm -f $@; }
+RUNTIME_OBJS += $(VARHANDLES_PATCH_OBJ)
 
 # Patched interpreter.cc (InterpreterJni shorty patterns)
 INTERP_PATCH_SRC = patches/runtime/interpreter/interpreter.cc
@@ -444,10 +452,9 @@ SVE_STUB_OBJ = $(BUILDDIR)/stubs/code_generator_vector_arm64_sve_stub.o
 METRICS_STUBS_OBJ = $(BUILDDIR)/stubs/metrics_stubs.o
 
 # ============ ARM64 assembly entry points ============
-# Strategy: Use A11's quick_entrypoints_arm64.S (compatible calling convention)
-#           + A15's jni_entrypoints_arm64.S (new JNI features)
-#           + A15's memcmp16_arm64.S
-#           + A15-new entry point stubs (method_exit_hook, nterp, etc.)
+# Strategy: Use A15 quick/memcmp entrypoints with A15 include precedence.
+#           Keep A11 JNI entrypoints because the A15 JNI assembly uses CFI
+#           macros that this portable toolchain path does not support yet.
 ASM_DIR = $(BUILDDIR)/asm_arm64
 ASM_QUICK = $(ASM_DIR)/quick_entrypoints_arm64.o
 ASM_JNI = $(ASM_DIR)/jni_entrypoints_arm64.o
@@ -455,10 +462,20 @@ ASM_MEMCMP = $(ASM_DIR)/memcmp16_arm64.o
 ASM_STUBS = $(BUILDDIR)/stubs/quick_entrypoints_stubs_arm64.o
 ASM_OBJS = $(ASM_QUICK) $(ASM_JNI) $(ASM_MEMCMP) $(ASM_STUBS)
 
-ASM_INCLUDES = -I$(STUBS) \
+ASM_QUICK_INCLUDES = -I$(STUBS) \
+  -I$(ART)/runtime \
+  -I$(ART)/runtime/arch \
+  -I$(ART)/runtime/arch/arm64 \
+  -I$(ART)/runtime/interpreter \
   -I$(ART11)/runtime \
   -I$(ART11)/runtime/arch \
-  -I$(ART)/runtime/arch/arm64 -I$(ART)/runtime \
+  -I$(ART11)/runtime/arch/arm64 \
+  -I$(ART11)/runtime/interpreter
+
+ASM_A11_INCLUDES = -I$(STUBS) \
+  -I$(ART11)/runtime \
+  -I$(ART11)/runtime/arch \
+  -I$(ART11)/runtime/arch/arm64 \
   -I$(ART11)/runtime/interpreter \
   -I$(ART)/runtime \
   -I$(ART)/runtime/arch \
@@ -515,7 +532,7 @@ link-stubs: $(STUBS_OBJ)
 sve-stub: $(SVE_STUB_OBJ)
 	@echo "=== SVE stub (ARM64) ==="
 
-metrics-stubs: $(METRICS_STUBS_OBJ) $(BUILDDIR)/stubs/thread_cpu_stub.o $(BUILDDIR)/stubs/exact_stubs.o
+metrics-stubs: $(METRICS_STUBS_OBJ) $(BUILDDIR)/stubs/thread_cpu_stub.o
 	@echo "=== metrics stubs (ARM64) ==="
 
 # ARM64 assembly entry points
@@ -523,12 +540,13 @@ asm: $(ASM_OBJS)
 	@echo "=== ARM64 assembly entry points ==="
 	@ls -lh $(ASM_OBJS) 2>/dev/null
 
-# A11 quick_entrypoints_arm64.S (compatible calling convention with A15 runtime)
+# A15 quick_entrypoints_arm64.S. The include order is important: it must pick
+# A15 arch/quick_alloc_entrypoints.S, not the A11 fallback.
 $(ASM_QUICK): $(ART)/runtime/arch/arm64/quick_entrypoints_arm64.S
 	@mkdir -p $(ASM_DIR)
 	@$(CC) $(TARGET_FLAGS) \
 	  -c -x assembler-with-cpp \
-	  $(ASM_INCLUDES) \
+	  $(ASM_QUICK_INCLUDES) \
 	  $< -o $@ 2>&1 && echo "OK: quick_entrypoints_arm64.S (A15)" || { echo "FAIL: quick_entrypoints_arm64.S"; rm -f $@; }
 
 # A11 jni_entrypoints_arm64.S (A15 version uses CFI macros not supported by OHOS clang)
@@ -536,7 +554,7 @@ $(ASM_JNI): $(ART11)/runtime/arch/arm64/jni_entrypoints_arm64.S
 	@mkdir -p $(ASM_DIR)
 	@$(CC) $(TARGET_FLAGS) \
 	  -c -x assembler-with-cpp \
-	  $(ASM_INCLUDES) \
+	  $(ASM_A11_INCLUDES) \
 	  $< -o $@ 2>&1 && echo "OK: jni_entrypoints_arm64.S (A11)" || { echo "FAIL: jni_entrypoints_arm64.S"; rm -f $@; }
 
 # memcmp16 from A15
@@ -544,7 +562,7 @@ $(ASM_MEMCMP): $(ART)/runtime/arch/arm64/memcmp16_arm64.S
 	@mkdir -p $(ASM_DIR)
 	@$(CC) $(TARGET_FLAGS) \
 	  -c -x assembler-with-cpp \
-	  $(ASM_INCLUDES) \
+	  $(ASM_QUICK_INCLUDES) \
 	  $< -o $@ 2>&1 && echo "OK: memcmp16_arm64.S" || { echo "FAIL: memcmp16_arm64.S"; rm -f $@; }
 
 # A15-new entry point stubs (method_exit_hook, nterp, etc.)
@@ -552,7 +570,7 @@ $(ASM_STUBS): $(STUBS)/quick_entrypoints_stubs_arm64.S
 	@mkdir -p $(dir $@)
 	@$(CC) $(TARGET_FLAGS) \
 	  -c -x assembler-with-cpp \
-	  $(ASM_INCLUDES) \
+	  $(ASM_QUICK_INCLUDES) \
 	  $< -o $@ 2>&1 && echo "OK: quick_entrypoints_stubs_arm64.S" || { echo "FAIL: quick_entrypoints_stubs_arm64.S"; rm -f $@; }
 
 # ziparchive
@@ -702,7 +720,7 @@ link-runtime: all ziparchive sigchain nativehelper dalvikvm-main fault-handler-s
 	  $(BUILDDIR)/stubs/template_instantiations.o \
 	  $(BUILDDIR)/fmtlib/format.o \
 	  $(BUILDDIR)/tinyxml2/tinyxml2.o \
-	  $(METRICS_STUBS_OBJ) $(BUILDDIR)/stubs/thread_cpu_stub.o $(BUILDDIR)/stubs/exact_stubs.o \
+	  $(METRICS_STUBS_OBJ) $(BUILDDIR)/stubs/thread_cpu_stub.o \
 	  $(BUILDDIR)/jni_stubs/icu_jni_stub.o \
 	  $(BUILDDIR)/jni_stubs/javacore_stub.o \
 	  $(BUILDDIR)/jni_stubs/openjdk_stub.o \
@@ -744,7 +762,7 @@ link-dynamic: all ziparchive sigchain nativehelper dalvikvm-main fault-handler-s
 	  $(BUILDDIR)/stubs/template_instantiations.o \
 	  $(BUILDDIR)/fmtlib/format.o \
 	  $(BUILDDIR)/tinyxml2/tinyxml2.o \
-	  $(METRICS_STUBS_OBJ) $(BUILDDIR)/stubs/thread_cpu_stub.o $(BUILDDIR)/stubs/exact_stubs.o \
+	  $(METRICS_STUBS_OBJ) $(BUILDDIR)/stubs/thread_cpu_stub.o \
 	  $(BUILDDIR)/jni_stubs/icu_jni_stub.o \
 	  $(BUILDDIR)/jni_stubs/javacore_stub.o \
 	  $(BUILDDIR)/jni_stubs/openjdk_stub.o \
@@ -793,7 +811,7 @@ link-shared: all $(RUNTIME_OBJS) $(WESTLAKE_JNI_OBJ) ziparchive sigchain nativeh
 	  $(BUILDDIR)/stubs/template_instantiations.o \
 	  $(BUILDDIR)/fmtlib/format.o \
 	  $(BUILDDIR)/tinyxml2/tinyxml2.o \
-	  $(METRICS_STUBS_OBJ) $(BUILDDIR)/stubs/thread_cpu_stub.o $(BUILDDIR)/stubs/exact_stubs.o \
+	  $(METRICS_STUBS_OBJ) $(BUILDDIR)/stubs/thread_cpu_stub.o \
 	  $(BUILDDIR)/jni_stubs/icu_jni_stub.o \
 	  $(BUILDDIR)/jni_stubs/javacore_stub.o \
 	  $(BUILDDIR)/jni_stubs/openjdk_stub.o \
@@ -846,9 +864,13 @@ $(SVE_STUB_OBJ): $(STUBS)/code_generator_vector_arm64_sve_stub.cc
 	@$(CXX) $(CXXFLAGS) -I$(ART)/compiler/optimizing -c $< -o $@ 2>&1 && echo "OK: SVE stub" || { echo "FAIL: SVE stub"; rm -f $@; }
 
 # Metrics stubs object
-$(METRICS_STUBS_OBJ) $(BUILDDIR)/stubs/thread_cpu_stub.o $(BUILDDIR)/stubs/exact_stubs.o: $(STUBS)/metrics_stubs.cc
+$(METRICS_STUBS_OBJ): $(STUBS)/metrics_stubs.cc
 	@mkdir -p $(dir $@)
 	@$(CXX) $(CXXFLAGS) -c $< -o $@ 2>&1 && echo "OK: metrics_stubs.cc" || { echo "FAIL: metrics_stubs.cc"; rm -f $@; }
+
+$(BUILDDIR)/stubs/thread_cpu_stub.o: $(STUBS)/thread_cpu_stub.cc
+	@mkdir -p $(dir $@)
+	@$(CXX) $(CXXFLAGS) -c $< -o $@ 2>&1 && echo "OK: thread_cpu_stub.cc" || { echo "FAIL: thread_cpu_stub.cc"; rm -f $@; }
 
 # globals_unix.cc: skip shared lib check (we're building static)
 $(BUILDDIR)/libartbase/base/globals_unix.o: $(ART)/libartbase/base/globals_unix.cc

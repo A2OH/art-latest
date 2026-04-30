@@ -251,6 +251,7 @@ RUNTIME_EXCLUDE = %backtrace_helper.cc \
   %mirror/class.cc \
   %oat/stack_map.cc \
   %oat/image.cc \
+  %runtime/var_handles.cc \
   %runtime/hidden_api.cc \
   %quick/quick_throw_entrypoints.cc
 # Exclude ALL runtime/native/*.cc -- we compile patched copies from patches/runtime/native/
@@ -322,6 +323,14 @@ $(HIDDENAPI_PATCH_OBJ): $(HIDDENAPI_PATCH_SRC)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@ 2>&1 && echo "OK: hidden_api.cc (patched)" || { echo "FAIL: hidden_api.cc (patched)"; rm -f $@; }
 RUNTIME_OBJS += $(HIDDENAPI_PATCH_OBJ)
+
+# Patched var_handles.cc (zero-mask FieldVarHandle access-mode support)
+VARHANDLES_PATCH_SRC = patches/runtime/var_handles.cc
+VARHANDLES_PATCH_OBJ = $(BUILDDIR)/runtime/var_handles.o
+$(VARHANDLES_PATCH_OBJ): $(VARHANDLES_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@ 2>&1 && echo "OK: var_handles.cc (patched)" || { echo "FAIL: var_handles.cc (patched)"; rm -f $@; }
+RUNTIME_OBJS += $(VARHANDLES_PATCH_OBJ)
 
 # Patched unstarted_runtime.cc (non-fatal native method calls during AOT)
 UNSTARTED_PATCH_SRC = patches/runtime/interpreter/unstarted_runtime.cc
@@ -741,4 +750,3 @@ link-runtime: all ziparchive sigchain nativehelper dalvikvm-main asm-x86_64 fmtl
 
 clean:
 	rm -rf $(BUILDDIR)
-
