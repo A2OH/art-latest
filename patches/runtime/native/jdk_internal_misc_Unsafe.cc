@@ -19,8 +19,10 @@
 #include <unistd.h>
 
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <atomic>
+#include <limits>
 
 #include "nativehelper/jni_macros.h"
 
@@ -30,6 +32,7 @@
 #include "jni/jni_internal.h"
 #include "mirror/array.h"
 #include "mirror/class-inl.h"
+#include "mirror/object_array-inl.h"
 #include "mirror/object-inl.h"
 #include "art_field-inl.h"
 #include "tolerant_native_util.h"
@@ -38,7 +41,150 @@
 
 namespace art HIDDEN {
 
+extern bool PFCutAppClassLoaderSeen();
+
 namespace {
+  bool PFCutIsBogusUnsafeObject(ObjPtr<mirror::Object> value) {
+    const uintptr_t ptr = reinterpret_cast<uintptr_t>(value.Ptr());
+    static constexpr uintptr_t kPFCutStaleEntry64 = 0xfffffffffffffb17ULL;
+    static constexpr uintptr_t kPFCutStaleEntry32 = 0xfffffb17ULL;
+    static constexpr uintptr_t kPFCutMinObjectAlignment = 4u;
+    return ptr == kPFCutStaleEntry64 || ptr == kPFCutStaleEntry32 ||
+           (ptr != 0u && ptr < 0x10000u) ||
+           ((ptr & (kPFCutMinObjectAlignment - 1u)) != 0u);
+  }
+
+  bool PFCutIsBogusUnsafeOffset(jlong offset) {
+    static constexpr jlong kPFCutMaxReasonableOffset = 1LL << 30;
+    static constexpr jlong kPFCutStaleEntry32 = 0xfffffb17LL;
+    return offset < 0 || offset > kPFCutMaxReasonableOffset || offset == kPFCutStaleEntry32 ||
+           ((offset % static_cast<jlong>(kHeapReferenceSize)) != 0);
+  }
+
+  bool PFCutIsBogusUnsafeJObject(jobject value) {
+    const uintptr_t ptr = reinterpret_cast<uintptr_t>(value);
+    static constexpr uintptr_t kPFCutStaleEntry64 = 0xfffffffffffffb17ULL;
+    static constexpr uintptr_t kPFCutStaleEntry32 = 0xfffffb17ULL;
+    // A JNI jobject is an indirect handle, not a decoded mirror::Object*
+    // address. It can legitimately be tagged/unaligned. Alignment must be
+    // checked only after ScopedFastNativeObjectAccess decodes the handle.
+    return ptr == kPFCutStaleEntry64 || ptr == kPFCutStaleEntry32 ||
+           (ptr != 0u && ptr < 0x10000u);
+  }
+
+  bool PFCutRejectUnsafeJObject(const char* method, jobject javaObj, jlong offset) {
+    if (UNLIKELY(javaObj == nullptr ||
+                 PFCutIsBogusUnsafeJObject(javaObj) ||
+                 PFCutIsBogusUnsafeOffset(offset))) {
+      static thread_local int bogus_jobject_count = 0;
+      if (bogus_jobject_count < 80) {
+        bogus_jobject_count++;
+        fprintf(stderr,
+                "[PFCUT] jdk.Unsafe bogus jobject %s javaObj=%p offset=%lld\n",
+                method,
+                javaObj,
+                static_cast<long long>(offset));
+        fflush(stderr);
+      }
+      return true;
+    }
+    return false;
+  }
+
+  void PFCutLogUnsafeBogusObject(const char* method,
+                                 ObjPtr<mirror::Object> obj,
+                                 jlong offset,
+                                 ObjPtr<mirror::Object> value) {
+    static thread_local int bogus_object_count = 0;
+    if (bogus_object_count < 80) {
+      bogus_object_count++;
+      fprintf(stderr,
+              "[PFCUT] jdk.Unsafe bogus object %s obj=%p offset=%lld value=%p\n",
+              method,
+              obj.Ptr(),
+              static_cast<long long>(offset),
+              value.Ptr());
+      fflush(stderr);
+    }
+  }
+
+  bool PFCutRejectUnsafeAccess(const char* method,
+                               ObjPtr<mirror::Object> obj,
+                               jlong offset) {
+    if (UNLIKELY(obj == nullptr ||
+                 PFCutIsBogusUnsafeObject(obj) ||
+                 PFCutIsBogusUnsafeOffset(offset))) {
+      PFCutLogUnsafeBogusObject(method, obj, offset, nullptr);
+      return true;
+    }
+    return false;
+  }
+
+  // PF-630 boot-aware routing gate (2026-05-04). Defined in runtime.cc.
+  // While false (i.e. before the app PathClassLoader is installed), PFCut's
+  // array-backed Unsafe path is bypassed and Unsafe ops fall through to
+  // stock CasFieldObject/GetFieldObject{Volatile}/SetFieldObject{Volatile}.
+  bool PFCutObjectArrayIndexFromOffset(ObjPtr<mirror::Object> obj,
+                                       jlong offset,
+                                       int32_t* index_out) {
+    if (UNLIKELY(!::art::PFCutAppClassLoaderSeen())) {
+      return false;
+    }
+    if (obj == nullptr || !obj->IsObjectArray()) {
+      return false;
+    }
+    const int32_t base = mirror::Array::DataOffset(kHeapReferenceSize).Int32Value();
+    if (offset < base) {
+      return false;
+    }
+    const jlong delta = offset - base;
+    if ((delta % kHeapReferenceSize) != 0) {
+      return false;
+    }
+    const jlong index64 = delta / kHeapReferenceSize;
+    ObjPtr<mirror::ObjectArray<mirror::Object>> array =
+        obj->AsObjectArray<mirror::Object>();
+    if (index64 < 0 || index64 > static_cast<jlong>(std::numeric_limits<int32_t>::max()) ||
+        index64 >= array->GetLength()) {
+      return false;
+    }
+    *index_out = static_cast<int32_t>(index64);
+    return true;
+  }
+
+  ObjPtr<mirror::Object> PFCutUnsafeGetObjectArraySlot(ObjPtr<mirror::Object> obj,
+                                                       int32_t index) {
+    return obj->AsObjectArray<mirror::Object>()->GetWithoutChecks(index);
+  }
+
+  void PFCutUnsafeSetObjectArraySlot(ObjPtr<mirror::Object> obj,
+                                     int32_t index,
+                                     ObjPtr<mirror::Object> value) {
+    obj->AsObjectArray<mirror::Object>()->SetWithoutChecks</*kTransactionActive=*/ false,
+                                                 /*kCheckTransaction=*/ false>(index, value);
+  }
+
+  void PFCutLogUnsafeCasInt(ObjPtr<mirror::Object> obj,
+                            jlong offset,
+                            jint current,
+                            jint expected,
+                            jint new_value,
+                            bool success) {
+    static thread_local int cas_int_count = 0;
+    if (cas_int_count < 96) {
+      cas_int_count++;
+      fprintf(stderr,
+              "[PFCUT] jdk.Unsafe CAS int obj=%p offset=%lld current=%d expected=%d new=%d success=%d\n",
+              obj.Ptr(),
+              static_cast<long long>(offset),
+              current,
+              expected,
+              new_value,
+              success ? 1 : 0);
+      fflush(stderr);
+    }
+  }
+
   // Checks a JNI argument `size` fits inside a size_t and throws a RuntimeException if not (see
   // jdk/internal/misc/Unsafe.java comments).
   bool ValidJniSizeArgument(jlong size) REQUIRES_SHARED(Locks::mutator_lock_) {
@@ -54,14 +200,25 @@ namespace {
 
 static jboolean Unsafe_compareAndSetInt(JNIEnv* env, jobject, jobject javaObj, jlong offset,
                                         jint expectedValue, jint newValue) {
+  if (UNLIKELY(PFCutRejectUnsafeJObject("compareAndSetInt.raw", javaObj, offset))) {
+    return JNI_FALSE;
+  }
   ScopedFastNativeObjectAccess soa(env);
   ObjPtr<mirror::Object> obj = soa.Decode<mirror::Object>(javaObj);
-  // JNI must use non transactional mode.
-  bool success = obj->CasField32<false>(MemberOffset(offset),
-                                        expectedValue,
-                                        newValue,
-                                        CASMode::kStrong,
-                                        std::memory_order_seq_cst);
+  if (UNLIKELY(PFCutRejectUnsafeAccess("compareAndSetInt", obj, offset))) {
+    return JNI_FALSE;
+  }
+  MemberOffset member_offset(offset);
+  jint current = obj->GetField32Volatile(member_offset);
+  const bool success = obj->CasField32<false>(member_offset,
+                                              expectedValue,
+                                              newValue,
+                                              CASMode::kStrong,
+                                              std::memory_order_seq_cst);
+  if (!success) {
+    current = obj->GetField32Volatile(member_offset);
+  }
+  PFCutLogUnsafeCasInt(obj, offset, current, expectedValue, newValue, success);
   return success ? JNI_TRUE : JNI_FALSE;
 }
 
@@ -75,13 +232,22 @@ static jboolean Unsafe_compareAndSwapInt(JNIEnv* env, jobject obj, jobject javaO
 
 static jboolean Unsafe_compareAndSetLong(JNIEnv* env, jobject, jobject javaObj, jlong offset,
                                          jlong expectedValue, jlong newValue) {
+  if (UNLIKELY(PFCutRejectUnsafeJObject("compareAndSetLong.raw", javaObj, offset))) {
+    return JNI_FALSE;
+  }
   ScopedFastNativeObjectAccess soa(env);
   ObjPtr<mirror::Object> obj = soa.Decode<mirror::Object>(javaObj);
-  // JNI must use non transactional mode.
-  bool success = obj->CasFieldStrongSequentiallyConsistent64<false>(MemberOffset(offset),
-                                                                    expectedValue,
-                                                                    newValue);
-  return success ? JNI_TRUE : JNI_FALSE;
+  if (UNLIKELY(PFCutRejectUnsafeAccess("compareAndSetLong", obj, offset))) {
+    return JNI_FALSE;
+  }
+  MemberOffset member_offset(offset);
+  const bool success = obj->CasFieldStrongSequentiallyConsistent64<false>(member_offset,
+                                                                         expectedValue,
+                                                                         newValue);
+  if (!success) {
+    return JNI_FALSE;
+  }
+  return JNI_TRUE;
 }
 
 static jboolean Unsafe_compareAndSwapLong(JNIEnv* env, jobject obj, jobject javaObj, jlong offset,
@@ -98,11 +264,35 @@ static jboolean Unsafe_compareAndSetReference(JNIEnv* env,
                                               jlong offset,
                                               jobject javaExpectedValue,
                                               jobject javaNewValue) {
+  if (UNLIKELY(PFCutRejectUnsafeJObject("compareAndSetReference.raw", javaObj, offset))) {
+    return JNI_FALSE;
+  }
   ScopedFastNativeObjectAccess soa(env);
   ObjPtr<mirror::Object> obj = soa.Decode<mirror::Object>(javaObj);
+  if (UNLIKELY(PFCutRejectUnsafeAccess("compareAndSetReference", obj, offset))) {
+    return JNI_FALSE;
+  }
   ObjPtr<mirror::Object> expectedValue = soa.Decode<mirror::Object>(javaExpectedValue);
   ObjPtr<mirror::Object> newValue = soa.Decode<mirror::Object>(javaNewValue);
-  // JNI must use non transactional mode.
+  if (UNLIKELY(PFCutIsBogusUnsafeObject(expectedValue) ||
+               PFCutIsBogusUnsafeObject(newValue))) {
+    PFCutLogUnsafeBogusObject("compareAndSetReference.arg", obj, offset,
+                              PFCutIsBogusUnsafeObject(newValue) ? newValue : expectedValue);
+    return JNI_FALSE;
+  }
+  int32_t array_index = -1;
+  if (PFCutObjectArrayIndexFromOffset(obj, offset, &array_index)) {
+    ObjPtr<mirror::Object> current = PFCutUnsafeGetObjectArraySlot(obj, array_index);
+    if (UNLIKELY(PFCutIsBogusUnsafeObject(current))) {
+      PFCutLogUnsafeBogusObject("compareAndSetReference.array", obj, offset, current);
+      return JNI_FALSE;
+    }
+    return obj->CasFieldObject<false>(MemberOffset(offset),
+                                      expectedValue,
+                                      newValue,
+                                      CASMode::kStrong,
+                                      std::memory_order_seq_cst) ? JNI_TRUE : JNI_FALSE;
+  }
   if (gUseReadBarrier) {
     // Need to make sure the reference stored in the field is a to-space one before attempting the
     // CAS or the CAS could fail incorrectly.
@@ -116,12 +306,18 @@ static jboolean Unsafe_compareAndSetReference(JNIEnv* env,
         MemberOffset(offset),
         field_addr);
   }
-  bool success = obj->CasFieldObject<false>(MemberOffset(offset),
-                                            expectedValue,
-                                            newValue,
-                                            CASMode::kStrong,
-                                            std::memory_order_seq_cst);
-  return success ? JNI_TRUE : JNI_FALSE;
+  MemberOffset member_offset(offset);
+  ObjPtr<mirror::Object> current =
+      obj->GetFieldObjectVolatile<mirror::Object>(member_offset);
+  if (UNLIKELY(PFCutIsBogusUnsafeObject(current))) {
+    PFCutLogUnsafeBogusObject("compareAndSetReference", obj, offset, current);
+    return JNI_FALSE;
+  }
+  return obj->CasFieldObject<false>(member_offset,
+                                    expectedValue,
+                                    newValue,
+                                    CASMode::kStrong,
+                                    std::memory_order_seq_cst) ? JNI_TRUE : JNI_FALSE;
 }
 
 static jboolean Unsafe_compareAndSwapObject(JNIEnv* env, jobject obj, jobject javaObj, jlong offset,
@@ -133,28 +329,52 @@ static jboolean Unsafe_compareAndSwapObject(JNIEnv* env, jobject obj, jobject ja
 }
 
 static jint Unsafe_getInt(JNIEnv* env, jobject, jobject javaObj, jlong offset) {
+  if (UNLIKELY(PFCutRejectUnsafeJObject("getInt.raw", javaObj, offset))) {
+    return 0;
+  }
   ScopedFastNativeObjectAccess soa(env);
   ObjPtr<mirror::Object> obj = soa.Decode<mirror::Object>(javaObj);
+  if (UNLIKELY(PFCutRejectUnsafeAccess("getInt", obj, offset))) {
+    return 0;
+  }
   return obj->GetField32(MemberOffset(offset));
 }
 
 static jint Unsafe_getIntVolatile(JNIEnv* env, jobject, jobject javaObj, jlong offset) {
+  if (UNLIKELY(PFCutRejectUnsafeJObject("getIntVolatile.raw", javaObj, offset))) {
+    return 0;
+  }
   ScopedFastNativeObjectAccess soa(env);
   ObjPtr<mirror::Object> obj = soa.Decode<mirror::Object>(javaObj);
+  if (UNLIKELY(PFCutRejectUnsafeAccess("getIntVolatile", obj, offset))) {
+    return 0;
+  }
   return obj->GetField32Volatile(MemberOffset(offset));
 }
 
 static void Unsafe_putInt(JNIEnv* env, jobject, jobject javaObj, jlong offset, jint newValue) {
+  if (UNLIKELY(PFCutRejectUnsafeJObject("putInt.raw", javaObj, offset))) {
+    return;
+  }
   ScopedFastNativeObjectAccess soa(env);
   ObjPtr<mirror::Object> obj = soa.Decode<mirror::Object>(javaObj);
+  if (UNLIKELY(PFCutRejectUnsafeAccess("putInt", obj, offset))) {
+    return;
+  }
   // JNI must use non transactional mode.
   obj->SetField32<false>(MemberOffset(offset), newValue);
 }
 
 static void Unsafe_putIntVolatile(JNIEnv* env, jobject, jobject javaObj, jlong offset,
                                   jint newValue) {
+  if (UNLIKELY(PFCutRejectUnsafeJObject("putIntVolatile.raw", javaObj, offset))) {
+    return;
+  }
   ScopedFastNativeObjectAccess soa(env);
   ObjPtr<mirror::Object> obj = soa.Decode<mirror::Object>(javaObj);
+  if (UNLIKELY(PFCutRejectUnsafeAccess("putIntVolatile", obj, offset))) {
+    return;
+  }
   // JNI must use non transactional mode.
   obj->SetField32Volatile<false>(MemberOffset(offset), newValue);
 }
@@ -170,28 +390,52 @@ static void Unsafe_putOrderedInt(JNIEnv* env, jobject, jobject javaObj, jlong of
 }
 
 static jlong Unsafe_getLong(JNIEnv* env, jobject, jobject javaObj, jlong offset) {
+  if (UNLIKELY(PFCutRejectUnsafeJObject("getLong.raw", javaObj, offset))) {
+    return 0;
+  }
   ScopedFastNativeObjectAccess soa(env);
   ObjPtr<mirror::Object> obj = soa.Decode<mirror::Object>(javaObj);
+  if (UNLIKELY(PFCutRejectUnsafeAccess("getLong", obj, offset))) {
+    return 0;
+  }
   return obj->GetField64(MemberOffset(offset));
 }
 
 static jlong Unsafe_getLongVolatile(JNIEnv* env, jobject, jobject javaObj, jlong offset) {
+  if (UNLIKELY(PFCutRejectUnsafeJObject("getLongVolatile.raw", javaObj, offset))) {
+    return 0;
+  }
   ScopedFastNativeObjectAccess soa(env);
   ObjPtr<mirror::Object> obj = soa.Decode<mirror::Object>(javaObj);
+  if (UNLIKELY(PFCutRejectUnsafeAccess("getLongVolatile", obj, offset))) {
+    return 0;
+  }
   return obj->GetField64Volatile(MemberOffset(offset));
 }
 
 static void Unsafe_putLong(JNIEnv* env, jobject, jobject javaObj, jlong offset, jlong newValue) {
+  if (UNLIKELY(PFCutRejectUnsafeJObject("putLong.raw", javaObj, offset))) {
+    return;
+  }
   ScopedFastNativeObjectAccess soa(env);
   ObjPtr<mirror::Object> obj = soa.Decode<mirror::Object>(javaObj);
+  if (UNLIKELY(PFCutRejectUnsafeAccess("putLong", obj, offset))) {
+    return;
+  }
   // JNI must use non transactional mode.
   obj->SetField64<false>(MemberOffset(offset), newValue);
 }
 
 static void Unsafe_putLongVolatile(JNIEnv* env, jobject, jobject javaObj, jlong offset,
                                    jlong newValue) {
+  if (UNLIKELY(PFCutRejectUnsafeJObject("putLongVolatile.raw", javaObj, offset))) {
+    return;
+  }
   ScopedFastNativeObjectAccess soa(env);
   ObjPtr<mirror::Object> obj = soa.Decode<mirror::Object>(javaObj);
+  if (UNLIKELY(PFCutRejectUnsafeAccess("putLongVolatile", obj, offset))) {
+    return;
+  }
   // JNI must use non transactional mode.
   obj->SetField64Volatile<false>(MemberOffset(offset), newValue);
 }
@@ -206,33 +450,97 @@ static void Unsafe_putOrderedLong(JNIEnv* env, jobject, jobject javaObj, jlong o
 }
 
 static jobject Unsafe_getReferenceVolatile(JNIEnv* env, jobject, jobject javaObj, jlong offset) {
+  if (UNLIKELY(PFCutRejectUnsafeJObject("getReferenceVolatile.raw", javaObj, offset))) {
+    return nullptr;
+  }
   ScopedFastNativeObjectAccess soa(env);
   ObjPtr<mirror::Object> obj = soa.Decode<mirror::Object>(javaObj);
+  if (UNLIKELY(PFCutRejectUnsafeAccess("getReferenceVolatile", obj, offset))) {
+    return nullptr;
+  }
+  int32_t array_index = -1;
+  if (PFCutObjectArrayIndexFromOffset(obj, offset, &array_index)) {
+    ObjPtr<mirror::Object> array_value = PFCutUnsafeGetObjectArraySlot(obj, array_index);
+    if (UNLIKELY(PFCutIsBogusUnsafeObject(array_value))) {
+      PFCutLogUnsafeBogusObject("getReferenceVolatile.array", obj, offset, array_value);
+      return nullptr;
+    }
+    return soa.AddLocalReference<jobject>(array_value);
+  }
   ObjPtr<mirror::Object> value = obj->GetFieldObjectVolatile<mirror::Object>(MemberOffset(offset));
+  if (UNLIKELY(PFCutIsBogusUnsafeObject(value))) {
+    PFCutLogUnsafeBogusObject("getReferenceVolatile", obj, offset, value);
+    return nullptr;
+  }
   return soa.AddLocalReference<jobject>(value);
 }
 
 static jobject Unsafe_getReference(JNIEnv* env, jobject, jobject javaObj, jlong offset) {
+  if (UNLIKELY(PFCutRejectUnsafeJObject("getReference.raw", javaObj, offset))) {
+    return nullptr;
+  }
   ScopedFastNativeObjectAccess soa(env);
   ObjPtr<mirror::Object> obj = soa.Decode<mirror::Object>(javaObj);
+  if (UNLIKELY(PFCutRejectUnsafeAccess("getReference", obj, offset))) {
+    return nullptr;
+  }
+  int32_t array_index = -1;
+  if (PFCutObjectArrayIndexFromOffset(obj, offset, &array_index)) {
+    ObjPtr<mirror::Object> array_value = PFCutUnsafeGetObjectArraySlot(obj, array_index);
+    if (UNLIKELY(PFCutIsBogusUnsafeObject(array_value))) {
+      PFCutLogUnsafeBogusObject("getReference.array", obj, offset, array_value);
+      return nullptr;
+    }
+    return soa.AddLocalReference<jobject>(array_value);
+  }
   ObjPtr<mirror::Object> value = obj->GetFieldObject<mirror::Object>(MemberOffset(offset));
+  if (UNLIKELY(PFCutIsBogusUnsafeObject(value))) {
+    PFCutLogUnsafeBogusObject("getReference", obj, offset, value);
+    return nullptr;
+  }
   return soa.AddLocalReference<jobject>(value);
 }
 
 static void Unsafe_putReference(
     JNIEnv* env, jobject, jobject javaObj, jlong offset, jobject javaNewValue) {
+  if (UNLIKELY(PFCutRejectUnsafeJObject("putReference.raw", javaObj, offset))) {
+    return;
+  }
   ScopedFastNativeObjectAccess soa(env);
   ObjPtr<mirror::Object> obj = soa.Decode<mirror::Object>(javaObj);
   ObjPtr<mirror::Object> newValue = soa.Decode<mirror::Object>(javaNewValue);
+  if (UNLIKELY(PFCutRejectUnsafeAccess("putReference", obj, offset) ||
+               PFCutIsBogusUnsafeObject(newValue))) {
+    PFCutLogUnsafeBogusObject("putReference.value", obj, offset, newValue);
+    return;
+  }
+  int32_t array_index = -1;
+  if (PFCutObjectArrayIndexFromOffset(obj, offset, &array_index)) {
+    PFCutUnsafeSetObjectArraySlot(obj, array_index, newValue);
+    return;
+  }
   // JNI must use non transactional mode.
   obj->SetFieldObject<false>(MemberOffset(offset), newValue);
 }
 
 static void Unsafe_putReferenceVolatile(
     JNIEnv* env, jobject, jobject javaObj, jlong offset, jobject javaNewValue) {
+  if (UNLIKELY(PFCutRejectUnsafeJObject("putReferenceVolatile.raw", javaObj, offset))) {
+    return;
+  }
   ScopedFastNativeObjectAccess soa(env);
   ObjPtr<mirror::Object> obj = soa.Decode<mirror::Object>(javaObj);
   ObjPtr<mirror::Object> newValue = soa.Decode<mirror::Object>(javaNewValue);
+  if (UNLIKELY(PFCutRejectUnsafeAccess("putReferenceVolatile", obj, offset) ||
+               PFCutIsBogusUnsafeObject(newValue))) {
+    PFCutLogUnsafeBogusObject("putReferenceVolatile.value", obj, offset, newValue);
+    return;
+  }
+  int32_t array_index = -1;
+  if (PFCutObjectArrayIndexFromOffset(obj, offset, &array_index)) {
+    PFCutUnsafeSetObjectArraySlot(obj, array_index, newValue);
+    return;
+  }
   // JNI must use non transactional mode.
   obj->SetFieldObjectVolatile<false>(MemberOffset(offset), newValue);
 }

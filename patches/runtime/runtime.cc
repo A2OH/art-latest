@@ -228,6 +228,20 @@ extern "C" jint Westlake_ThreadLocal_nextHashCode(JNIEnv*, jclass) {
   return g_westlake_threadlocal_hash_counter.fetch_add(kHashIncrement);
 }
 
+// PF-630 (2026-05-04) boot-aware routing gate. Set once after the standalone
+// app PathClassLoader is installed in Runtime::Start(). PFCut Unsafe-array
+// routing only activates after this flips true; boot-time clinit
+// (ICU/Charset/Provider/Crypto) goes through stock CAS/SetField paths.
+static std::atomic<bool> g_pfcut_app_loader_seen{false};
+
+bool PFCutAppClassLoaderSeen() {
+  return g_pfcut_app_loader_seen.load(std::memory_order_relaxed);
+}
+
+void PFCutMarkAppClassLoaderSeen() {
+  g_pfcut_app_loader_seen.store(true, std::memory_order_release);
+}
+
 static void Westlake_ThrowErrnoException(JNIEnv* env, const char* function_name, int errnum) {
   jclass cls = env->FindClass("android/system/ErrnoException");
   if (cls == nullptr || env->ExceptionCheck()) {
@@ -3201,6 +3215,8 @@ bool Runtime::Start() {
       fprintf(stderr, "[RT] Installed standalone app PathClassLoader (%zu dex files)\n",
               standalone_class_path.size());
       fflush(stderr);
+      PFCutMarkAppClassLoaderSeen();
+      fprintf(stderr, "[RT] PFCut boot gate flipped: app loader seen\n"); fflush(stderr);
     } else {
       fprintf(stderr, "[RT] Failed to install standalone app PathClassLoader\n");
       fflush(stderr);
