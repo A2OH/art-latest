@@ -3215,6 +3215,14 @@ bool Runtime::Start() {
       fprintf(stderr, "[RT] Installed standalone app PathClassLoader (%zu dex files)\n",
               standalone_class_path.size());
       fflush(stderr);
+      // PF-noice (2026-05-04): empirical finding — disabling the bypass
+      // entirely (gate never flipped) does NOT eliminate the boot-class
+      // ArrayStoreException cascade (ICU/CharsetProvider/Crypto). The
+      // cascade has a different root cause in the runtime/shim
+      // infrastructure that survives bypass disable. Restoring the
+      // boot-aware flip because it eliminates the SIGBUS at sentinel
+      // 0xfffffffffffffb17 (PF-630) regardless. The cascade remains an
+      // open issue tracked separately.
       PFCutMarkAppClassLoaderSeen();
       fprintf(stderr, "[RT] PFCut boot gate flipped: app loader seen\n"); fflush(stderr);
     } else {
