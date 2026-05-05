@@ -113,6 +113,8 @@
 #include "memory_representation.h"
 #include "metrics/statsd.h"
 #include "mirror/array.h"
+#include "mirror/object_array-inl.h"
+#include "mirror/object-inl.h"
 #include "mirror/class-alloc-inl.h"
 #include "mirror/class-inl.h"
 #include "mirror/class_ext.h"
@@ -240,6 +242,117 @@ bool PFCutAppClassLoaderSeen() {
 
 void PFCutMarkAppClassLoaderSeen() {
   g_pfcut_app_loader_seen.store(true, std::memory_order_release);
+}
+
+// PF-noice-001 (2026-05-04) per-Unsafe-array-write trace flag. Active from
+// runtime startup to the JNI hook nativePfcutTraceStop() called by Java when
+// MainActivity.onResume completes. Used to localize the boot-class
+// ArrayStoreException cascade without adding permanent runtime overhead.
+static std::atomic<bool> g_pfcut_trace_active{false};
+
+bool PFCutTraceActive() {
+  return g_pfcut_trace_active.load(std::memory_order_relaxed);
+}
+
+void PFCutTraceStart() {
+  g_pfcut_trace_active.store(true, std::memory_order_release);
+}
+
+void PFCutTraceStop() {
+  g_pfcut_trace_active.store(false, std::memory_order_release);
+}
+
+// Durable trace sink. Opens the file lazily under a once-init.
+static FILE* PFCutTraceFile() {
+  static FILE* f = []() -> FILE* {
+    FILE* result = fopen("/sdcard/westlake_pfcut_trace.txt", "w");
+    if (result == nullptr) {
+      result = fopen("/data/local/tmp/westlake_pfcut_trace.txt", "w");
+    }
+    if (result != nullptr) {
+      // Line-buffered so logcat backpressure doesn't lose lines on crash.
+      setvbuf(result, nullptr, _IOLBF, 4096);
+    }
+    return result;
+  }();
+  return f;
+}
+
+void PFCutTraceWrite(const char* line) {
+  // Always emit to stderr (logcat) for cheap inspection.
+  fputs(line, stderr);
+  fputc('\n', stderr);
+  // Also emit to durable file.
+  FILE* f = PFCutTraceFile();
+  if (f != nullptr) {
+    fputs(line, f);
+    fputc('\n', f);
+  }
+}
+
+// Per-thread cap so trace volume stays bounded. The cascade fires within the
+// first few hundred Unsafe writes; capping at 200 per thread is plenty.
+static constexpr int kPFCutTracePerThreadCap = 200;
+
+// Emit a structured trace line for the given Unsafe-array operation. NOT
+// static so sun_misc_Unsafe.cc / jdk_internal_misc_Unsafe.cc can extern it.
+void PFCutTraceUnsafeArrayWrite(const char* kind,
+                                ObjPtr<mirror::Object> /*array_obj*/,
+                                int32_t array_index,
+                                int32_t array_length,
+                                ObjPtr<mirror::Class> array_class,
+                                ObjPtr<mirror::Class> component_class,
+                                ObjPtr<mirror::Object> value,
+                                ObjPtr<mirror::Class> value_class,
+                                bool assignable)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (!PFCutTraceActive()) {
+    return;
+  }
+  static thread_local int per_thread_count = 0;
+  if (per_thread_count >= kPFCutTracePerThreadCap) {
+    return;
+  }
+  per_thread_count++;
+
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  uint64_t ts_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+
+  std::string caller = "<unknown>";
+  ArtMethod* current = Thread::Current()->GetCurrentMethod(/*dex_pc=*/ nullptr);
+  if (current != nullptr) {
+    caller = current->PrettyMethod();
+  }
+
+  std::string thread_name;
+  Thread::Current()->GetThreadName(thread_name);
+
+  std::string array_class_name = array_class != nullptr
+      ? array_class->PrettyDescriptor() : "<null>";
+  std::string component_class_name = component_class != nullptr
+      ? component_class->PrettyDescriptor() : "<null>";
+  std::string value_class_name = value_class != nullptr
+      ? value_class->PrettyDescriptor() : "<null>";
+
+  char buf[1024];
+  snprintf(buf, sizeof(buf),
+           "[PFCUT-TRACE] thread=%s ts_us=%llu kind=%s "
+           "caller=\"%s\" array.class=%s array.componentType=%s "
+           "array.length=%d index=%d value.ptr=%p value.class=%s "
+           "assignable=%d",
+           thread_name.c_str(),
+           (unsigned long long) ts_us,
+           kind,
+           caller.c_str(),
+           array_class_name.c_str(),
+           component_class_name.c_str(),
+           array_length,
+           array_index,
+           value.Ptr(),
+           value_class_name.c_str(),
+           assignable ? 1 : 0);
+  PFCutTraceWrite(buf);
 }
 
 static void Westlake_ThrowErrnoException(JNIEnv* env, const char* function_name, int errnum) {
@@ -2986,6 +3099,33 @@ bool Runtime::Start() {
               abaseF->SetInt<false>(chm_class, abase);
               ashiftF->SetInt<false>(chm_class, ashift);
               fprintf(stderr, "[RT] Set ConcurrentHashMap ABASE=%d ASHIFT=%d\n", abase, ashift);
+              {
+                // PF-noice-001 verification: aarch64 dalvikvm with compressed
+                // refs (kHeapReferenceSize=4) expects ABASE=12 ASHIFT=2; with
+                // uncompressed refs ABASE=16 ASHIFT=3. Mismatch with the build's
+                // actual layout = corrupt CHM Node[] addressing.
+                const int32_t expected_abase_compressed = 12;
+                const int32_t expected_ashift_compressed = 2;
+                const int32_t expected_abase_uncompressed = 16;
+                const int32_t expected_ashift_uncompressed = 3;
+                const bool layout_compressed =
+                    sizeof(mirror::HeapReference<mirror::Object>) == 4u;
+                const int32_t expect_abase = layout_compressed
+                    ? expected_abase_compressed
+                    : expected_abase_uncompressed;
+                const int32_t expect_ashift = layout_compressed
+                    ? expected_ashift_compressed
+                    : expected_ashift_uncompressed;
+                const bool match = (abase == expect_abase) && (ashift == expect_ashift);
+                fprintf(stderr,
+                        "[PFCUT-VERIFY] CHM ABASE=%d ASHIFT=%d "
+                        "kHeapReferenceSize=%zu compressed=%d expected_abase=%d "
+                        "expected_ashift=%d match=%d\n",
+                        abase, ashift, sizeof(mirror::HeapReference<mirror::Object>),
+                        layout_compressed ? 1 : 0, expect_abase, expect_ashift,
+                        match ? 1 : 0);
+                fflush(stderr);
+              }
             }
           }
         }
@@ -3225,6 +3365,12 @@ bool Runtime::Start() {
       // open issue tracked separately.
       PFCutMarkAppClassLoaderSeen();
       fprintf(stderr, "[RT] PFCut boot gate flipped: app loader seen\n"); fflush(stderr);
+      // PF-noice-001: start tracing every Unsafe-array write from this point
+      // until JNI hook nativePfcutTraceStop() fires (called from Java when
+      // MainActivity.onResume completes). The trace will localize the
+      // boot-class ArrayStoreException cascade root cause.
+      PFCutTraceStart();
+      fprintf(stderr, "[PFCUT-TRACE] active=1\n"); fflush(stderr);
     } else {
       fprintf(stderr, "[RT] Failed to install standalone app PathClassLoader\n");
       fflush(stderr);

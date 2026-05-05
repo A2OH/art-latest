@@ -124,6 +124,19 @@ static bool PFCutRejectUnsafeAccess(const char* method,
 // CasFieldObject/GetFieldObject{Volatile}/SetFieldObject{Volatile}.
 extern bool PFCutAppClassLoaderSeen();
 
+// PF-noice-001 (2026-05-04) trace API defined in runtime.cc.
+extern bool PFCutTraceActive();
+extern void PFCutTraceUnsafeArrayWrite(const char* kind,
+                                        ObjPtr<mirror::Object> array_obj,
+                                        int32_t array_index,
+                                        int32_t array_length,
+                                        ObjPtr<mirror::Class> array_class,
+                                        ObjPtr<mirror::Class> component_class,
+                                        ObjPtr<mirror::Object> value,
+                                        ObjPtr<mirror::Class> value_class,
+                                        bool assignable)
+    REQUIRES_SHARED(Locks::mutator_lock_);
+
 static bool PFCutObjectArrayIndexFromOffset(ObjPtr<mirror::Object> obj,
                                             jlong offset,
                                             int32_t* index_out) {
@@ -154,12 +167,44 @@ static bool PFCutObjectArrayIndexFromOffset(ObjPtr<mirror::Object> obj,
 
 static ObjPtr<mirror::Object> PFCutUnsafeGetObjectArraySlot(ObjPtr<mirror::Object> obj,
                                                             int32_t index) {
-  return obj->AsObjectArray<mirror::Object>()->GetWithoutChecks(index);
+  ObjPtr<mirror::Object> result =
+      obj->AsObjectArray<mirror::Object>()->GetWithoutChecks(index);
+  if (UNLIKELY(PFCutTraceActive())) {
+    ObjPtr<mirror::ObjectArray<mirror::Object>> array =
+        obj->AsObjectArray<mirror::Object>();
+    ObjPtr<mirror::Class> array_class = array->GetClass();
+    ObjPtr<mirror::Class> component_class =
+        array_class != nullptr ? array_class->GetComponentType() : nullptr;
+    ObjPtr<mirror::Class> value_class =
+        result != nullptr ? result->GetClass() : nullptr;
+    bool assignable = (component_class == nullptr || value_class == nullptr) ||
+                      component_class->IsAssignableFrom(value_class.Ptr());
+    PFCutTraceUnsafeArrayWrite("getSlot", obj, index, array->GetLength(),
+                               array_class, component_class,
+                               result, value_class, assignable);
+  }
+  return result;
 }
 
 static void PFCutUnsafeSetObjectArraySlot(ObjPtr<mirror::Object> obj,
                                           int32_t index,
                                           ObjPtr<mirror::Object> value) {
+  // PF-noice-001 trace BEFORE the bypass-write; emits assignable=0 if this is
+  // the corrupting write that SetWithoutChecks lets through.
+  if (UNLIKELY(PFCutTraceActive())) {
+    ObjPtr<mirror::ObjectArray<mirror::Object>> array =
+        obj->AsObjectArray<mirror::Object>();
+    ObjPtr<mirror::Class> array_class = array->GetClass();
+    ObjPtr<mirror::Class> component_class =
+        array_class != nullptr ? array_class->GetComponentType() : nullptr;
+    ObjPtr<mirror::Class> value_class =
+        value != nullptr ? value->GetClass() : nullptr;
+    bool assignable = (component_class == nullptr || value_class == nullptr) ||
+                      component_class->IsAssignableFrom(value_class.Ptr());
+    PFCutTraceUnsafeArrayWrite("setSlot", obj, index, array->GetLength(),
+                               array_class, component_class,
+                               value, value_class, assignable);
+  }
   obj->AsObjectArray<mirror::Object>()->SetWithoutChecks</*kTransactionActive=*/ false,
                                                 /*kCheckTransaction=*/ false>(index, value);
 }
