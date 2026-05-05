@@ -252,6 +252,36 @@ extern "C" NO_RETURN void artThrowArrayStoreException(mirror::Object* array,
                                                       Thread* self)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   ScopedQuickEntrypointChecks sqec(self);
+  // PF-noice-002 (2026-05-04): Westlake's standalone-dalvikvm has duplicate
+  // Class objects with same descriptor (boot-class identity duplication).
+  // Compare descriptors before throwing — log the match so we can quantify.
+  // We can't actually skip the throw here because this is NO_RETURN and the
+  // call site assembly does DeliverAndJump immediately after; but the
+  // logging confirms the diagnosis and counts how often it fires.
+  static thread_local int pfcut_ase_descriptor_match_count = 0;
+  if (value != nullptr && array != nullptr) {
+    ObjPtr<mirror::Class> array_class = array->GetClass();
+    ObjPtr<mirror::Class> value_class = value->GetClass();
+    if (array_class != nullptr && value_class != nullptr) {
+      ObjPtr<mirror::Class> component_class = array_class->GetComponentType();
+      if (component_class != nullptr) {
+        std::string component_desc;
+        std::string value_desc;
+        const char* cd = component_class->GetDescriptor(&component_desc);
+        const char* vd = value_class->GetDescriptor(&value_desc);
+        if (cd != nullptr && vd != nullptr && strcmp(cd, vd) == 0) {
+          pfcut_ase_descriptor_match_count++;
+          if (pfcut_ase_descriptor_match_count <= 40) {
+            fprintf(stderr,
+                    "[PFCUT-ASE-MATCH] descriptor=%s component_class=%p value_class=%p count=%d\n",
+                    cd, component_class.Ptr(), value_class.Ptr(),
+                    pfcut_ase_descriptor_match_count);
+            fflush(stderr);
+          }
+        }
+      }
+    }
+  }
   ThrowArrayStoreException(value->GetClass(), array->GetClass());
   DeliverAndJump(self);
 }
