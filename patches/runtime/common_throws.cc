@@ -15,7 +15,13 @@
  */
 
 #include "common_throws.h"
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <iostream>
+#include <cstdlib>
 
+#include <atomic>
 #include <sstream>
 
 #include <android-base/logging.h>
@@ -119,6 +125,21 @@ void ThrowArithmeticExceptionDivideByZero() {
 // ArrayIndexOutOfBoundsException
 
 void ThrowArrayIndexOutOfBoundsException(int index, int length) {
+  /* PF-arch-051: dump the Java stack at the throw site to logcat so the agent
+   * lifecycle runner can identify which array access fails. ART pre-allocates
+   * the exception object for hot paths and our catch site sees an empty stack.
+   * Limit the dump to first N firings to avoid log flood. */
+  static std::atomic<int> diag_count(0);
+  if (diag_count.fetch_add(1) < 8) {
+    Thread* self = Thread::Current();
+    std::ostringstream os;
+    os << "[PF-arch-051] ThrowAIOOB length=" << length << " index=" << index << " stack:\n";
+    if (self != nullptr) {
+      self->DumpJavaStack(os);
+    }
+    fprintf(stderr, "%s", os.str().c_str());
+    fflush(stderr);
+  }
   ThrowException("Ljava/lang/ArrayIndexOutOfBoundsException;", nullptr,
                  StringPrintf("length=%d; index=%d", length, index).c_str());
 }
@@ -127,6 +148,39 @@ void ThrowArrayIndexOutOfBoundsException(int index, int length) {
 
 void ThrowArrayStoreException(ObjPtr<mirror::Class> element_class,
                               ObjPtr<mirror::Class> array_class) {
+  // WESTLAKE §603f ASE-DIAG: with the JIT on, this port throws IMPOSSIBLE array-store exceptions
+  // ("java.lang.String cannot be stored in an array of type java.lang.String[]"), 3 per launch,
+  // never with the JIT off. Storing a String into a String[] is always legal, so the assignability
+  // test is answering wrongly. The decisive question is whether element_class and
+  // array_class->GetComponentType() are the SAME Class object: if the pointers differ while the
+  // descriptors match, there are DUPLICATE Class objects (class-loader / dex-cache identity), not a
+  // broken comparison. Dump both pointers plus the Java stack that names the store.
+  // Gated on WESTLAKE_ASE_DIAG=1 and capped, so normal runs are unaffected.
+  {
+    static const bool wl_ase_diag = (getenv("WESTLAKE_ASE_DIAG") != nullptr);
+    static int wl_ase_count = 0;
+    if (UNLIKELY(wl_ase_diag) && wl_ase_count < 10) {
+      wl_ase_count++;
+      ObjPtr<mirror::Class> comp =
+          (array_class != nullptr) ? array_class->GetComponentType() : nullptr;
+      fprintf(stderr,
+              "[WESTLAKE-ASE-DIAG] #%d element=%p (%s) array=%p (%s) component=%p (%s) "
+              "element==component:%d\n",
+              wl_ase_count,
+              element_class.Ptr(), mirror::Class::PrettyDescriptor(element_class).c_str(),
+              array_class.Ptr(), mirror::Class::PrettyDescriptor(array_class).c_str(),
+              comp.Ptr(), mirror::Class::PrettyDescriptor(comp).c_str(),
+              (element_class.Ptr() == comp.Ptr()) ? 1 : 0);
+      fflush(stderr);
+      Thread* self_ase = Thread::Current();
+      if (self_ase != nullptr) {
+        fprintf(stderr, "[WESTLAKE-ASE-DIAG] #%d Java stack:\n", wl_ase_count);
+        fflush(stderr);
+        self_ase->DumpJavaStack(std::cerr);
+        std::cerr.flush();
+      }
+    }
+  }
   ThrowException("Ljava/lang/ArrayStoreException;", nullptr,
                  StringPrintf("%s cannot be stored in an array of type %s",
                               mirror::Class::PrettyDescriptor(element_class).c_str(),
@@ -432,6 +486,46 @@ static void ThrowNullPointerExceptionForMethodAccessImpl(uint32_t method_idx,
                                                          const DexFile& dex_file,
                                                          InvokeType type)
     REQUIRES_SHARED(Locks::mutator_lock_) {
+  // WESTLAKE (arm64 board, 2026-07-21) NPE-DIAG: ActivityThread.handleBindApplication dies
+  // with "Attempt to invoke ... String.contains(CharSequence) on a null object reference"
+  // and the adapter only logs "Caused by:" with no frames, so dump the Java stack at the
+  // throw site.  Gated on WESTLAKE_NPE_DIAG so normal runs are unaffected.
+  // NOT env-gated: the spawned child resets `environ`, so getenv() is useless there
+  // (same lesson as the libart THROW-DIAG). Rate-limit instead.
+  {
+    static int westlake_npe_diag_count = 0;
+    if (westlake_npe_diag_count < 3) {
+      westlake_npe_diag_count++;
+      Thread* self_diag = Thread::Current();
+      // WESTLAKE 2026-07-22 (§178): when Thread::Current() is NULL the message below is still
+      // built and thrown but NO stack is dumped -- that is exactly how the failing
+      // AtomicReferenceFieldUpdater.compareAndSet NPE escaped every diagnostic. Report the null
+      // case explicitly with OS thread ids so the offending (unattached) thread can be identified.
+      if (self_diag == nullptr) {
+        fprintf(stderr,
+                "[WESTLAKE-NOTHREAD] NPE thrown with Thread::Current()==NULL "
+                "tid=%d pthread=%p type=%d method_idx=%u\n",
+                static_cast<int>(syscall(SYS_gettid)),
+                reinterpret_cast<void*>(pthread_self()),
+                static_cast<int>(type), method_idx);
+        fflush(stderr);
+      }
+      if (self_diag != nullptr) {
+        fprintf(stderr, "[WESTLAKE-NPE-DIAG] NPE on invoke #%d, Java stack:\n",
+                westlake_npe_diag_count);
+        fflush(stderr);
+        self_diag->DumpJavaStack(std::cerr);
+        std::cerr.flush();
+      }
+    }
+  }
+  {
+    static int wl_t = 0;
+    if (wl_t < 20) { wl_t++;
+      fprintf(stderr, "[WESTLAKE-INVTYPE] #%d raw_type=%d method_idx=%u\n",
+              wl_t, static_cast<int>(type), method_idx);
+      fflush(stderr); }
+  }
   std::ostringstream msg;
   msg << "Attempt to invoke " << type << " method '"
       << dex_file.PrettyMethod(method_idx, true) << "' on a null object reference";
@@ -654,6 +748,44 @@ void ThrowNullPointerExceptionFromDexPC(bool check_address, uintptr_t addr) {
                      "Attempt to write to null array");
       break;
     case Instruction::ARRAY_LENGTH:
+      {
+        // WESTLAKE §434: DISABLED (condition forced false). This diagnostic is ABSENT from
+        // the known-good libart — proved by diffing the two binaries' PFCUT/WESTLAKE marker
+        // strings — and walking shadow frames + PrettyMethod() on every null-array NPE
+        // SIGSEGVs the child during startup. Flip to `< 80` only for targeted debugging.
+        // WESTLAKE §611: re-enabled behind WESTLAKE_NULLARR_DIAG (default off; §434 hazard
+        // stays dormant). Frame walk additionally gated on WESTLAKE_NULLARR_WALK.
+        static thread_local int pfc_null_array_count = 0;
+        static const bool wl_nullarr_diag = (getenv("WESTLAKE_NULLARR_DIAG") != nullptr);
+        if (wl_nullarr_diag && pfc_null_array_count < 40) {
+          pfc_null_array_count++;
+          Thread* self = Thread::Current();
+          fprintf(stderr,
+                  "[PFCUT-NPE-ARRAY-LENGTH] method=%s dex_pc=%u shadow=%p quick=%p\n",
+                  method != nullptr ? method->PrettyMethod().c_str() : "<null>",
+                  throw_dex_pc,
+                  self != nullptr && self->GetManagedStack() != nullptr
+                      ? self->GetManagedStack()->GetTopShadowFrame()
+                      : nullptr,
+                  self != nullptr && self->GetManagedStack() != nullptr
+                      ? self->GetManagedStack()->GetTopQuickFrame()
+                      : nullptr);
+          if (getenv("WESTLAKE_NULLARR_WALK") != nullptr &&
+              self != nullptr && self->GetManagedStack() != nullptr) {
+            int depth = 0;
+            for (auto* frame = self->GetManagedStack()->GetTopShadowFrame();
+                 frame != nullptr && depth < 16;
+                 frame = frame->GetLink(), depth++) {
+              ArtMethod* m = frame->GetMethod();
+              fprintf(stderr,
+                      "[PFCUT-NPE-ARRAY-LENGTH]   #%d %s\n",
+                      depth,
+                      m != nullptr ? m->PrettyMethod().c_str() : "<null>");
+            }
+          }
+          fflush(stderr);
+        }
+      }
       ThrowException("Ljava/lang/NullPointerException;", nullptr,
                      "Attempt to get length of null array");
       break;
