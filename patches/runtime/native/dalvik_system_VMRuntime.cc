@@ -314,6 +314,8 @@ static void VMRuntime_notifyNativeAllocationsInternal(JNIEnv* env, jobject) {
 }
 
 static jlong VMRuntime_getFinalizerTimeoutMs(JNIEnv*, jobject) {
+  // 2026-07-09: reverted the 24h override — it destabilized appspawn-x (died after
+  // Ready) without fixing the forked child, so it was a wrong turn. Back to stock.
   return Runtime::Current()->GetFinalizerTimeoutMs();
 }
 

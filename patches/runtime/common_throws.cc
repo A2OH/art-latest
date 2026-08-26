@@ -755,8 +755,20 @@ void ThrowNullPointerExceptionFromDexPC(bool check_address, uintptr_t addr) {
         // SIGSEGVs the child during startup. Flip to `< 80` only for targeted debugging.
         // WESTLAKE §611: re-enabled behind WESTLAKE_NULLARR_DIAG (default off; §434 hazard
         // stays dormant). Frame walk additionally gated on WESTLAKE_NULLARR_WALK.
+        // WESTLAKE §657 (2026-08-15): the getenv() gates NEVER OPEN — environment variables do
+        // not reach appspawn-x children (verified: exported in run_*.sh, 0 hits in the child's
+        // /proc/<pid>/environ). That is why this diagnostic reported 0 for the Toutiao
+        // "Attempt to get length of null array" NPE that blocks Application.onCreate.
+        // Use a FILE trigger instead — the child can read /data/local/tmp/asx even though it
+        // cannot write there (it runs as an app uid). Create it before launching:
+        //     touch /data/local/tmp/asx/NULLARR        (and .../NULLARR_WALK for frame walking)
+        // Checked once per thread, so the cost is one access() per thread that ever throws this.
         static thread_local int pfc_null_array_count = 0;
-        static const bool wl_nullarr_diag = (getenv("WESTLAKE_NULLARR_DIAG") != nullptr);
+        static thread_local int wl_nullarr_state = -1;   // -1 unknown, 0 off, 1 on
+        if (wl_nullarr_state < 0) {
+          wl_nullarr_state = (access("/data/local/tmp/asx/NULLARR", F_OK) == 0) ? 1 : 0;
+        }
+        const bool wl_nullarr_diag = (wl_nullarr_state == 1);
         if (wl_nullarr_diag && pfc_null_array_count < 40) {
           pfc_null_array_count++;
           Thread* self = Thread::Current();
@@ -770,7 +782,7 @@ void ThrowNullPointerExceptionFromDexPC(bool check_address, uintptr_t addr) {
                   self != nullptr && self->GetManagedStack() != nullptr
                       ? self->GetManagedStack()->GetTopQuickFrame()
                       : nullptr);
-          if (getenv("WESTLAKE_NULLARR_WALK") != nullptr &&
+          if (access("/data/local/tmp/asx/NULLARR_WALK", F_OK) == 0 &&
               self != nullptr && self->GetManagedStack() != nullptr) {
             int depth = 0;
             for (auto* frame = self->GetManagedStack()->GetTopShadowFrame();

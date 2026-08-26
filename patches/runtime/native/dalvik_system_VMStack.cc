@@ -16,6 +16,7 @@
 
 #include "dalvik_system_VMStack.h"
 
+#include <cstdio>
 #include <type_traits>
 
 #include "nativehelper/jni_macros.h"
@@ -130,40 +131,16 @@ static jobject VMStack_getClosestUserClassLoader(JNIEnv* env, jclass) {
 // Returns the class of the caller's caller's caller.
 static jclass VMStack_getStackClass2(JNIEnv* env, jclass) {
   ScopedFastNativeObjectAccess soa(env);
-  struct StackClass2Visitor : public StackVisitor {
-    explicit StackClass2Visitor(Thread* thread)
-        : StackVisitor(thread, nullptr, StackVisitor::StackWalkKind::kIncludeInlinedFrames),
-          result(nullptr) {}
-
-    bool VisitFrame() override REQUIRES_SHARED(Locks::mutator_lock_) {
-      ArtMethod* method = GetMethod();
-      if (method == nullptr || method->IsRuntimeMethod()) {
-        return true;
-      }
-      ObjPtr<mirror::Class> klass = method->GetDeclaringClass();
-      if (klass == nullptr) {
-        return true;
-      }
-      if (klass->DescriptorEquals("Ldalvik/system/VMStack;") ||
-          klass->DescriptorEquals("Ljava/lang/invoke/MethodHandles;") ||
-          klass->DescriptorEquals("Ljava/lang/invoke/MethodHandles$Lookup;") ||
-          klass->DescriptorEquals("Lsun/reflect/Reflection;")) {
-        return true;
-      }
-      result = klass;
-      return false;
-    }
-
-    ObjPtr<mirror::Class> result;
-  };
-
-  StackClass2Visitor visitor(soa.Self());
+  NthCallerVisitor visitor(soa.Self(), 3);
   visitor.WalkStack();
-  if (UNLIKELY(visitor.result == nullptr)) {
-    // The caller is an attached native thread.
-    return nullptr;
+  if (LIKELY(visitor.caller != nullptr)) {
+    return soa.AddLocalReference<jclass>(visitor.caller->GetDeclaringClass());
   }
-  return soa.AddLocalReference<jclass>(visitor.result);
+
+  // Keep a narrow fallback for attached-native-thread edge cases, but do not
+  // use it for normal MethodHandles.lookup(): returning MethodHandles itself
+  // makes Android's Lookup constructor reject the caller as privileged.
+  return nullptr;
 }
 
 static jobjectArray VMStack_getThreadStackTrace(JNIEnv* env, jclass, jobject javaThread) {
@@ -192,7 +169,7 @@ static JNINativeMethod gMethods[] = {
   FAST_NATIVE_METHOD(VMStack, fillStackTraceElements, "(Ljava/lang/Thread;[Ljava/lang/StackTraceElement;)I"),
   FAST_NATIVE_METHOD(VMStack, getCallingClassLoader, "()Ljava/lang/ClassLoader;"),
   FAST_NATIVE_METHOD(VMStack, getClosestUserClassLoader, "()Ljava/lang/ClassLoader;"),
-  FAST_NATIVE_METHOD(VMStack, getStackClass2, "()Ljava/lang/Class;"),
+  NATIVE_METHOD(VMStack, getStackClass2, "()Ljava/lang/Class;"),
   FAST_NATIVE_METHOD(VMStack, getThreadStackTrace, "(Ljava/lang/Thread;)[Ljava/lang/StackTraceElement;"),
   FAST_NATIVE_METHOD(VMStack, getAnnotatedThreadStackTrace, "(Ljava/lang/Thread;)[Ldalvik/system/AnnotatedStackTraceElement;"),
 };

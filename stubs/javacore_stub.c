@@ -9,6 +9,14 @@
 #include <sys/stat.h>
 #include <stdio.h>
 #include <limits.h>
+#include <stdint.h>
+#include <dlfcn.h>
+#include <pthread.h>
+#include <zlib.h>
+
+#ifndef DEF_MEM_LEVEL
+#define DEF_MEM_LEVEL 8
+#endif
 
 /* Tolerant RegisterNatives — skip methods that don't exist in this DEX version */
 static void registerNativesOrSkip(JNIEnv* env, jclass clazz,
@@ -26,8 +34,25 @@ static int getFd(JNIEnv* env, jobject fdObj) {
     if (!fdObj) return -1;
     jclass fdCls = (*env)->GetObjectClass(env, fdObj);
     jfieldID descField = (*env)->GetFieldID(env, fdCls, "descriptor", "I");
+    if (!descField) {
+        (*env)->ExceptionClear(env);
+        descField = (*env)->GetFieldID(env, fdCls, "fd", "I");
+    }
     if (!descField) return -1;
     return (*env)->GetIntField(env, fdObj, descField);
+}
+
+static void setFd(JNIEnv* env, jobject fdObj, jint fd) {
+    if (!fdObj) return;
+    jclass fdCls = (*env)->GetObjectClass(env, fdObj);
+    jfieldID descField = (*env)->GetFieldID(env, fdCls, "descriptor", "I");
+    if (!descField) {
+        (*env)->ExceptionClear(env);
+        descField = (*env)->GetFieldID(env, fdCls, "fd", "I");
+    }
+    if (descField) {
+        (*env)->SetIntField(env, fdObj, descField, fd);
+    }
 }
 
 static void throwErrnoException(JNIEnv* env, const char* functionName, int errnum) {
@@ -38,6 +63,29 @@ static void throwErrnoException(JNIEnv* env, const char* functionName, int errnu
     jstring name = (*env)->NewStringUTF(env, functionName);
     jobject exc = (*env)->NewObject(env, cls, ctor, name, (jint)errnum);
     if (exc) (*env)->Throw(env, (jthrowable)exc);
+}
+
+static void throwIOException(JNIEnv* env, const char* functionName, int errnum) {
+    jclass cls = (*env)->FindClass(env, "java/io/IOException");
+    if (!cls) return;
+    char message[160];
+    snprintf(message, sizeof(message), "%s failed: %s", functionName, strerror(errnum));
+    (*env)->ThrowNew(env, cls, message);
+}
+
+static void throwOutOfMemoryError(JNIEnv* env, const char* message) {
+    jclass cls = (*env)->FindClass(env, "java/lang/OutOfMemoryError");
+    if (cls) (*env)->ThrowNew(env, cls, message);
+}
+
+static void throwZipException(JNIEnv* env, const char* message) {
+    jclass cls = (*env)->FindClass(env, "java/util/zip/ZipException");
+    if (cls) (*env)->ThrowNew(env, cls, message);
+}
+
+static void throwDataFormatException(JNIEnv* env, const char* message) {
+    jclass cls = (*env)->FindClass(env, "java/util/zip/DataFormatException");
+    if (cls) (*env)->ThrowNew(env, cls, message);
 }
 
 /* ==================== libcore.io.Linux native methods ==================== */
@@ -175,9 +223,7 @@ static jobject linux_open(JNIEnv* env, jobject thiz, jstring jpath, jint flags, 
     if (!ctor) return NULL;
     jobject fdObj = (*env)->NewObject(env, fdCls, ctor);
     if (!fdObj) return NULL;
-    jfieldID descField = (*env)->GetFieldID(env, fdCls, "descriptor", "I");
-    if (!descField) return NULL;
-    (*env)->SetIntField(env, fdObj, descField, fd);
+    setFd(env, fdObj, fd);
     return fdObj;
 }
 
@@ -209,6 +255,34 @@ static jobject linux_fstat(JNIEnv* env, jobject thiz, jobject fdObj) {
         (jint)sb.st_uid, (jint)sb.st_gid, (jlong)sb.st_rdev, (jlong)sb.st_size,
         (jlong)sb.st_atime, (jlong)sb.st_mtime, (jlong)sb.st_ctime,
         (jlong)sb.st_blksize, (jlong)sb.st_blocks);
+}
+
+/* sun.nio.ch.FileKey: key for shared FileChannel locks */
+static void FileKey_initIDs(JNIEnv* env, jclass cls) {
+    (void)env;
+    (void)cls;
+}
+
+static void FileKey_init(JNIEnv* env, jobject thiz, jobject fdObj) {
+    int fd = getFd(env, fdObj);
+    if (fd < 0) {
+        throwIOException(env, "fstat", EBADF);
+        return;
+    }
+
+    struct stat sb;
+    if (fstat(fd, &sb) < 0) {
+        throwIOException(env, "fstat", errno);
+        return;
+    }
+
+    jclass cls = (*env)->GetObjectClass(env, thiz);
+    jfieldID stDev = (*env)->GetFieldID(env, cls, "st_dev", "J");
+    if (!stDev) return;
+    jfieldID stIno = (*env)->GetFieldID(env, cls, "st_ino", "J");
+    if (!stIno) return;
+    (*env)->SetLongField(env, thiz, stDev, (jlong)sb.st_dev);
+    (*env)->SetLongField(env, thiz, stIno, (jlong)sb.st_ino);
 }
 
 /* stat(String path) -> StructStat */
@@ -366,8 +440,7 @@ static jobject linux_dup(JNIEnv* env, jobject thiz, jobject fdObj) {
     if (!ctor) return NULL;
     jobject newFdObj = (*env)->NewObject(env, fdCls, ctor);
     if (!newFdObj) return NULL;
-    jfieldID descField = (*env)->GetFieldID(env, fdCls, "descriptor", "I");
-    if (descField) (*env)->SetIntField(env, newFdObj, descField, newfd);
+    setFd(env, newFdObj, newfd);
     return newFdObj;
 }
 
@@ -385,8 +458,7 @@ static jobject linux_dup2(JNIEnv* env, jobject thiz, jobject fdObj, jint newfd) 
     if (!ctor) return NULL;
     jobject newFdObj = (*env)->NewObject(env, fdCls, ctor);
     if (!newFdObj) return NULL;
-    jfieldID descField = (*env)->GetFieldID(env, fdCls, "descriptor", "I");
-    if (descField) (*env)->SetIntField(env, newFdObj, descField, result);
+    setFd(env, newFdObj, result);
     return newFdObj;
 }
 
@@ -895,6 +967,260 @@ static jboolean NativeBN_BN_primality_test(JNIEnv* env, jclass cls, jlong candid
     return JNI_FALSE; /* not prime — safe default */
 }
 
+/* ==================== Android 15 libcore.math.NativeBN ==================== */
+/*
+ * Android 15 moved BigInteger's native surface to libcore.math.NativeBN and
+ * reduced it to these seven methods. Keep the older java.math.NativeBN stubs
+ * above for legacy boot class paths, but back the Android 15 ABI with the
+ * platform OpenSSL implementation so certificate RSA operations are not
+ * truncated to the legacy stub's machine-word representation.
+ *
+ * Resolve OpenSSL dynamically: libart is shared across bridge configurations,
+ * while OpenHarmony supplies libcrypto_openssl.z.so at the platform boundary.
+ */
+typedef struct oh_bignum_st OhBignum;
+typedef struct oh_bn_ctx_st OhBnCtx;
+
+typedef struct {
+    void* handle;
+    OhBignum* (*bn_new)(void);
+    void (*bn_free)(OhBignum*);
+    OhBignum* (*bin2bn)(const unsigned char*, int, OhBignum*);
+    int (*bn2bin)(const OhBignum*, unsigned char*);
+    int (*num_bits)(const OhBignum*);
+    void (*set_negative)(OhBignum*, int);
+    OhBnCtx* (*ctx_new)(void);
+    void (*ctx_free)(OhBnCtx*);
+    int (*mul)(OhBignum*, const OhBignum*, const OhBignum*, OhBnCtx*);
+    int (*div)(OhBignum*, OhBignum*, const OhBignum*, const OhBignum*, OhBnCtx*);
+    int (*mod_exp)(OhBignum*, const OhBignum*, const OhBignum*, const OhBignum*, OhBnCtx*);
+    const char* error;
+} OhNativeBnApi;
+
+static OhNativeBnApi gOhNativeBn;
+static pthread_once_t gOhNativeBnOnce = PTHREAD_ONCE_INIT;
+
+static void initOhNativeBn(void) {
+    gOhNativeBn.handle = dlopen("libcrypto_openssl.z.so", RTLD_NOW | RTLD_LOCAL);
+    if (!gOhNativeBn.handle) {
+        gOhNativeBn.error = dlerror();
+        return;
+    }
+
+#define LOAD_OH_BN(field, symbol)                                                \
+    do {                                                                         \
+        *(void**)(&gOhNativeBn.field) = dlsym(gOhNativeBn.handle, symbol);       \
+        if (!gOhNativeBn.field) {                                                 \
+            gOhNativeBn.error = "libcrypto_openssl.z.so is missing " symbol;    \
+            return;                                                              \
+        }                                                                        \
+    } while (0)
+
+    LOAD_OH_BN(bn_new, "BN_new");
+    LOAD_OH_BN(bn_free, "BN_free");
+    LOAD_OH_BN(bin2bn, "BN_bin2bn");
+    LOAD_OH_BN(bn2bin, "BN_bn2bin");
+    LOAD_OH_BN(num_bits, "BN_num_bits");
+    LOAD_OH_BN(set_negative, "BN_set_negative");
+    LOAD_OH_BN(ctx_new, "BN_CTX_new");
+    LOAD_OH_BN(ctx_free, "BN_CTX_free");
+    LOAD_OH_BN(mul, "BN_mul");
+    LOAD_OH_BN(div, "BN_div");
+    LOAD_OH_BN(mod_exp, "BN_mod_exp");
+#undef LOAD_OH_BN
+}
+
+static void throwNativeBnException(JNIEnv* env, const char* className, const char* message) {
+    jclass cls = (*env)->FindClass(env, className);
+    if (cls) {
+        (*env)->ThrowNew(env, cls, message);
+        (*env)->DeleteLocalRef(env, cls);
+    }
+}
+
+static jboolean ensureOhNativeBn(JNIEnv* env) {
+    pthread_once(&gOhNativeBnOnce, initOhNativeBn);
+    if (!gOhNativeBn.error && gOhNativeBn.mod_exp) return JNI_TRUE;
+    throwNativeBnException(env, "java/lang/UnsatisfiedLinkError",
+            gOhNativeBn.error ? gOhNativeBn.error : "OpenHarmony OpenSSL NativeBN is unavailable");
+    return JNI_FALSE;
+}
+
+static OhBignum* toOhBignum(jlong address) {
+    return (OhBignum*)(uintptr_t)address;
+}
+
+static jboolean requireOhBignum(JNIEnv* env, jlong address) {
+    if (address != 0) return JNI_TRUE;
+    throwNativeBnException(env, "java/lang/NullPointerException", "null BIGNUM pointer");
+    return JNI_FALSE;
+}
+
+static void throwOhBnOperationFailed(JNIEnv* env) {
+    throwNativeBnException(env, "java/lang/ArithmeticException", "BIGNUM operation failed");
+}
+
+static jlong LibcoreNativeBN_BN_new(JNIEnv* env, jclass cls) {
+    (void)cls;
+    if (!ensureOhNativeBn(env)) return 0;
+    OhBignum* result = gOhNativeBn.bn_new();
+    if (!result) {
+        throwNativeBnException(env, "java/lang/OutOfMemoryError", "BN_new failed");
+        return 0;
+    }
+    return (jlong)(uintptr_t)result;
+}
+
+static void LibcoreNativeBN_BN_free(JNIEnv* env, jclass cls, jlong a) {
+    (void)cls;
+    if (!ensureOhNativeBn(env)) return;
+    gOhNativeBn.bn_free(toOhBignum(a));
+}
+
+static void LibcoreNativeBN_litEndInts2bn(JNIEnv* env, jclass cls, jintArray ints,
+        jint len, jboolean neg, jlong retAddress) {
+    (void)cls;
+    if (!ensureOhNativeBn(env) || !requireOhBignum(env, retAddress)) return;
+    if (!ints) {
+        throwNativeBnException(env, "java/lang/NullPointerException", "ints == null");
+        return;
+    }
+
+    jsize arrayLen = (*env)->GetArrayLength(env, ints);
+    if (len < 0 || len > arrayLen || len > INT_MAX / (jint)sizeof(jint)) {
+        throwNativeBnException(env, "java/lang/IllegalArgumentException", "invalid NativeBN word count");
+        return;
+    }
+
+    size_t numBytes = (size_t)len * sizeof(jint);
+    unsigned char zero = 0;
+    unsigned char* bigEndian = numBytes ? (unsigned char*)malloc(numBytes) : &zero;
+    jint* words = len ? (jint*)malloc((size_t)len * sizeof(jint)) : NULL;
+    if ((numBytes && !bigEndian) || (len && !words)) {
+        if (numBytes && bigEndian) free(bigEndian);
+        free(words);
+        throwNativeBnException(env, "java/lang/OutOfMemoryError", "NativeBN conversion allocation failed");
+        return;
+    }
+
+    if (len) {
+        (*env)->GetIntArrayRegion(env, ints, 0, len, words);
+        if ((*env)->ExceptionCheck(env)) {
+            free(bigEndian);
+            free(words);
+            return;
+        }
+        for (jint wordIndex = 0; wordIndex < len; ++wordIndex) {
+            uint32_t word = (uint32_t)words[wordIndex];
+            for (unsigned int byteIndex = 0; byteIndex < sizeof(jint); ++byteIndex) {
+                size_t littleByteIndex = (size_t)wordIndex * sizeof(jint) + byteIndex;
+                bigEndian[numBytes - 1 - littleByteIndex] =
+                        (unsigned char)(word >> (8u * byteIndex));
+            }
+        }
+    }
+
+    OhBignum* result = gOhNativeBn.bin2bn(bigEndian, (int)numBytes, toOhBignum(retAddress));
+    if (numBytes) free(bigEndian);
+    free(words);
+    if (!result) {
+        throwOhBnOperationFailed(env);
+        return;
+    }
+    gOhNativeBn.set_negative(result, neg ? 1 : 0);
+}
+
+static jintArray LibcoreNativeBN_bn2litEndInts(JNIEnv* env, jclass cls, jlong aAddress) {
+    (void)cls;
+    if (!ensureOhNativeBn(env) || !requireOhBignum(env, aAddress)) return NULL;
+
+    OhBignum* a = toOhBignum(aAddress);
+    int bits = gOhNativeBn.num_bits(a);
+    if (bits < 0) {
+        throwOhBnOperationFailed(env);
+        return NULL;
+    }
+    size_t numBytes = ((size_t)bits + 7u) / 8u;
+    size_t intLen = (numBytes + sizeof(jint) - 1u) / sizeof(jint);
+    if (intLen > (size_t)INT_MAX) {
+        throwNativeBnException(env, "java/lang/OutOfMemoryError", "NativeBN result is too large");
+        return NULL;
+    }
+
+    jintArray result = (*env)->NewIntArray(env, (jsize)intLen);
+    if (!result || intLen == 0) return result;
+
+    unsigned char* bigEndian = (unsigned char*)malloc(numBytes);
+    jint* words = (jint*)calloc(intLen, sizeof(jint));
+    if (!bigEndian || !words) {
+        free(bigEndian);
+        free(words);
+        throwNativeBnException(env, "java/lang/OutOfMemoryError", "NativeBN conversion allocation failed");
+        return NULL;
+    }
+    if (gOhNativeBn.bn2bin(a, bigEndian) != (int)numBytes) {
+        free(bigEndian);
+        free(words);
+        throwOhBnOperationFailed(env);
+        return NULL;
+    }
+
+    for (size_t littleByteIndex = 0; littleByteIndex < numBytes; ++littleByteIndex) {
+        unsigned char value = bigEndian[numBytes - 1u - littleByteIndex];
+        size_t wordIndex = littleByteIndex / sizeof(jint);
+        unsigned int shift = (unsigned int)(8u * (littleByteIndex % sizeof(jint)));
+        words[wordIndex] = (jint)((uint32_t)words[wordIndex] | ((uint32_t)value << shift));
+    }
+    (*env)->SetIntArrayRegion(env, result, 0, (jsize)intLen, words);
+    free(bigEndian);
+    free(words);
+    return result;
+}
+
+static OhBnCtx* newOhBnContext(JNIEnv* env) {
+    OhBnCtx* ctx = gOhNativeBn.ctx_new();
+    if (!ctx) throwNativeBnException(env, "java/lang/OutOfMemoryError", "BN_CTX_new failed");
+    return ctx;
+}
+
+static void LibcoreNativeBN_BN_mul(JNIEnv* env, jclass cls, jlong r, jlong a, jlong b) {
+    (void)cls;
+    if (!ensureOhNativeBn(env) || !requireOhBignum(env, r) ||
+            !requireOhBignum(env, a) || !requireOhBignum(env, b)) return;
+    OhBnCtx* ctx = newOhBnContext(env);
+    if (!ctx) return;
+    int ok = gOhNativeBn.mul(toOhBignum(r), toOhBignum(a), toOhBignum(b), ctx);
+    gOhNativeBn.ctx_free(ctx);
+    if (!ok) throwOhBnOperationFailed(env);
+}
+
+static void LibcoreNativeBN_BN_div(JNIEnv* env, jclass cls, jlong quotient, jlong remainder,
+        jlong numerator, jlong divisor) {
+    (void)cls;
+    if (!ensureOhNativeBn(env) || !requireOhBignum(env, numerator) ||
+            !requireOhBignum(env, divisor)) return;
+    OhBnCtx* ctx = newOhBnContext(env);
+    if (!ctx) return;
+    int ok = gOhNativeBn.div(toOhBignum(quotient), toOhBignum(remainder),
+            toOhBignum(numerator), toOhBignum(divisor), ctx);
+    gOhNativeBn.ctx_free(ctx);
+    if (!ok) throwOhBnOperationFailed(env);
+}
+
+static void LibcoreNativeBN_BN_mod_exp(JNIEnv* env, jclass cls, jlong r, jlong a,
+        jlong exponent, jlong modulus) {
+    (void)cls;
+    if (!ensureOhNativeBn(env) || !requireOhBignum(env, r) ||
+            !requireOhBignum(env, a) || !requireOhBignum(env, exponent) ||
+            !requireOhBignum(env, modulus)) return;
+    OhBnCtx* ctx = newOhBnContext(env);
+    if (!ctx) return;
+    int ok = gOhNativeBn.mod_exp(toOhBignum(r), toOhBignum(a), toOhBignum(exponent),
+            toOhBignum(modulus), ctx);
+    gOhNativeBn.ctx_free(ctx);
+    if (!ok) throwOhBnOperationFailed(env);
+}
+
 /* ==================== ICU / LocaleData stubs ==================== */
 
 /* Helper to set a String field on LocaleData */
@@ -925,9 +1251,20 @@ static void ld_setStringArray(JNIEnv* env, jobject ld, jclass cls, const char* n
     if (!f) { (*env)->ExceptionClear(env); return; }
     jclass strCls = (*env)->FindClass(env, "java/lang/String");
     jobjectArray arr = (*env)->NewObjectArray(env, count, strCls, NULL);
-    for (int i = 0; i < count; i++)
-        (*env)->SetObjectArrayElement(env, arr, i, (*env)->NewStringUTF(env, vals[i]));
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        return;
+    }
+    (void)vals;
+    /* The standalone runtime can carry duplicate java.lang.String class objects across
+       native/JNI boundaries. Repeated SetObjectArrayElement calls for LocaleData calendar
+       name arrays therefore trip class-identity ArrayStoreExceptions and can destabilize
+       the native thread. The McD startup path needs the scalar number/currency fields below,
+       so keep the String[] field shape here and leave the calendar-name entries unset. */
     (*env)->SetObjectField(env, ld, f, arr);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+    }
 }
 
 /* getBestDateTimePatternNative(skeleton, languageTag) → pattern string */
@@ -1074,6 +1411,411 @@ static jint Thread_nicenessForPriority(JNIEnv* env, jclass cls, jint priority) {
     return kNiceValues[priority - 1];
 }
 
+/* java.util.zip CRC/Adler support. Avoid GetPrimitiveArrayCritical here: the
+ * standalone runtime can move through early multidex code before critical-array
+ * pinning is fully safe. */
+static jint CRC32_update(JNIEnv* env, jclass cls, jint crc, jint b) {
+    unsigned char one = (unsigned char)b;
+    return (jint)crc32((uLong)crc, &one, 1);
+}
+
+static jint CRC32_updateBytes(JNIEnv* env, jclass cls, jint crc,
+                              jbyteArray array, jint off, jint len) {
+    if (!array || len <= 0) return crc;
+    jsize array_len = (*env)->GetArrayLength(env, array);
+    if (off < 0 || len < 0 || off > array_len || len > array_len - off) return crc;
+    jbyte* bytes = (*env)->GetByteArrayElements(env, array, NULL);
+    if (!bytes) return crc;
+    jint out = (jint)crc32((uLong)crc, (const Bytef*)(bytes + off), (uInt)len);
+    (*env)->ReleaseByteArrayElements(env, array, bytes, JNI_ABORT);
+    return out;
+}
+
+static jint CRC32_updateByteBuffer(JNIEnv* env, jclass cls, jint crc,
+                                   jlong address, jint off, jint len) {
+    if (address == 0 || len <= 0) return crc;
+    const Bytef* bytes = (const Bytef*)((uintptr_t)address + (uintptr_t)off);
+    return (jint)crc32((uLong)crc, bytes, (uInt)len);
+}
+
+static jint Adler32_update(JNIEnv* env, jclass cls, jint adler, jint b) {
+    unsigned char one = (unsigned char)b;
+    return (jint)adler32((uLong)adler, &one, 1);
+}
+
+static jint Adler32_updateBytes(JNIEnv* env, jclass cls, jint adler,
+                                jbyteArray array, jint off, jint len) {
+    if (!array || len <= 0) return adler;
+    jsize array_len = (*env)->GetArrayLength(env, array);
+    if (off < 0 || len < 0 || off > array_len || len > array_len - off) return adler;
+    jbyte* bytes = (*env)->GetByteArrayElements(env, array, NULL);
+    if (!bytes) return adler;
+    jint out = (jint)adler32((uLong)adler, (const Bytef*)(bytes + off), (uInt)len);
+    (*env)->ReleaseByteArrayElements(env, array, bytes, JNI_ABORT);
+    return out;
+}
+
+static jint Adler32_updateByteBuffer(JNIEnv* env, jclass cls, jint adler,
+                                     jlong address, jint off, jint len) {
+    if (address == 0 || len <= 0) return adler;
+    const Bytef* bytes = (const Bytef*)((uintptr_t)address + (uintptr_t)off);
+    return (jint)adler32((uLong)adler, bytes, (uInt)len);
+}
+
+/* java.util.zip Deflater/Inflater support for multidex ZIP extraction. Android
+ * core-oj packs native progress into a long: low 31 bits are input consumed,
+ * next 31 bits are output produced, bit 62 is finished, bit 63 is the
+ * class-specific "pending parameter/dictionary" flag. */
+static jlong zipPackResult(jint consumed, jint produced, int bit62, int bit63) {
+    uint64_t packed = ((uint64_t)consumed & 0x7fffffffULL) |
+                      (((uint64_t)produced & 0x7fffffffULL) << 31);
+    if (bit62) packed |= (1ULL << 62);
+    if (bit63) packed |= (1ULL << 63);
+    return (jlong)packed;
+}
+
+static z_stream* zipStreamFromAddress(jlong addr) {
+    return (z_stream*)(uintptr_t)addr;
+}
+
+static const char* zipMessage(z_stream* zs, const char* fallback) {
+    return (zs && zs->msg) ? zs->msg : fallback;
+}
+
+static void setIntFieldIfPresent(JNIEnv* env, jobject obj, const char* name, jint value) {
+    if (!obj) return;
+    jclass cls = (*env)->GetObjectClass(env, obj);
+    if (!cls) return;
+    jfieldID field = (*env)->GetFieldID(env, cls, name, "I");
+    if (!field) {
+        (*env)->ExceptionClear(env);
+        return;
+    }
+    (*env)->SetIntField(env, obj, field, value);
+}
+
+static jlong Deflater_init(JNIEnv* env, jclass cls, jint level, jint strategy, jboolean nowrap) {
+    z_stream* zs = (z_stream*)calloc(1, sizeof(z_stream));
+    if (!zs) {
+        throwOutOfMemoryError(env, "zlib deflate stream allocation failed");
+        return 0;
+    }
+
+    int windowBits = nowrap ? -MAX_WBITS : MAX_WBITS;
+    int rc = deflateInit2(zs, level, Z_DEFLATED, windowBits, DEF_MEM_LEVEL, strategy);
+    if (rc != Z_OK) {
+        const char* msg = zipMessage(zs, "deflateInit2 failed");
+        deflateEnd(zs);
+        free(zs);
+        throwZipException(env, msg);
+        return 0;
+    }
+    return (jlong)(uintptr_t)zs;
+}
+
+static void Deflater_setDictionary(JNIEnv* env, jclass cls,
+                                   jlong addr, jbyteArray array, jint off, jint len) {
+    z_stream* zs = zipStreamFromAddress(addr);
+    if (!zs || !array || len <= 0) return;
+    jsize arrayLen = (*env)->GetArrayLength(env, array);
+    if (off < 0 || len < 0 || off > arrayLen || len > arrayLen - off) return;
+    jbyte* bytes = (*env)->GetByteArrayElements(env, array, NULL);
+    if (!bytes) return;
+    int rc = deflateSetDictionary(zs, (const Bytef*)(bytes + off), (uInt)len);
+    (*env)->ReleaseByteArrayElements(env, array, bytes, JNI_ABORT);
+    if (rc != Z_OK) throwZipException(env, zipMessage(zs, "deflateSetDictionary failed"));
+}
+
+static void Deflater_setDictionaryBuffer(JNIEnv* env, jclass cls,
+                                         jlong addr, jlong buffer, jint len) {
+    z_stream* zs = zipStreamFromAddress(addr);
+    if (!zs || buffer == 0 || len <= 0) return;
+    int rc = deflateSetDictionary(zs, (const Bytef*)(uintptr_t)buffer, (uInt)len);
+    if (rc != Z_OK) throwZipException(env, zipMessage(zs, "deflateSetDictionary failed"));
+}
+
+static jlong Deflater_deflateCommon(JNIEnv* env, z_stream* zs,
+                                    Bytef* in, jint inLen,
+                                    Bytef* out, jint outLen,
+                                    jint flush, jint params) {
+    if (!zs) {
+        throwZipException(env, "deflater stream is closed");
+        return 0;
+    }
+    if (inLen < 0) inLen = 0;
+    if (outLen < 0) outLen = 0;
+
+    uLong oldIn = zs->total_in;
+    uLong oldOut = zs->total_out;
+    zs->next_in = inLen > 0 ? in : Z_NULL;
+    zs->avail_in = (uInt)inLen;
+    zs->next_out = outLen > 0 ? out : Z_NULL;
+    zs->avail_out = (uInt)outLen;
+
+    int paramsPending = 0;
+    if (params != 0) {
+        int strategy = (params >> 1) & 0x3;
+        int level = params >> 3;
+        int rc = deflateParams(zs, level, strategy);
+        if (rc == Z_BUF_ERROR) {
+            paramsPending = 1;
+        } else if (rc != Z_OK) {
+            throwZipException(env, zipMessage(zs, "deflateParams failed"));
+            return 0;
+        }
+    }
+
+    int rc = deflate(zs, flush);
+    if (rc != Z_OK && rc != Z_STREAM_END && rc != Z_BUF_ERROR) {
+        throwZipException(env, zipMessage(zs, "deflate failed"));
+        return 0;
+    }
+
+    jint consumed = (jint)(zs->total_in - oldIn);
+    jint produced = (jint)(zs->total_out - oldOut);
+    return zipPackResult(consumed, produced, rc == Z_STREAM_END, paramsPending);
+}
+
+static jlong Deflater_deflateBytesBytes(JNIEnv* env, jobject thiz, jlong addr,
+                                        jbyteArray inArray, jint inOff, jint inLen,
+                                        jbyteArray outArray, jint outOff, jint outLen,
+                                        jint flush, jint params) {
+    jbyte* inBytes = NULL;
+    jbyte* outBytes = NULL;
+    if (inArray && inLen > 0) {
+        inBytes = (*env)->GetByteArrayElements(env, inArray, NULL);
+        if (!inBytes) return 0;
+    }
+    if (outArray && outLen > 0) {
+        outBytes = (*env)->GetByteArrayElements(env, outArray, NULL);
+        if (!outBytes) {
+            if (inBytes) (*env)->ReleaseByteArrayElements(env, inArray, inBytes, JNI_ABORT);
+            return 0;
+        }
+    }
+    jlong result = Deflater_deflateCommon(env, zipStreamFromAddress(addr),
+                                          inBytes ? (Bytef*)(inBytes + inOff) : NULL, inLen,
+                                          outBytes ? (Bytef*)(outBytes + outOff) : NULL, outLen,
+                                          flush, params);
+    if (inBytes) (*env)->ReleaseByteArrayElements(env, inArray, inBytes, JNI_ABORT);
+    if (outBytes) (*env)->ReleaseByteArrayElements(env, outArray, outBytes, 0);
+    return result;
+}
+
+static jlong Deflater_deflateBytesBuffer(JNIEnv* env, jobject thiz, jlong addr,
+                                         jbyteArray inArray, jint inOff, jint inLen,
+                                         jlong outAddress, jint outLen,
+                                         jint flush, jint params) {
+    jbyte* inBytes = NULL;
+    if (inArray && inLen > 0) {
+        inBytes = (*env)->GetByteArrayElements(env, inArray, NULL);
+        if (!inBytes) return 0;
+    }
+    jlong result = Deflater_deflateCommon(env, zipStreamFromAddress(addr),
+                                          inBytes ? (Bytef*)(inBytes + inOff) : NULL, inLen,
+                                          outAddress ? (Bytef*)(uintptr_t)outAddress : NULL, outLen,
+                                          flush, params);
+    if (inBytes) (*env)->ReleaseByteArrayElements(env, inArray, inBytes, JNI_ABORT);
+    return result;
+}
+
+static jlong Deflater_deflateBufferBytes(JNIEnv* env, jobject thiz, jlong addr,
+                                         jlong inAddress, jint inLen,
+                                         jbyteArray outArray, jint outOff, jint outLen,
+                                         jint flush, jint params) {
+    jbyte* outBytes = NULL;
+    if (outArray && outLen > 0) {
+        outBytes = (*env)->GetByteArrayElements(env, outArray, NULL);
+        if (!outBytes) return 0;
+    }
+    jlong result = Deflater_deflateCommon(env, zipStreamFromAddress(addr),
+                                          inAddress ? (Bytef*)(uintptr_t)inAddress : NULL, inLen,
+                                          outBytes ? (Bytef*)(outBytes + outOff) : NULL, outLen,
+                                          flush, params);
+    if (outBytes) (*env)->ReleaseByteArrayElements(env, outArray, outBytes, 0);
+    return result;
+}
+
+static jlong Deflater_deflateBufferBuffer(JNIEnv* env, jobject thiz, jlong addr,
+                                          jlong inAddress, jint inLen,
+                                          jlong outAddress, jint outLen,
+                                          jint flush, jint params) {
+    return Deflater_deflateCommon(env, zipStreamFromAddress(addr),
+                                  inAddress ? (Bytef*)(uintptr_t)inAddress : NULL, inLen,
+                                  outAddress ? (Bytef*)(uintptr_t)outAddress : NULL, outLen,
+                                  flush, params);
+}
+
+static jint Deflater_getAdler(JNIEnv* env, jclass cls, jlong addr) {
+    z_stream* zs = zipStreamFromAddress(addr);
+    return zs ? (jint)zs->adler : 0;
+}
+
+static void Deflater_reset(JNIEnv* env, jclass cls, jlong addr) {
+    z_stream* zs = zipStreamFromAddress(addr);
+    if (zs) deflateReset(zs);
+}
+
+static void Deflater_end(JNIEnv* env, jclass cls, jlong addr) {
+    z_stream* zs = zipStreamFromAddress(addr);
+    if (zs) {
+        deflateEnd(zs);
+        free(zs);
+    }
+}
+
+static void Inflater_initIDs(JNIEnv* env, jclass cls) { }
+
+static jlong Inflater_init(JNIEnv* env, jclass cls, jboolean nowrap) {
+    z_stream* zs = (z_stream*)calloc(1, sizeof(z_stream));
+    if (!zs) {
+        throwOutOfMemoryError(env, "zlib inflate stream allocation failed");
+        return 0;
+    }
+    int windowBits = nowrap ? -MAX_WBITS : MAX_WBITS;
+    int rc = inflateInit2(zs, windowBits);
+    if (rc != Z_OK) {
+        const char* msg = zipMessage(zs, "inflateInit2 failed");
+        inflateEnd(zs);
+        free(zs);
+        throwZipException(env, msg);
+        return 0;
+    }
+    return (jlong)(uintptr_t)zs;
+}
+
+static void Inflater_setDictionary(JNIEnv* env, jclass cls,
+                                   jlong addr, jbyteArray array, jint off, jint len) {
+    z_stream* zs = zipStreamFromAddress(addr);
+    if (!zs || !array || len <= 0) return;
+    jsize arrayLen = (*env)->GetArrayLength(env, array);
+    if (off < 0 || len < 0 || off > arrayLen || len > arrayLen - off) return;
+    jbyte* bytes = (*env)->GetByteArrayElements(env, array, NULL);
+    if (!bytes) return;
+    int rc = inflateSetDictionary(zs, (const Bytef*)(bytes + off), (uInt)len);
+    (*env)->ReleaseByteArrayElements(env, array, bytes, JNI_ABORT);
+    if (rc != Z_OK) throwDataFormatException(env, zipMessage(zs, "inflateSetDictionary failed"));
+}
+
+static void Inflater_setDictionaryBuffer(JNIEnv* env, jclass cls,
+                                         jlong addr, jlong buffer, jint len) {
+    z_stream* zs = zipStreamFromAddress(addr);
+    if (!zs || buffer == 0 || len <= 0) return;
+    int rc = inflateSetDictionary(zs, (const Bytef*)(uintptr_t)buffer, (uInt)len);
+    if (rc != Z_OK) throwDataFormatException(env, zipMessage(zs, "inflateSetDictionary failed"));
+}
+
+static jlong Inflater_inflateCommon(JNIEnv* env, jobject thiz, z_stream* zs,
+                                    Bytef* in, jint inLen,
+                                    Bytef* out, jint outLen) {
+    if (!zs) {
+        throwDataFormatException(env, "inflater stream is closed");
+        return 0;
+    }
+    if (inLen < 0) inLen = 0;
+    if (outLen < 0) outLen = 0;
+
+    uLong oldIn = zs->total_in;
+    uLong oldOut = zs->total_out;
+    zs->next_in = inLen > 0 ? in : Z_NULL;
+    zs->avail_in = (uInt)inLen;
+    zs->next_out = outLen > 0 ? out : Z_NULL;
+    zs->avail_out = (uInt)outLen;
+
+    int rc = inflate(zs, Z_PARTIAL_FLUSH);
+    jint consumed = (jint)(zs->total_in - oldIn);
+    jint produced = (jint)(zs->total_out - oldOut);
+
+    if (rc == Z_DATA_ERROR || rc == Z_MEM_ERROR || rc == Z_STREAM_ERROR) {
+        setIntFieldIfPresent(env, thiz, "inputConsumed", consumed);
+        setIntFieldIfPresent(env, thiz, "outputConsumed", produced);
+        throwDataFormatException(env, zipMessage(zs, "inflate failed"));
+        return 0;
+    }
+
+    return zipPackResult(consumed, produced, rc == Z_STREAM_END, rc == Z_NEED_DICT);
+}
+
+static jlong Inflater_inflateBytesBytes(JNIEnv* env, jobject thiz, jlong addr,
+                                        jbyteArray inArray, jint inOff, jint inLen,
+                                        jbyteArray outArray, jint outOff, jint outLen) {
+    jbyte* inBytes = NULL;
+    jbyte* outBytes = NULL;
+    if (inArray && inLen > 0) {
+        inBytes = (*env)->GetByteArrayElements(env, inArray, NULL);
+        if (!inBytes) return 0;
+    }
+    if (outArray && outLen > 0) {
+        outBytes = (*env)->GetByteArrayElements(env, outArray, NULL);
+        if (!outBytes) {
+            if (inBytes) (*env)->ReleaseByteArrayElements(env, inArray, inBytes, JNI_ABORT);
+            return 0;
+        }
+    }
+    jlong result = Inflater_inflateCommon(env, thiz, zipStreamFromAddress(addr),
+                                          inBytes ? (Bytef*)(inBytes + inOff) : NULL, inLen,
+                                          outBytes ? (Bytef*)(outBytes + outOff) : NULL, outLen);
+    if (inBytes) (*env)->ReleaseByteArrayElements(env, inArray, inBytes, JNI_ABORT);
+    if (outBytes) (*env)->ReleaseByteArrayElements(env, outArray, outBytes, 0);
+    return result;
+}
+
+static jlong Inflater_inflateBytesBuffer(JNIEnv* env, jobject thiz, jlong addr,
+                                         jbyteArray inArray, jint inOff, jint inLen,
+                                         jlong outAddress, jint outLen) {
+    jbyte* inBytes = NULL;
+    if (inArray && inLen > 0) {
+        inBytes = (*env)->GetByteArrayElements(env, inArray, NULL);
+        if (!inBytes) return 0;
+    }
+    jlong result = Inflater_inflateCommon(env, thiz, zipStreamFromAddress(addr),
+                                          inBytes ? (Bytef*)(inBytes + inOff) : NULL, inLen,
+                                          outAddress ? (Bytef*)(uintptr_t)outAddress : NULL, outLen);
+    if (inBytes) (*env)->ReleaseByteArrayElements(env, inArray, inBytes, JNI_ABORT);
+    return result;
+}
+
+static jlong Inflater_inflateBufferBytes(JNIEnv* env, jobject thiz, jlong addr,
+                                         jlong inAddress, jint inLen,
+                                         jbyteArray outArray, jint outOff, jint outLen) {
+    jbyte* outBytes = NULL;
+    if (outArray && outLen > 0) {
+        outBytes = (*env)->GetByteArrayElements(env, outArray, NULL);
+        if (!outBytes) return 0;
+    }
+    jlong result = Inflater_inflateCommon(env, thiz, zipStreamFromAddress(addr),
+                                          inAddress ? (Bytef*)(uintptr_t)inAddress : NULL, inLen,
+                                          outBytes ? (Bytef*)(outBytes + outOff) : NULL, outLen);
+    if (outBytes) (*env)->ReleaseByteArrayElements(env, outArray, outBytes, 0);
+    return result;
+}
+
+static jlong Inflater_inflateBufferBuffer(JNIEnv* env, jobject thiz, jlong addr,
+                                          jlong inAddress, jint inLen,
+                                          jlong outAddress, jint outLen) {
+    return Inflater_inflateCommon(env, thiz, zipStreamFromAddress(addr),
+                                  inAddress ? (Bytef*)(uintptr_t)inAddress : NULL, inLen,
+                                  outAddress ? (Bytef*)(uintptr_t)outAddress : NULL, outLen);
+}
+
+static jint Inflater_getAdler(JNIEnv* env, jclass cls, jlong addr) {
+    z_stream* zs = zipStreamFromAddress(addr);
+    return zs ? (jint)zs->adler : 0;
+}
+
+static void Inflater_reset(JNIEnv* env, jclass cls, jlong addr) {
+    z_stream* zs = zipStreamFromAddress(addr);
+    if (zs) inflateReset(zs);
+}
+
+static void Inflater_end(JNIEnv* env, jclass cls, jlong addr) {
+    z_stream* zs = zipStreamFromAddress(addr);
+    if (zs) {
+        inflateEnd(zs);
+        free(zs);
+    }
+}
+
 /* ==================== JNI_OnLoad ==================== */
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
@@ -1158,7 +1900,27 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
         }
     }
 
-    /* java.math.NativeBN - BigInteger/BigDecimal support */
+    /* Android 15 libcore.math.NativeBN - OpenHarmony OpenSSL-backed BigInteger. */
+    {
+        jclass cls = (*env)->FindClass(env, "libcore/math/NativeBN");
+        if (cls) {
+            JNINativeMethod methods[] = {
+                {"BN_new", "()J", (void*)LibcoreNativeBN_BN_new},
+                {"BN_free", "(J)V", (void*)LibcoreNativeBN_BN_free},
+                {"litEndInts2bn", "([IIZJ)V", (void*)LibcoreNativeBN_litEndInts2bn},
+                {"bn2litEndInts", "(J)[I", (void*)LibcoreNativeBN_bn2litEndInts},
+                {"BN_mul", "(JJJ)V", (void*)LibcoreNativeBN_BN_mul},
+                {"BN_div", "(JJJJ)V", (void*)LibcoreNativeBN_BN_div},
+                {"BN_mod_exp", "(JJJJ)V", (void*)LibcoreNativeBN_BN_mod_exp},
+            };
+            registerNativesOrSkip(env, cls, methods, sizeof(methods)/sizeof(methods[0]));
+            (*env)->DeleteLocalRef(env, cls);
+        } else {
+            (*env)->ExceptionClear(env);
+        }
+    }
+
+    /* Legacy java.math.NativeBN - BigInteger/BigDecimal support */
     {
         jclass cls = (*env)->FindClass(env, "java/math/NativeBN");
         if (cls) {
@@ -1273,6 +2035,92 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
                 {"nicenessForPriority", "(I)I", (void*)Thread_nicenessForPriority},
             };
             registerNativesOrSkip(env, cls, methods, 1);
+            (*env)->DeleteLocalRef(env, cls);
+        }
+    }
+
+    /* sun.nio.ch.FileKey */
+    {
+        jclass cls = (*env)->FindClass(env, "sun/nio/ch/FileKey");
+        if (cls) {
+            JNINativeMethod methods[] = {
+                {"initIDs", "()V", (void*)FileKey_initIDs},
+                {"init", "(Ljava/io/FileDescriptor;)V", (void*)FileKey_init},
+            };
+            registerNativesOrSkip(env, cls, methods, sizeof(methods)/sizeof(methods[0]));
+            (*env)->DeleteLocalRef(env, cls);
+        }
+    }
+
+    /* java.util.zip.CRC32 */
+    {
+        jclass cls = (*env)->FindClass(env, "java/util/zip/CRC32");
+        if (cls) {
+            JNINativeMethod methods[] = {
+                {"update", "(II)I", (void*)CRC32_update},
+                {"updateBytes", "(I[BII)I", (void*)CRC32_updateBytes},
+                {"updateBytes0", "(I[BII)I", (void*)CRC32_updateBytes},
+                {"updateByteBuffer", "(IJII)I", (void*)CRC32_updateByteBuffer},
+                {"updateByteBuffer0", "(IJII)I", (void*)CRC32_updateByteBuffer},
+            };
+            registerNativesOrSkip(env, cls, methods, sizeof(methods)/sizeof(methods[0]));
+            (*env)->DeleteLocalRef(env, cls);
+        }
+    }
+
+    /* java.util.zip.Adler32 */
+    {
+        jclass cls = (*env)->FindClass(env, "java/util/zip/Adler32");
+        if (cls) {
+            JNINativeMethod methods[] = {
+                {"update", "(II)I", (void*)Adler32_update},
+                {"updateBytes", "(I[BII)I", (void*)Adler32_updateBytes},
+                {"updateByteBuffer", "(IJII)I", (void*)Adler32_updateByteBuffer},
+            };
+            registerNativesOrSkip(env, cls, methods, sizeof(methods)/sizeof(methods[0]));
+            (*env)->DeleteLocalRef(env, cls);
+        }
+    }
+
+    /* java.util.zip.Deflater */
+    {
+        jclass cls = (*env)->FindClass(env, "java/util/zip/Deflater");
+        if (cls) {
+            JNINativeMethod methods[] = {
+                {"init", "(IIZ)J", (void*)Deflater_init},
+                {"setDictionary", "(J[BII)V", (void*)Deflater_setDictionary},
+                {"setDictionaryBuffer", "(JJI)V", (void*)Deflater_setDictionaryBuffer},
+                {"deflateBytesBytes", "(J[BII[BIIII)J", (void*)Deflater_deflateBytesBytes},
+                {"deflateBytesBuffer", "(J[BIIJIII)J", (void*)Deflater_deflateBytesBuffer},
+                {"deflateBufferBytes", "(JJI[BIIII)J", (void*)Deflater_deflateBufferBytes},
+                {"deflateBufferBuffer", "(JJIJIII)J", (void*)Deflater_deflateBufferBuffer},
+                {"getAdler", "(J)I", (void*)Deflater_getAdler},
+                {"reset", "(J)V", (void*)Deflater_reset},
+                {"end", "(J)V", (void*)Deflater_end},
+            };
+            registerNativesOrSkip(env, cls, methods, sizeof(methods)/sizeof(methods[0]));
+            (*env)->DeleteLocalRef(env, cls);
+        }
+    }
+
+    /* java.util.zip.Inflater */
+    {
+        jclass cls = (*env)->FindClass(env, "java/util/zip/Inflater");
+        if (cls) {
+            JNINativeMethod methods[] = {
+                {"initIDs", "()V", (void*)Inflater_initIDs},
+                {"init", "(Z)J", (void*)Inflater_init},
+                {"setDictionary", "(J[BII)V", (void*)Inflater_setDictionary},
+                {"setDictionaryBuffer", "(JJI)V", (void*)Inflater_setDictionaryBuffer},
+                {"inflateBytesBytes", "(J[BII[BII)J", (void*)Inflater_inflateBytesBytes},
+                {"inflateBytesBuffer", "(J[BIIJI)J", (void*)Inflater_inflateBytesBuffer},
+                {"inflateBufferBytes", "(JJI[BII)J", (void*)Inflater_inflateBufferBytes},
+                {"inflateBufferBuffer", "(JJIJI)J", (void*)Inflater_inflateBufferBuffer},
+                {"getAdler", "(J)I", (void*)Inflater_getAdler},
+                {"reset", "(J)V", (void*)Inflater_reset},
+                {"end", "(J)V", (void*)Inflater_end},
+            };
+            registerNativesOrSkip(env, cls, methods, sizeof(methods)/sizeof(methods[0]));
             (*env)->DeleteLocalRef(env, cls);
         }
     }

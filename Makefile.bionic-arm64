@@ -237,7 +237,8 @@ RUNTIME_EXCLUDE = %backtrace_helper.cc \
   %runtime/hidden_api.cc \
   %runtime/instrumentation.cc \
   %quick/quick_throw_entrypoints.cc \
-  %quick/quick_trampoline_entrypoints.cc
+  %quick/quick_trampoline_entrypoints.cc \
+  %arch/context.cc
 
 # Exclude ALL runtime/native/*.cc -- we compile patched copies from patches/runtime/native/
 RUNTIME_NATIVE_ORIG = $(filter-out %_test.cc %_fuzzer.cc %_bench.cc,$(wildcard $(ART)/runtime/native/*.cc))
@@ -251,6 +252,14 @@ $(RT_PATCH_OBJ): $(RT_PATCH_SRC)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@ 2>&1 && echo "OK: runtime.cc (patched)" || { echo "FAIL: runtime.cc (patched)"; rm -f $@; }
 RUNTIME_OBJS += $(RT_PATCH_OBJ)
+
+# Patched arch/context.cc (PF-arch-016: null-vtable guard in artContextCopyForLongJump)
+CTX_PATCH_SRC = patches/runtime/arch/context.cc
+CTX_PATCH_OBJ = $(BUILDDIR)/runtime/arch/context.o
+$(CTX_PATCH_OBJ): $(CTX_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@ 2>&1 && echo "OK: context.cc (patched)" || { echo "FAIL: context.cc (patched)"; rm -f $@; }
+RUNTIME_OBJS += $(CTX_PATCH_OBJ)
 
 # Patched class_linker.cc
 CL_PATCH_SRC = patches/runtime/class_linker.cc
@@ -671,6 +680,10 @@ dalvikvm-main:
 	  -o $(BUILDDIR)/dalvikvm/dalvikvm.o 2>&1 && echo "OK: dalvikvm.cc (patched)" || echo "FAIL: dalvikvm.cc (patched)"
 
 # ============ JNI stubs (statically linked native libs) ============
+# M3-finish: includes binder_jni_stub.cc which provides the
+# Java_android_os_ServiceManager_native* JNI methods.  These call into
+# libbinder via the libbinder_full_static.a archive linked below.
+BINDER_PORT := /home/dspfac/android-to-openharmony-migration/aosp-libbinder-port
 jni-stubs:
 	@mkdir -p $(BUILDDIR)/jni_stubs
 	@echo "=== JNI stubs (ARM64) ==="
@@ -698,6 +711,58 @@ jni-stubs:
 	    -I$(AOSP)/libnativehelper/include_jni \
 	    -c $(STUBS)/framework_native_stubs.c \
 	    -o $(BUILDDIR)/jni_stubs/framework_native_stubs.o 2>&1 && echo "OK: framework_native_stubs.c" || echo "FAIL: framework_native_stubs.c"
+	@$(CXX) $(TARGET_FLAGS) -fPIC -O2 -w \
+	    -I$(AOSP)/libnativehelper/include_jni \
+	    -c $(STUBS)/framework_register_stubs.cpp \
+	    -o $(BUILDDIR)/jni_stubs/framework_register_stubs.o 2>&1 && echo "OK: framework_register_stubs.cpp" || echo "FAIL: framework_register_stubs.cpp"
+	@$(CXX) $(TARGET_FLAGS) -fPIC -O2 -w -std=c++17 \
+	    -fno-rtti -fno-exceptions \
+	    -I$(AOSP)/libnativehelper/include_jni \
+	    -I$(BINDER_PORT)/out/aidl-gen/include \
+	    -I$(BINDER_PORT)/bionic-overlay/include \
+	    -I$(BINDER_PORT)/aosp-src/libbinder/include \
+	    -I$(BINDER_PORT)/aosp-src/libbinder/ndk/include_cpp \
+	    -I$(BINDER_PORT)/aosp-src/libbinder \
+	    -I$(BINDER_PORT)/aosp-src/libbinder/liblog_stub/include \
+	    -I$(BINDER_PORT)/deps-src/libutils_binder/include \
+	    -I$(BINDER_PORT)/deps-src/libcutils/include \
+	    -I$(BINDER_PORT)/deps-src/libbase/include \
+	    -I$(BINDER_PORT)/deps-src/libsystem/include \
+	    -c $(STUBS)/binder_jni_stub.cc \
+	    -o $(BUILDDIR)/jni_stubs/binder_jni_stub.o 2>&1 && echo "OK: binder_jni_stub.cc" || echo "FAIL: binder_jni_stub.cc"
+	@# M4-PRE4: messagequeue_jni_stub.cc — Java_android_os_MessageQueue_native*
+	@# glue over android::Looper (already in libbinder_full_static.a's libutils
+	@# component). Reuses the libbinder_port include set since libutils headers
+	@# live under deps-src/libutils_binder/include/utils.
+	@$(CXX) $(TARGET_FLAGS) -fPIC -O2 -w -std=c++17 \
+	    -fno-rtti -fno-exceptions \
+	    -I$(AOSP)/libnativehelper/include_jni \
+	    -I$(BINDER_PORT)/bionic-overlay/include \
+	    -I$(BINDER_PORT)/aosp-src/libbinder/liblog_stub/include \
+	    -I$(BINDER_PORT)/deps-src/libutils_binder/include \
+	    -I$(BINDER_PORT)/deps-src/libcutils/include \
+	    -I$(BINDER_PORT)/deps-src/libbase/include \
+	    -I$(BINDER_PORT)/deps-src/libsystem/include \
+	    -c $(STUBS)/messagequeue_jni_stub.cc \
+	    -o $(BUILDDIR)/jni_stubs/messagequeue_jni_stub.o 2>&1 && echo "OK: messagequeue_jni_stub.cc" || echo "FAIL: messagequeue_jni_stub.cc"
+	@# M4-PRE7: assetmanager_jni_stub.cc — Java_android_content_res_AssetManager_native*
+	@# Stub-only natives for ResourcesImpl.<clinit> path (nativeGetThemeFreeFunction
+	@# and friends). 56 native methods stubbed; no real asset management.
+	@$(CXX) $(TARGET_FLAGS) -fPIC -O2 -w -std=c++17 \
+	    -fno-rtti -fno-exceptions \
+	    -I$(AOSP)/libnativehelper/include_jni \
+	    -c $(STUBS)/assetmanager_jni_stub.cc \
+	    -o $(BUILDDIR)/jni_stubs/assetmanager_jni_stub.o 2>&1 && echo "OK: assetmanager_jni_stub.cc" || echo "FAIL: assetmanager_jni_stub.cc"
+	@# M5-PRE: audiosystem_jni_stub.cc — Java_android_media_AudioSystem_*
+	@# Stub-only natives for AudioSystem.<clinit> path (native_getMaxChannelCount,
+	@# native_getMaxSampleRate, getMasterMute, etc.). 105 native methods stubbed;
+	@# no real audio routing.  Unblocks noice/AudioFocus/MediaSession clinit;
+	@# real audio is M5 westlake-audio-daemon's job.
+	@$(CXX) $(TARGET_FLAGS) -fPIC -O2 -w -std=c++17 \
+	    -fno-rtti -fno-exceptions \
+	    -I$(AOSP)/libnativehelper/include_jni \
+	    -c $(STUBS)/audiosystem_jni_stub.cc \
+	    -o $(BUILDDIR)/jni_stubs/audiosystem_jni_stub.o 2>&1 && echo "OK: audiosystem_jni_stub.cc" || echo "FAIL: audiosystem_jni_stub.cc"
 
 # ============ link-runtime (dalvikvm without dex2oat) ============
 # 'all' compiles AOSP base, then patched .o targets overwrite specific files
@@ -735,6 +800,12 @@ link-runtime: all ziparchive sigchain nativehelper dalvikvm-main fault-handler-s
 	  $(BUILDDIR)/jni_stubs/openjdk_stub.o \
 	  $(BUILDDIR)/jni_stubs/ohbridge_stub.o \
 	  $(BUILDDIR)/jni_stubs/framework_native_stubs.o \
+  $(BUILDDIR)/jni_stubs/framework_register_stubs.o \
+	  $(BUILDDIR)/jni_stubs/binder_jni_stub.o \
+	  $(BUILDDIR)/jni_stubs/messagequeue_jni_stub.o \
+	  $(BUILDDIR)/jni_stubs/assetmanager_jni_stub.o \
+	  $(BUILDDIR)/jni_stubs/audiosystem_jni_stub.o \
+	  -Wl,--whole-archive $(BINDER_PORT)/out/bionic/libbinder_full_static.a -Wl,--no-whole-archive \
 	  /home/dspfac/android-sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_static.a \
 	  /home/dspfac/android-sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++abi.a \
 	  /home/dspfac/android-sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libz.a \
@@ -777,6 +848,7 @@ link-dynamic: all ziparchive sigchain nativehelper dalvikvm-main fault-handler-s
 	  $(BUILDDIR)/jni_stubs/openjdk_stub.o \
 	  $(BUILDDIR)/jni_stubs/ohbridge_stub.o \
 	  $(BUILDDIR)/jni_stubs/framework_native_stubs.o \
+  $(BUILDDIR)/jni_stubs/framework_register_stubs.o \
 	  $(BUILDDIR)/stubs/missing_stubs.o \
 	  -lc++_shared -lz -ldl -lm -llog
 	@echo "Built: $(BUILDDIR)/bin/dalvikvm-dynamic"
@@ -826,6 +898,7 @@ link-shared: all $(RUNTIME_OBJS) $(WESTLAKE_JNI_OBJ) ziparchive sigchain nativeh
 	  $(BUILDDIR)/jni_stubs/openjdk_stub.o \
 	  $(BUILDDIR)/jni_stubs/ohbridge_stub.o \
 	  $(BUILDDIR)/jni_stubs/framework_native_stubs.o \
+  $(BUILDDIR)/jni_stubs/framework_register_stubs.o \
 	  $(BUILDDIR)/stubs/missing_stubs.o \
 	  /home/dspfac/android-sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_static.a \
 	  /home/dspfac/android-sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++abi.a \
@@ -992,6 +1065,7 @@ link-dex2oat: all dex2oat-build ziparchive sigchain nativehelper fault-handler-s
 	  $(BUILDDIR)/jni_stubs/openjdk_stub.o \
 	  $(BUILDDIR)/jni_stubs/ohbridge_stub.o \
 	  $(BUILDDIR)/jni_stubs/framework_native_stubs.o \
+  $(BUILDDIR)/jni_stubs/framework_register_stubs.o \
 	  /home/dspfac/android-sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_static.a \
 	  /home/dspfac/android-sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++abi.a \
 	  /home/dspfac/android-sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libz.a \

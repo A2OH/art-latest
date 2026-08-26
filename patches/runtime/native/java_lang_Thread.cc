@@ -20,14 +20,21 @@
 #include "jni/jni_internal.h"
 #include "mirror/object.h"
 #include "monitor.h"
+#include "nth_caller_visitor.h"
 #include "tolerant_native_util.h"
 #include "nativehelper/jni_macros.h"
 #include "nativehelper/scoped_utf_chars.h"
 #include "scoped_fast_native_object_access-inl.h"
 #include "scoped_thread_state_change-inl.h"
+#include "stack.h"
 #include "thread.h"
 #include "thread_list.h"
 #include "verify_object.h"
+
+#include <errno.h>
+#include <atomic>
+#include <pthread.h>
+#include <time.h>
 
 namespace art HIDDEN {
 
@@ -175,9 +182,42 @@ static void Thread_setPriority0(JNIEnv* env, jobject java_thread, jint new_prior
 }
 
 static void Thread_sleep(JNIEnv* env, jclass, jobject java_lock, jlong ms, jint ns) {
-  ScopedFastNativeObjectAccess soa(env);
-  ObjPtr<mirror::Object> lock = soa.Decode<mirror::Object>(java_lock);
-  Monitor::Wait(Thread::Current(), lock.Ptr(), ms, ns, true, ThreadState::kSleeping);
+  UNUSED(java_lock);
+  if (ms < 0 || ns < 0 || ns > 999999) {
+    ThrowIllegalArgumentException("timeout value is negative or nanos out of range");
+    return;
+  }
+  timespec ts;
+  ts.tv_sec = ms / 1000;
+  ts.tv_nsec = (ms % 1000) * 1000000 + ns;
+  // 2026-07-09: sleep is FAST_NATIVE, so the calling thread is kRunnable here. A raw
+  // nanosleep leaves it kRunnable, so GC SuspendAll waits for the sleeping thread,
+  // times out, and SIGABRTs. The FinalizerWatchdogDaemon sleeps in here, which is why
+  // EVERY adapter process (parent zygote AND forked apps) died ~seconds into its first
+  // GC ("Caused HeapTaskDaemon failure : SuspendAll timeout"). AOSP's original used
+  // Monitor::Wait(..., kSleeping); we keep the nanosleep but transition to kSleeping (a
+  // GC-safe/suspendable state) around it so SuspendAll skips a sleeping thread.
+  Thread* self = Thread::Current();
+  static std::atomic<int> wl_main_sleep_logs{0};
+  char wl_thread_name[16] = {};
+  pthread_getname_np(pthread_self(), wl_thread_name, sizeof(wl_thread_name));
+  if (strcmp(wl_thread_name, "main") == 0 && wl_main_sleep_logs.fetch_add(1) < 80) {
+    std::string wl_callers;
+    for (uint32_t depth = 0; depth < 8; ++depth) {
+      NthCallerVisitor visitor(self, depth);
+      visitor.WalkStack();
+      if (visitor.caller != nullptr) {
+        if (!wl_callers.empty()) wl_callers.append(" <- ");
+        wl_callers.append(visitor.caller->PrettyMethod());
+      }
+    }
+    fprintf(stderr, "[WESTLAKE-MAIN-SLEEP] ms=%lld ns=%d stack=%s\n",
+            static_cast<long long>(ms), static_cast<int>(ns), wl_callers.c_str());
+    fflush(stderr);
+  }
+  ScopedThreadSuspension sts(self, ThreadState::kSleeping);
+  while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {
+  }
 }
 
 /*

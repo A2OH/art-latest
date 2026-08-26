@@ -17,6 +17,7 @@
 #include "interpreter_common.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <dirent.h>
 #include <cmath>
@@ -25,8 +26,14 @@
 #include <cstring>
 #include <fcntl.h>
 #include <limits.h>
+#include <mutex>
+#include <string>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -44,6 +51,7 @@
 #include "intrinsics_enum.h"
 #include "intrinsics_list.h"
 #include "jit/jit.h"
+#include "jit/jit_code_cache.h"
 #include "jni/jni_env_ext.h"
 #include "jvalue-inl.h"
 #include "method_handles-inl.h"
@@ -53,6 +61,7 @@
 #include "mirror/call_site-inl.h"
 #include "mirror/class-alloc-inl.h"
 #include "mirror/class.h"
+#include "mirror/iftable-inl.h"   // §673: IfTable::GetMethodArrayCount for the bounds check
 #include "mirror/field.h"
 #include "mirror/emulated_stack_frame.h"
 #include "mirror/method.h"
@@ -74,13 +83,89 @@
 #include "var_handles.h"
 #include "well_known_classes-inl.h"
 
+#include "westlake_quiet_stdio.h"
+
 namespace art HIDDEN {
 namespace interpreter {
 
-static bool WestlakeTraceTimeZoneBridge() {
-  const char* value = getenv("WESTLAKE_TRACE_TZ");
+static std::atomic<int> g_westlake_main_looper_return_logs{0};
+static thread_local ArtMethod* g_westlake_last_main_looper_method = nullptr;
+static thread_local ArtMethod* g_westlake_last_main_looper_caller = nullptr;
+static thread_local uint32_t g_westlake_last_main_looper_dex_pc = 0;
+static thread_local bool g_westlake_last_main_looper_non_null = false;
+
+static bool WestlakeEnvFlagEnabled(const char* name) {
+  const char* value = getenv(name);
   return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0 &&
-         strcmp(value, "false") != 0 && strcmp(value, "FALSE") != 0;
+         strcmp(value, "false") != 0 && strcmp(value, "FALSE") != 0 &&
+         strcmp(value, "no") != 0 && strcmp(value, "NO") != 0 &&
+         strcmp(value, "off") != 0 && strcmp(value, "OFF") != 0;
+}
+
+static bool WestlakeTraceTimeZoneBridge() {
+  return WestlakeEnvFlagEnabled("WESTLAKE_TRACE_TZ");
+}
+
+static bool WestlakeTraceVerboseCalls() {
+  return WestlakeEnvFlagEnabled("WESTLAKE_TRACE_VERBOSE_CALLS");
+}
+
+static bool WestlakeTraceMcdCalls() {
+  return WestlakeEnvFlagEnabled("WESTLAKE_TRACE_MCD_CALLS");
+}
+
+// WESTLAKE §752 (2026-08-20): opt-in, method-only trace for Toutiao's short-video
+// response handoff.  Transport tracing proved that the tt_video_immerse feed returns
+// HTTP 200, while no player data source is installed.  Keep this diagnostic at the ART
+// boundary and off by default; it observes managed calls/results without changing them.
+static bool WestlakeTraceToutiaoVideoCalls() {
+  static const bool enabled = WestlakeEnvFlagEnabled("WESTLAKE_TRACE_TOUTIAO_VIDEO");
+  return enabled;
+}
+
+// WESTLAKE §753 (2026-08-20): Gson's nextNonWhitespace intrinsic used to
+// fflush(stderr) for every JSON token.  A normal short-video feed advanced only
+// about 7 KiB per 30 seconds and therefore took hours to reach its callback.
+// Keep the diagnostics available on demand without taxing normal execution.
+static bool WestlakeTraceGson() {
+  static const bool enabled = WestlakeEnvFlagEnabled("WESTLAKE_TRACE_GSON");
+  return enabled;
+}
+
+static constexpr uintptr_t kPFCutPf625StaleNativeEntry = 0xfffffffffffffb17ULL;
+
+static inline bool PFCutPf625EntryLooksInvalid(const void* entry) {
+  const uintptr_t value = reinterpret_cast<uintptr_t>(entry);
+  if (value == 0u) {
+    return false;
+  }
+  return value == kPFCutPf625StaleNativeEntry ||
+      value < 4096u ||
+      (value >> 48u) == 0xffffu ||
+      (value & 0x3u) != 0u;
+}
+
+static inline void PFCutPf625LogUnsafeNativeEntry(const char* site,
+                                                 ArtMethod* method,
+                                                 ArtMethod* caller,
+                                                 const void* quick_entry,
+                                                 const void* jni_entry)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  static thread_local int pf625_log_count = 0;
+  if (pf625_log_count >= 120) {
+    return;
+  }
+  pf625_log_count++;
+  const std::string method_name = method != nullptr ? method->PrettyMethod() : "<null>";
+  const std::string caller_name = caller != nullptr ? caller->PrettyMethod() : "<null>";
+  fprintf(stderr,
+          "[PFCUT-PF625] unsafe-native-entry site=%s method=%s caller=%s quick=%p jni=%p\n",
+          site != nullptr ? site : "<unknown>",
+          method_name.c_str(),
+          caller_name.c_str(),
+          quick_entry,
+          jni_entry);
+  fflush(stderr);
 }
 
 void ThrowNullPointerExceptionFromInterpreter() {
@@ -115,34 +200,226 @@ bool ShouldStayInSwitchInterpreter(ArtMethod* method)
   return true;
 }
 
+// WESTLAKE §603f: the §436 guard, ported from the §551 binary code cave into source.
+//
+// A corrupt ArtMethod reaches the PFCUT predicates below with declaring_class_ holding small garbage
+// (observed: 5). The idiomatic `GetDeclaringClass() != nullptr` test PASSES for 5, and then
+// DescriptorEquals' inline load at class+0x40 faults at 0x45 -- the §436 launch lottery. §550 also
+// showed the ArtMethod pointer itself can be unaligned garbage, and that dropping the alignment test
+// merely changes the crash's shape, so BOTH checks are required.
+//
+// Use this in place of the bare null test on a method's declaring class everywhere in this file.
+// It returns false
+// for an implausible method or declaring class, which makes the predicate simply not match -- the
+// same outcome as a null declaring class, i.e. no behaviour change on healthy input.
+static inline bool PFCutDeclaringClassPlausible(ArtMethod* m)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (m == nullptr) return false;
+  if ((reinterpret_cast<uintptr_t>(m) & 0x3u) != 0) return false;         // §550: keep the alignment test
+  const uintptr_t c = reinterpret_cast<uintptr_t>(m->GetDeclaringClass().Ptr());
+  return c >= 0x1000u && (c & 0x3u) == 0;                                 // §551: plausibility test
+  // WESTLAKE §634b (2026-08-15) REVERTED: extending this predicate with a dex-index bounds check
+  // (idx < dex_file->NumMethodIds()) broke the ZYGOTE — preload died in StreamOpFlag.<clinit>,
+  // because PFCUT compat shims that boot depends on stopped matching. Lesson: on this port a
+  // method index that is out of range for the dex reached via its dex_cache is apparently NORMAL
+  // for classes injected across our patched BCP jars, so "out of range" means "unsafe to READ",
+  // NOT "corrupt method". Guard the READ (see WlNameMatches / §632), never the dispatch.
+}
+
+// WESTLAKE §673 (2026-08-17): bounds-checked stand-in for
+// mirror::Class::FindVirtualMethodForInterface (class-inl.h:589), whose last act is
+//
+//     iftable->GetMethodArray(i)->GetElementPtrSize<ArtMethod*>(method->GetMethodIndex(), ps)
+//
+// with NO bounds check. Upstream is entitled to that: matching the interface by identity
+// (iftable->GetInterface(i) == declaring_class) is supposed to imply the method array is sized
+// for exactly that interface's declared virtual methods -- IfTable::SetMethodArray DCHECKs the
+// invariant (iftable-inl.h:68). This port breaks it, because it injects classes across several
+// patched BCP jars, so an interface can match by identity while the receiver's method array came
+// from a differently-sized copy. GetElementPtrSize is then a raw (array_data + idx * 8) load that
+// hands back adjacent heap bytes as an "ArtMethod*".
+//
+// Measured on Toutiao 2026-08-17 across three consecutive launches: method_index_ 26 read past a
+// shorter array returned 0x1000000014 -- non-null, 4-byte aligned, > 0x10000 and < 1<<48, so it
+// satisfied every test in the §206 wl_sane_ptr guard below and was then dereferenced by
+// PFCutDeclaringClassPlausible() at the §633 site (`ldr w8,[x26]`, libart.so+0x93f250), killing
+// the child with SIGSEGV addr=0x1000000014. All three runs faulted at that one instruction; only
+// the arrival time varied, which is what made the launch look like a 1-in-3 lottery -- the run
+// that reached a window simply crashed 174s in rather than 43s in.
+//
+// nullptr is already upstream's return value for "no matching interface", so every caller here
+// handles it: !wl_sane_ptr takes the §209 repair path, which walks the RECEIVER's own class
+// hierarchy for a name+signature match and so needs no iftable indexing at all.
+static ArtMethod* WlFindVirtualMethodForInterfaceChecked(ObjPtr<mirror::Class> klass,
+                                                         ArtMethod* method,
+                                                         PointerSize pointer_size)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (klass == nullptr || method == nullptr) {
+    return nullptr;
+  }
+  ObjPtr<mirror::Class> declaring_class = method->GetDeclaringClass();
+  if (declaring_class == nullptr) {
+    return nullptr;
+  }
+  if (UNLIKELY(!declaring_class->IsInterface())) {
+    // Upstream delegates to FindVirtualMethodForVirtual() here (Object's public methods).
+    // Leave that path exactly as it was.
+    return klass->FindVirtualMethodForVirtual(method, pointer_size);
+  }
+  ObjPtr<mirror::IfTable> iftable = klass->GetIfTable();
+  if (iftable == nullptr) {
+    return nullptr;
+  }
+  const int32_t iftable_count = klass->GetIfTableCount();
+  const size_t midx = method->GetMethodIndex();
+  for (int32_t i = 0; i < iftable_count; i++) {
+    if (iftable->GetInterface(i) == declaring_class) {
+      const size_t count = iftable->GetMethodArrayCount(i);
+      if (UNLIKELY(midx >= count)) {
+        // Deliberately NOT getenv()-gated: a diagnostic that never fires teaches nothing.
+        // Only integers and the interface descriptor are printed -- naming `method` would mean
+        // a dex-backed read on exactly the suspect method that §634 showed can fault.
+        static thread_local int wl_ifoob = 0;
+        if (wl_ifoob < 20) {
+          wl_ifoob++;
+          fprintf(stderr,
+                  "[WESTLAKE-IFOOB] iface=%s method_index=%zu >= method_array_count=%zu"
+                  " (iftable entry %d/%d) -- refused out-of-bounds iftable read\n",
+                  declaring_class->PrettyDescriptor().c_str(),
+                  midx,
+                  count,
+                  i,
+                  iftable_count);
+          fflush(stderr);
+        }
+        return nullptr;
+      }
+      return iftable->GetMethodArray(i)->GetElementPtrSize<ArtMethod*>(midx, pointer_size);
+    }
+  }
+  return nullptr;
+}
+
+// WESTLAKE §634 (2026-08-15): GetNameView()/GetSignature() index the method's OWN dex by its
+// dex_method_index_, and in a release build do so UNCHECKED (the DCHECKs compile away). A method
+// that is foreign to its declaring class's dex therefore reads a garbage name_idx and the
+// StringId load walks off the mapping — measured on Toutiao: idx 62215 against a dex whose header
+// says method_ids_size 41100, name_idx 812,646,432, si_addr == string_ids_ + idx*4.
+// Returning false for "cannot read" keeps every caller's intent: `== expected` stays false, and
+// `!= expected` (written as !WlNameMatches) stays true, i.e. treated as a mismatch to repair.
+static inline bool WlNameMatches(ArtMethod* m, std::string_view expected)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (m == nullptr) {
+    return false;
+  }
+  const uint32_t idx = m->GetDexMethodIndex();
+  if (idx == dex::kDexNoIndex) {
+    return m->GetNameView() == expected;   // runtime method: GetRuntimeMethodName(), no dex read
+  }
+  if (!PFCutDeclaringClassPlausible(m)) {
+    return false;
+  }
+  const DexFile* dex_file = m->GetDexFile();
+  if (dex_file == nullptr || idx >= dex_file->NumMethodIds()) {
+    return false;
+  }
+  return m->GetNameView() == expected;
+}
+
+// WESTLAKE §635 (2026-08-15): may we read this method's dex-backed name/descriptor?
+// GetName(), GetNameView(), GetSignature() and GetDeclaringClassDescriptor() all index the
+// method's OWN dex by dex_method_index_ and, in a release build, do so UNCHECKED (the DCHECKs in
+// art_method-inl.h and DexFile::GetMethodId compile away). Measured on Toutiao (21 dex, Tinker +
+// Mira): a method reaches DoCall with index 62215 against a dex whose header says
+// method_ids_size 41100, so the MethodId read returns a garbage name_idx (812,646,432 against
+// 39,578 strings) and `string_ids_[name_idx]` lands ~3 GB past the mapping.
+//
+// ⛔Deliberately NOT folded into PFCutDeclaringClassPlausible(): §634b did exactly that to cover
+// all ~40 shim sites at once and BROKE THE ZYGOTE (preload died in StreamOpFlag.<clinit>).
+// Guard the READ at the site that faults, never the shared dispatch predicate.
+//
+// Uses GetDexCache() directly rather than ArtMethod::GetDexFile(), which has its own CHECKs and
+// obsolete-method handling that we do not want to trigger on a suspect method.
+static inline bool WlNameReadable(ArtMethod* m)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (m == nullptr) {
+    return false;
+  }
+  const uint32_t idx = m->GetDexMethodIndex();
+  if (idx == dex::kDexNoIndex) {
+    return true;   // runtime method: GetRuntimeMethodName(), no dex read
+  }
+  ObjPtr<mirror::Class> klass = m->GetDeclaringClass();
+  const uintptr_t c = reinterpret_cast<uintptr_t>(klass.Ptr());
+  if (c < 0x1000u || (c & 0x3u) != 0) {
+    return false;
+  }
+  ObjPtr<mirror::DexCache> dex_cache = klass->GetDexCache();
+  if (dex_cache == nullptr) {
+    return false;
+  }
+  const DexFile* dex_file = dex_cache->GetDexFile();
+  return dex_file != nullptr && idx < dex_file->NumMethodIds();
+}
+
+// WESTLAKE §635b (2026-08-15): SAFE name/descriptor accessors for the PFCUT shim layer.
+//
+// Every `strcmp(called_method->GetName(), "…")` in this file reads the method's OWN dex by
+// dex_method_index_ and, in a release build, does so UNCHECKED. A method that is foreign to the
+// dex reached via its declaring class therefore reads a garbage name_idx and the StringId load
+// walks off the mapping — Toutiao hit this twice in a row, first at DoCall+0x38c and then in
+// PFCutTryMcdJustFlipEventNoop, both `ldr w9,[x10,x9,lsl #2]` with si_addr ≈ string_ids_ + 3 GB.
+//
+// Returning "" rather than nullptr is deliberate: every existing `name != nullptr` check keeps
+// passing, `strcmp(name,"foo") == 0` becomes false (shim does not match) and `!= 0` becomes true
+// (shim bails) — i.e. an unreadable name makes each shim decline, which is always safe because
+// they are optional compat shims for specific, known, never-foreign methods.
+//
+// ⛔Do NOT fold this into PFCutDeclaringClassPlausible(): §634b did that to cover every site at
+// once and BROKE THE ZYGOTE (preload died in StreamOpFlag.<clinit>). That predicate also gates
+// non-name decisions. Guard the READ, never the shared dispatch predicate.
+static inline const char* WlSafeName(ArtMethod* m)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  return WlNameReadable(m) ? m->GetName() : "";
+}
+
+static inline const char* WlSafeDescriptor(ArtMethod* m)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (!WlNameReadable(m)) {
+    return "";
+  }
+  const char* d = m->GetDeclaringClassDescriptor();
+  return d != nullptr ? d : "";
+}
+
 static inline bool PFCutIsGsonNextNonWhitespace(ArtMethod* method)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   return method != nullptr &&
-      method->GetDeclaringClass() != nullptr &&
+      PFCutDeclaringClassPlausible(method) &&
       (method->GetDeclaringClass()->DescriptorEquals("Lcom/google/gson/stream/JsonReader;") ||
        method->GetDeclaringClass()->DescriptorEquals(
            "Lcom/newrelic/com/google/gson/stream/JsonReader;")) &&
-      strcmp(method->GetName(), "nextNonWhitespace") == 0;
+      strcmp(WlSafeName(method), "nextNonWhitespace") == 0;
 }
 
 static inline bool PFCutIsGsonJsonReaderMethod(ArtMethod* method, const char* name)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   return method != nullptr &&
-      method->GetDeclaringClass() != nullptr &&
+      PFCutDeclaringClassPlausible(method) &&
       (method->GetDeclaringClass()->DescriptorEquals("Lcom/google/gson/stream/JsonReader;") ||
        method->GetDeclaringClass()->DescriptorEquals(
            "Lcom/newrelic/com/google/gson/stream/JsonReader;")) &&
-      strcmp(method->GetName(), name) == 0;
+      strcmp(WlSafeName(method), name) == 0;
 }
 
 static inline bool PFCutIsGsonLinkedTreeMapMethod(ArtMethod* method, const char* name)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   return method != nullptr &&
-      method->GetDeclaringClass() != nullptr &&
+      PFCutDeclaringClassPlausible(method) &&
       (method->GetDeclaringClass()->DescriptorEquals("Lcom/google/gson/internal/LinkedTreeMap;") ||
        method->GetDeclaringClass()->DescriptorEquals(
            "Lcom/newrelic/com/google/gson/internal/LinkedTreeMap;")) &&
-      strcmp(method->GetName(), name) == 0;
+      strcmp(WlSafeName(method), name) == 0;
 }
 
 static inline bool PFCutDecodeHexChar(uint16_t c, uint16_t* value) {
@@ -183,7 +460,7 @@ static inline void PFCutLogGsonReaderState(const char* phase,
                                            size_t receiver_reg,
                                            JValue* result)
     REQUIRES_SHARED(Locks::mutator_lock_) {
-  if (!PFCutIsGsonNextNonWhitespace(method) || frame == nullptr) {
+  if (!WestlakeTraceGson() || !PFCutIsGsonNextNonWhitespace(method) || frame == nullptr) {
     return;
   }
   ObjPtr<mirror::Object> receiver = frame->GetVRegReference(receiver_reg);
@@ -302,15 +579,17 @@ static inline bool PFCutTryGsonNextNonWhitespace(ArtMethod* called_method,
     line_field->SetInt<false>(receiver, line);
     line_start_field->SetInt<false>(receiver, line_start);
     result->SetI(static_cast<int32_t>(c));
-    fprintf(stderr,
-            "[PFCUT-GSON] intrinsic nextNonWhitespace reader=%p start=%d end=%d char=%u line=%d lineStart=%d\n",
-            receiver.Ptr(),
-            pos_field->GetInt(receiver) - 1,
-            next_pos,
-            static_cast<unsigned int>(c),
-            line,
-            line_start);
-    fflush(stderr);
+    if (WestlakeTraceGson()) {
+      fprintf(stderr,
+              "[PFCUT-GSON] intrinsic nextNonWhitespace reader=%p start=%d end=%d char=%u line=%d lineStart=%d\n",
+              receiver.Ptr(),
+              pos_field->GetInt(receiver) - 1,
+              next_pos,
+              static_cast<unsigned int>(c),
+              line,
+              line_start);
+      fflush(stderr);
+    }
     return true;
   }
 
@@ -400,7 +679,7 @@ static inline bool PFCutTryGsonNextQuotedValue(ArtMethod* called_method,
       result->SetL(string);
 
       static thread_local int next_quoted_count = 0;
-      if (next_quoted_count < 120) {
+      if (WestlakeTraceGson() && next_quoted_count < 120) {
         next_quoted_count++;
         fprintf(stderr,
                 "[PFCUT-GSON] intrinsic nextQuotedValue reader=%p start=%d end=%d chars=%zu escape=%d\n",
@@ -607,7 +886,7 @@ static inline bool PFCutTryGsonLinkedTreeMapPut(ArtMethod* called_method,
     return false;
   }
 
-  StackHandleScope<7> hs(self);
+  StackHandleScope<10> hs(self);
   Handle<mirror::Object> h_receiver(hs.NewHandle(receiver));
   Handle<mirror::Object> h_key(hs.NewHandle(key_obj));
   Handle<mirror::Object> h_value(hs.NewHandle(value_obj));
@@ -644,7 +923,7 @@ static inline bool PFCutTryGsonLinkedTreeMapPut(ArtMethod* called_method,
   result->SetL(nullptr);
 
   static thread_local int linked_tree_put_count = 0;
-  if (linked_tree_put_count < 120) {
+  if (WestlakeTraceGson() && linked_tree_put_count < 120) {
     linked_tree_put_count++;
     fprintf(stderr,
             "[PFCUT-GSON] LinkedTreeMap.put intrinsic receiver=%p parent=%p size=%d\n",
@@ -669,7 +948,7 @@ static inline bool PFCutTryStringFactoryCharsetFallback(ArtMethod* called_method
       !called_method->IsStatic() ||
       called_method->GetDeclaringClass() == nullptr ||
       !called_method->GetDeclaringClass()->DescriptorEquals("Ljava/lang/StringFactory;") ||
-      strcmp(called_method->GetName(), "newStringFromBytes") != 0) {
+      strcmp(WlSafeName(called_method), "newStringFromBytes") != 0) {
     return false;
   }
 
@@ -825,7 +1104,7 @@ static inline bool PFCutTryCharsetNameFallback(ArtMethod* called_method,
       called_method->IsStatic() ||
       called_method->GetDeclaringClass() == nullptr ||
       !called_method->GetDeclaringClass()->DescriptorEquals("Ljava/nio/charset/Charset;") ||
-      strcmp(called_method->GetName(), "name") != 0 ||
+      strcmp(WlSafeName(called_method), "name") != 0 ||
       number_of_inputs != 1u) {
     return false;
   }
@@ -901,7 +1180,7 @@ static inline ObjPtr<mirror::Object> PFCutGetOrCreateUtf8Charset(Thread* self)
     return nullptr;
   }
 
-  StackHandleScope<4> hs(self);
+  StackHandleScope<6> hs(self);
   Handle<mirror::Class> h_charset_class(hs.NewHandle(charset_class));
   Handle<mirror::Class> h_standard_charsets_class(hs.NewHandle(standard_charsets_class));
   Handle<mirror::String> h_utf8_name(
@@ -1021,7 +1300,7 @@ static inline bool PFCutTryCharsetCodingErrorActionFallback(
     return false;
   }
 
-  const char* method_name = called_method->GetName();
+  const char* method_name = WlSafeName(called_method);
   const bool malformed = method_name != nullptr && strcmp(method_name, "onMalformedInput") == 0;
   const bool unmappable =
       method_name != nullptr && strcmp(method_name, "onUnmappableCharacter") == 0;
@@ -1044,19 +1323,40 @@ static inline bool PFCutTryCharsetCodingErrorActionFallback(
     result->SetL(nullptr);
     return true;
   }
+  ArtField* action_field = called_method->GetDeclaringClass()->FindInstanceField(
+      malformed ? "malformedInputAction" : "unmappableCharacterAction",
+      "Ljava/nio/charset/CodingErrorAction;");
   ObjPtr<mirror::Object> action = shadow_frame.GetVRegReference(action_reg);
+  if (action == nullptr) {
+    // The platform objects normally already contain REPORT.  Prefer that
+    // rooted instance before asking ClassLinker to synthesize one: late video
+    // and WebView callbacks can arrive while another exception is pending,
+    // in which case FindSystemClass is not a reliable allocation path.
+    if (action_field != nullptr) {
+      action = action_field->GetObject(receiver);
+    }
+  }
   if (action == nullptr) {
     action = PFCutGetOrCreateCodingErrorAction(self, "REPORT");
     if (action == nullptr) {
-      self->ThrowNewException("Ljava/lang/IllegalArgumentException;", "Null action");
-      result->SetL(nullptr);
+      // This method is itself the compatibility implementation for missing
+      // libcore code.  Letting its repair failure escape Looper.loop kills the
+      // whole app.  Keep the receiver's prior policy and preserve fluent API
+      // semantics; the next encode/decode still reports malformed input.
+      if (self->IsExceptionPending()) {
+        self->ClearException();
+      }
+      static thread_local int missing_action_count = 0;
+      if (missing_action_count++ < 8) {
+        fprintf(stderr,
+                "[PFCUT] Charset action unavailable; retained existing policy\n");
+        fflush(stderr);
+      }
+      result->SetL(receiver);
       return true;
     }
   }
 
-  ArtField* action_field = called_method->GetDeclaringClass()->FindInstanceField(
-      malformed ? "malformedInputAction" : "unmappableCharacterAction",
-      "Ljava/nio/charset/CodingErrorAction;");
   if (action_field != nullptr) {
     action_field->SetObject<false>(receiver, action);
   }
@@ -1066,7 +1366,7 @@ static inline bool PFCutTryCharsetCodingErrorActionFallback(
     coding_action_fallback_count++;
     fprintf(stderr,
             "[PFCUT] %s.%s fallback action=%p\n",
-            called_method->GetDeclaringClassDescriptor(),
+            WlSafeDescriptor(called_method),
             method_name,
             action.Ptr());
     fflush(stderr);
@@ -1162,7 +1462,7 @@ static inline bool PFCutTryUnixNativeDispatcherPathIntrinsic(
     return false;
   }
 
-  const char* method_name = called_method->GetName();
+  const char* method_name = WlSafeName(called_method);
   if (method_name == nullptr) {
     return false;
   }
@@ -1267,7 +1567,7 @@ static inline bool PFCutTryZipFileRequireNonNullCharsetFallback(
   if (called_method == nullptr ||
       called_method->GetDeclaringClass() == nullptr ||
       !called_method->GetDeclaringClass()->DescriptorEquals("Ljava/util/Objects;") ||
-      strcmp(called_method->GetName(), "requireNonNull") != 0 ||
+      strcmp(WlSafeName(called_method), "requireNonNull") != 0 ||
       number_of_inputs != 2u) {
     return false;
   }
@@ -1327,7 +1627,7 @@ static inline void PFCutNormalizeZipFileNullCharsetArg(
   if (called_method == nullptr ||
       called_method->GetDeclaringClass() == nullptr ||
       !called_method->GetDeclaringClass()->DescriptorEquals("Ljava/util/zip/ZipFile;") ||
-      strcmp(called_method->GetName(), "<init>") != 0 ||
+      strcmp(WlSafeName(called_method), "<init>") != 0 ||
       (number_of_inputs != 4u && number_of_inputs != 5u)) {
     return;
   }
@@ -1386,7 +1686,7 @@ static inline bool PFCutTryThreadGroupUncaughtExceptionNoop(ArtMethod* called_me
       called_method->IsStatic() ||
       called_method->GetDeclaringClass() == nullptr ||
       !called_method->GetDeclaringClass()->DescriptorEquals("Ljava/lang/ThreadGroup;") ||
-      strcmp(called_method->GetName(), "uncaughtException") != 0 ||
+      strcmp(WlSafeName(called_method), "uncaughtException") != 0 ||
       number_of_inputs != 3u) {
     return false;
   }
@@ -1432,7 +1732,7 @@ static inline bool PFCutTryStringIntrinsic(ArtMethod* called_method,
   uint32_t shorty_len = 0;
   const char* shorty =
       called_method->GetInterfaceMethodIfProxy(kRuntimePointerSize)->GetShorty(&shorty_len);
-  const char* name = called_method->GetName();
+  const char* name = WlSafeName(called_method);
   if (name == nullptr || shorty == nullptr) {
     return false;
   }
@@ -1734,7 +2034,7 @@ static inline bool PFCutTryUuidIntrinsic(ArtMethod* called_method,
       number_of_inputs != 0u ||
       called_method->GetDeclaringClass() == nullptr ||
       !called_method->GetDeclaringClass()->DescriptorEquals("Ljava/util/UUID;") ||
-      strcmp(called_method->GetName(), "randomUUID") != 0) {
+      strcmp(WlSafeName(called_method), "randomUUID") != 0) {
     return false;
   }
 
@@ -1783,7 +2083,7 @@ static inline bool PFCutTrySystemTimeIntrinsic(ArtMethod* called_method,
   uint32_t shorty_len = 0;
   const char* shorty =
       called_method->GetInterfaceMethodIfProxy(kRuntimePointerSize)->GetShorty(&shorty_len);
-  const char* name = called_method->GetName();
+  const char* name = WlSafeName(called_method);
   if (name == nullptr || shorty == nullptr || strcmp(shorty, "J") != 0) {
     return false;
   }
@@ -1793,7 +2093,19 @@ static inline bool PFCutTrySystemTimeIntrinsic(ArtMethod* called_method,
     return true;
   }
   if (strcmp(name, "currentTimeMillis") == 0) {
-    result->SetJ(static_cast<int64_t>(MilliTime()));
+    // System.currentTimeMillis() is wall-clock time since the Unix epoch.
+    // ART's MilliTime() deliberately uses CLOCK_MONOTONIC on Linux and is
+    // suitable for elapsed durations only.  Returning it here made Java
+    // dates land near January 1970 and caused valid X.509 leaves to fail as
+    // "not yet valid".  Keep nanoTime() monotonic above, but use realtime
+    // for this separate Java contract.
+    timeval now;
+    if (gettimeofday(&now, nullptr) == 0) {
+      result->SetJ(static_cast<int64_t>(now.tv_sec) * INT64_C(1000) +
+                   static_cast<int64_t>(now.tv_usec) / INT64_C(1000));
+    } else {
+      result->SetJ(static_cast<int64_t>(time(nullptr)) * INT64_C(1000));
+    }
     return true;
   }
   return false;
@@ -1907,7 +2219,7 @@ static inline bool PFCutTrySystemArraycopyIntrinsic(
       number_of_inputs != 5u ||
       called_method->GetDeclaringClass() == nullptr ||
       !called_method->GetDeclaringClass()->DescriptorEquals("Ljava/lang/System;") ||
-      strcmp(called_method->GetName(), "arraycopy") != 0) {
+      strcmp(WlSafeName(called_method), "arraycopy") != 0) {
     return false;
   }
 
@@ -2068,7 +2380,7 @@ static inline bool PFCutTrySystemArraycopyIntrinsic(
   }
 
   static thread_local int arraycopy_intrinsic_count = 0;
-  if (arraycopy_intrinsic_count < 80) {
+  if (arraycopy_intrinsic_count < 0 /*§650*/) {
     arraycopy_intrinsic_count++;
     std::string src_desc_storage;
     std::string dst_desc_storage;
@@ -2102,7 +2414,7 @@ static inline bool PFCutTryRuntimeAvailableProcessorsIntrinsic(
       number_of_inputs != 1u ||
       called_method->GetDeclaringClass() == nullptr ||
       !called_method->GetDeclaringClass()->DescriptorEquals("Ljava/lang/Runtime;") ||
-      strcmp(called_method->GetName(), "availableProcessors") != 0) {
+      strcmp(WlSafeName(called_method), "availableProcessors") != 0) {
     return false;
   }
 
@@ -2236,7 +2548,7 @@ static inline void PFCutLogKotlinResultFailure(ArtMethod* called_method,
       number_of_inputs != 1u ||
       called_method->GetDeclaringClass() == nullptr ||
       !called_method->GetDeclaringClass()->DescriptorEquals("Lkotlin/ResultKt;") ||
-      strcmp(called_method->GetName(), "a") != 0) {
+      strcmp(WlSafeName(called_method), "a") != 0) {
     return;
   }
 
@@ -2283,7 +2595,7 @@ static inline bool PFCutTryReflectUtilEnsureMemberAccessNoop(ArtMethod* called_m
       called_method->GetDeclaringClass() == nullptr ||
       !called_method->GetDeclaringClass()->DescriptorEquals(
           "Lsun/reflect/misc/ReflectUtil;") ||
-      strcmp(called_method->GetName(), "ensureMemberAccess") != 0) {
+      strcmp(WlSafeName(called_method), "ensureMemberAccess") != 0) {
     return false;
   }
 
@@ -2312,6 +2624,44 @@ static inline bool PFCutTryReflectUtilEnsureMemberAccessNoop(ArtMethod* called_m
   return true;
 }
 
+// WESTLAKE §319i: intercept sun.security.jca.ProviderList.removeInvalid() and return the receiver
+// (this) unchanged, skipping its eager loadAll() of every configured JCA provider. On this in-process
+// ART, loadAll during Providers.<clinit> re-enters Security.addProvider -> Providers.<clinit> ->
+// loadAll ~13 levels deep, stalling the ActivityThread main thread so MainActivity.onCreate never runs
+// (screen black). core-oj.jar is un-patchable (any dex mod trips a BCP method-resolution SIGBUS,
+// §319h), so break the recursion here. Providers then load LAZILY on first crypto use (after the UI).
+template <bool is_range>
+static inline bool PFCutTryProviderListRemoveInvalidNoop(
+    ArtMethod* called_method,
+    ShadowFrame& shadow_frame,
+    JValue* result,
+    uint32_t (&arg)[Instruction::kMaxVarArgRegs],
+    uint32_t vregC)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (called_method == nullptr || called_method->GetDeclaringClass() == nullptr) {
+    return false;
+  }
+  std::string ds;
+  const char* d = called_method->GetDeclaringClass()->GetDescriptor(&ds);
+  if (d == nullptr || strcmp(d, "Lsun/security/jca/ProviderList;") != 0) {
+    return false;
+  }
+  const char* name = WlSafeName(called_method);
+  if (name == nullptr || strcmp(name, "removeInvalid") != 0) {
+    return false;
+  }
+  const uint32_t receiver_reg = is_range ? vregC : arg[0];
+  ObjPtr<mirror::Object> receiver = shadow_frame.GetVRegReference(receiver_reg);
+  static thread_local int wl_ri_count = 0;
+  if (wl_ri_count < 8) {
+    wl_ri_count++;
+    fprintf(stderr, "[WESTLAKE-JCA] ProviderList.removeInvalid -> this (skip eager loadAll)\n");
+    fflush(stderr);
+  }
+  result->SetL(receiver);
+  return true;
+}
+
 template <bool is_range>
 static inline bool PFCutTryAtomicReferenceArrayIntrinsic(
     ArtMethod* called_method,
@@ -2330,7 +2680,7 @@ static inline bool PFCutTryAtomicReferenceArrayIntrinsic(
     return false;
   }
 
-  const char* name = called_method->GetName();
+  const char* name = WlSafeName(called_method);
   if (name == nullptr) {
     return false;
   }
@@ -2402,31 +2752,52 @@ static inline bool PFCutTryAtomicReferenceArrayIntrinsic(
     return true;
   }
 
-  ObjPtr<mirror::Object> current = array->GetWithoutChecks(index);
+  const MemberOffset element_offset(
+      mirror::Array::DataOffset(kHeapReferenceSize).Int32Value() + index * kHeapReferenceSize);
+  ObjPtr<mirror::Object> current =
+      array->GetFieldObjectVolatile<mirror::Object>(element_offset);
   if (is_get) {
     result->SetL(current);
   } else if (is_set) {
     ObjPtr<mirror::Object> value = shadow_frame.GetVRegReference(reg_at(2));
-    array->SetWithoutChecks</*kTransactionActive=*/ false,
-                            /*kCheckTransaction=*/ false>(index, value);
+    array->SetFieldObjectVolatile<false>(element_offset, value);
     result->SetJ(0);
   } else if (is_get_and_set) {
     ObjPtr<mirror::Object> value = shadow_frame.GetVRegReference(reg_at(2));
-    array->SetWithoutChecks</*kTransactionActive=*/ false,
-                            /*kCheckTransaction=*/ false>(index, value);
+    do {
+      current = array->GetFieldObjectVolatile<mirror::Object>(element_offset);
+    } while (!array->CasFieldObject<false>(element_offset,
+                                           current,
+                                           value,
+                                           CASMode::kStrong,
+                                           std::memory_order_seq_cst));
+    result->SetL(current);
+  } else if (is_compare_exchange) {
+    ObjPtr<mirror::Object> expected = shadow_frame.GetVRegReference(reg_at(2));
+    ObjPtr<mirror::Object> update = shadow_frame.GetVRegReference(reg_at(3));
+    do {
+      current = array->GetFieldObjectVolatile<mirror::Object>(element_offset);
+      if (current.Ptr() != expected.Ptr()) {
+        break;
+      }
+    } while (!array->CasFieldObject<false>(element_offset,
+                                           expected,
+                                           update,
+                                           CASMode::kStrong,
+                                           std::memory_order_seq_cst));
     result->SetL(current);
   } else {
     ObjPtr<mirror::Object> expected = shadow_frame.GetVRegReference(reg_at(2));
     ObjPtr<mirror::Object> update = shadow_frame.GetVRegReference(reg_at(3));
     const bool success = current.Ptr() == expected.Ptr();
     if (success) {
-      array->SetWithoutChecks</*kTransactionActive=*/ false,
-                              /*kCheckTransaction=*/ false>(index, update);
-    }
-    if (is_compare_exchange) {
-      result->SetL(current);
+      result->SetZ(array->CasFieldObject<false>(element_offset,
+                                                expected,
+                                                update,
+                                                CASMode::kStrong,
+                                                std::memory_order_seq_cst));
     } else {
-      result->SetZ(success);
+      result->SetZ(false);
     }
   }
 
@@ -2462,7 +2833,7 @@ static inline bool PFCutTryAtomicReferenceIntrinsic(
     return false;
   }
 
-  const char* name = called_method->GetName();
+  const char* name = WlSafeName(called_method);
   if (name == nullptr) {
     return false;
   }
@@ -2517,28 +2888,51 @@ static inline bool PFCutTryAtomicReferenceIntrinsic(
     return false;
   }
 
-  ObjPtr<mirror::Object> current = value_field->GetObject(receiver);
+  const MemberOffset value_offset = value_field->GetOffset();
+  ObjPtr<mirror::Object> current =
+      receiver->GetFieldObjectVolatile<mirror::Object>(value_offset);
   if (is_get) {
     result->SetL(current);
   } else if (is_set) {
     ObjPtr<mirror::Object> value = shadow_frame.GetVRegReference(reg_at(1));
-    value_field->SetObject<false>(receiver, value);
+    receiver->SetFieldObjectVolatile<false>(value_offset, value);
     result->SetJ(0);
   } else if (is_get_and_set) {
     ObjPtr<mirror::Object> value = shadow_frame.GetVRegReference(reg_at(1));
-    value_field->SetObject<false>(receiver, value);
+    do {
+      current = receiver->GetFieldObjectVolatile<mirror::Object>(value_offset);
+    } while (!receiver->CasFieldObject<false>(value_offset,
+                                              current,
+                                              value,
+                                              CASMode::kStrong,
+                                              std::memory_order_seq_cst));
+    result->SetL(current);
+  } else if (is_compare_exchange) {
+    ObjPtr<mirror::Object> expected = shadow_frame.GetVRegReference(reg_at(1));
+    ObjPtr<mirror::Object> update = shadow_frame.GetVRegReference(reg_at(2));
+    do {
+      current = receiver->GetFieldObjectVolatile<mirror::Object>(value_offset);
+      if (current.Ptr() != expected.Ptr()) {
+        break;
+      }
+    } while (!receiver->CasFieldObject<false>(value_offset,
+                                              expected,
+                                              update,
+                                              CASMode::kStrong,
+                                              std::memory_order_seq_cst));
     result->SetL(current);
   } else {
     ObjPtr<mirror::Object> expected = shadow_frame.GetVRegReference(reg_at(1));
     ObjPtr<mirror::Object> update = shadow_frame.GetVRegReference(reg_at(2));
     const bool success = current.Ptr() == expected.Ptr();
     if (success) {
-      value_field->SetObject<false>(receiver, update);
-    }
-    if (is_compare_exchange) {
-      result->SetL(current);
+      result->SetZ(receiver->CasFieldObject<false>(value_offset,
+                                                   expected,
+                                                   update,
+                                                   CASMode::kStrong,
+                                                   std::memory_order_seq_cst));
     } else {
-      result->SetZ(success);
+      result->SetZ(false);
     }
   }
 
@@ -2581,7 +2975,7 @@ static inline bool PFCutTryAtomicIntegerOrBooleanIntrinsic(
     return false;
   }
 
-  const char* name = called_method->GetName();
+  const char* name = WlSafeName(called_method);
   if (name == nullptr) {
     return false;
   }
@@ -2654,7 +3048,8 @@ static inline bool PFCutTryAtomicIntegerOrBooleanIntrinsic(
     return false;
   }
 
-  const int32_t current = value_field->GetInt(receiver);
+  const MemberOffset value_offset = value_field->GetOffset();
+  int32_t current = receiver->GetField32Volatile(value_offset);
   const auto normalize = [&](int32_t value) -> int32_t {
     return is_boolean ? (value != 0 ? 1 : 0) : value;
   };
@@ -2667,33 +3062,56 @@ static inline bool PFCutTryAtomicIntegerOrBooleanIntrinsic(
     }
   } else if (is_set) {
     const int32_t value = normalize(static_cast<int32_t>(shadow_frame.GetVReg(reg_at(1))));
-    value_field->SetInt<false>(receiver, value);
+    receiver->SetField32Volatile<false>(value_offset, value);
     result->SetJ(0);
   } else if (is_get_and_set) {
     const int32_t value = normalize(static_cast<int32_t>(shadow_frame.GetVReg(reg_at(1))));
-    value_field->SetInt<false>(receiver, value);
+    do {
+      current = receiver->GetField32Volatile(value_offset);
+    } while (!receiver->CasField32<false>(value_offset,
+                                          current,
+                                          value,
+                                          CASMode::kStrong,
+                                          std::memory_order_seq_cst));
     if (is_boolean) {
       result->SetZ(current != 0);
     } else {
       result->SetI(current);
     }
-  } else if (is_cas || is_compare_exchange) {
+  } else if (is_compare_exchange) {
+    const int32_t expected =
+        normalize(static_cast<int32_t>(shadow_frame.GetVReg(reg_at(1))));
+    const int32_t update =
+        normalize(static_cast<int32_t>(shadow_frame.GetVReg(reg_at(2))));
+    do {
+      current = receiver->GetField32Volatile(value_offset);
+      if (current != expected) {
+        break;
+      }
+    } while (!receiver->CasField32<false>(value_offset,
+                                          expected,
+                                          update,
+                                          CASMode::kStrong,
+                                          std::memory_order_seq_cst));
+    if (is_boolean) {
+      result->SetZ(current != 0);
+    } else {
+      result->SetI(current);
+    }
+  } else if (is_cas) {
     const int32_t expected =
         normalize(static_cast<int32_t>(shadow_frame.GetVReg(reg_at(1))));
     const int32_t update =
         normalize(static_cast<int32_t>(shadow_frame.GetVReg(reg_at(2))));
     const bool success = current == expected;
     if (success) {
-      value_field->SetInt<false>(receiver, update);
-    }
-    if (is_compare_exchange) {
-      if (is_boolean) {
-        result->SetZ(current != 0);
-      } else {
-        result->SetI(current);
-      }
+      result->SetZ(receiver->CasField32<false>(value_offset,
+                                               expected,
+                                               update,
+                                               CASMode::kStrong,
+                                               std::memory_order_seq_cst));
     } else {
-      result->SetZ(success);
+      result->SetZ(false);
     }
   } else {
     int32_t delta = 0;
@@ -2704,8 +3122,14 @@ static inline bool PFCutTryAtomicIntegerOrBooleanIntrinsic(
     } else {
       delta = static_cast<int32_t>(shadow_frame.GetVReg(reg_at(1)));
     }
+    do {
+      current = receiver->GetField32Volatile(value_offset);
+    } while (!receiver->CasField32<false>(value_offset,
+                                          current,
+                                          current + delta,
+                                          CASMode::kStrong,
+                                          std::memory_order_seq_cst));
     const int32_t updated = current + delta;
-    value_field->SetInt<false>(receiver, updated);
     result->SetI(is_get_and_add ? current : updated);
   }
 
@@ -2741,7 +3165,7 @@ static inline bool PFCutTryAtomicLongIntrinsic(
     return false;
   }
 
-  const char* name = called_method->GetName();
+  const char* name = WlSafeName(called_method);
   if (name == nullptr) {
     return false;
   }
@@ -2812,28 +3236,44 @@ static inline bool PFCutTryAtomicLongIntrinsic(
     return false;
   }
 
-  const int64_t current = value_field->GetLong(receiver);
+  const MemberOffset value_offset = value_field->GetOffset();
+  int64_t current = receiver->GetField64Volatile(value_offset);
   if (is_get) {
     result->SetJ(current);
   } else if (is_set) {
     const int64_t value = shadow_frame.GetVRegLong(reg_at(1));
-    value_field->SetLong<false>(receiver, value);
+    receiver->SetField64Volatile<false>(value_offset, value);
     result->SetJ(0);
   } else if (is_get_and_set) {
     const int64_t value = shadow_frame.GetVRegLong(reg_at(1));
-    value_field->SetLong<false>(receiver, value);
+    do {
+      current = receiver->GetField64Volatile(value_offset);
+    } while (!receiver->CasFieldStrongSequentiallyConsistent64<false>(value_offset,
+                                                                      current,
+                                                                      value));
     result->SetJ(current);
-  } else if (is_cas || is_compare_exchange) {
+  } else if (is_compare_exchange) {
+    const int64_t expected = shadow_frame.GetVRegLong(reg_at(1));
+    const int64_t update = shadow_frame.GetVRegLong(reg_at(3));
+    do {
+      current = receiver->GetField64Volatile(value_offset);
+      if (current != expected) {
+        break;
+      }
+    } while (!receiver->CasFieldStrongSequentiallyConsistent64<false>(value_offset,
+                                                                      expected,
+                                                                      update));
+    result->SetJ(current);
+  } else if (is_cas) {
     const int64_t expected = shadow_frame.GetVRegLong(reg_at(1));
     const int64_t update = shadow_frame.GetVRegLong(reg_at(3));
     const bool success = current == expected;
     if (success) {
-      value_field->SetLong<false>(receiver, update);
-    }
-    if (is_compare_exchange) {
-      result->SetJ(current);
+      result->SetZ(receiver->CasFieldStrongSequentiallyConsistent64<false>(value_offset,
+                                                                           expected,
+                                                                           update));
     } else {
-      result->SetZ(success);
+      result->SetZ(false);
     }
   } else {
     int64_t delta = 0;
@@ -2844,8 +3284,12 @@ static inline bool PFCutTryAtomicLongIntrinsic(
     } else {
       delta = shadow_frame.GetVRegLong(reg_at(1));
     }
+    do {
+      current = receiver->GetField64Volatile(value_offset);
+    } while (!receiver->CasFieldStrongSequentiallyConsistent64<false>(value_offset,
+                                                                      current,
+                                                                      current + delta));
     const int64_t updated = current + delta;
-    value_field->SetLong<false>(receiver, updated);
     result->SetJ(is_get_and_add ? current : updated);
   }
 
@@ -2877,7 +3321,7 @@ static inline bool PFCutTryUnixFileSystemListIntrinsic(
       number_of_inputs != 2u ||
       called_method->GetDeclaringClass() == nullptr ||
       !called_method->GetDeclaringClass()->DescriptorEquals("Ljava/io/UnixFileSystem;") ||
-      strcmp(called_method->GetName(), "list") != 0) {
+      strcmp(WlSafeName(called_method), "list") != 0) {
     return false;
   }
 
@@ -2975,7 +3419,7 @@ static inline bool PFCutTryUnixFileSystemGetBooleanAttributesIntrinsic(
       number_of_inputs != 2u ||
       called_method->GetDeclaringClass() == nullptr ||
       !called_method->GetDeclaringClass()->DescriptorEquals("Ljava/io/UnixFileSystem;") ||
-      strcmp(called_method->GetName(), "getBooleanAttributes") != 0) {
+      strcmp(WlSafeName(called_method), "getBooleanAttributes") != 0) {
     return false;
   }
 
@@ -3041,6 +3485,70 @@ static inline bool PFCutTryUnixFileSystemGetBooleanAttributesIntrinsic(
 }
 
 template <bool is_range>
+static inline bool PFCutTryUnixFileSystemGetLengthIntrinsic(
+    ArtMethod* called_method,
+    ShadowFrame& shadow_frame,
+    JValue* result,
+    uint16_t number_of_inputs,
+    uint32_t (&arg)[Instruction::kMaxVarArgRegs],
+    uint32_t vregC)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (called_method == nullptr ||
+      called_method->IsStatic() ||
+      number_of_inputs != 2u ||
+      called_method->GetDeclaringClass() == nullptr ||
+      !called_method->GetDeclaringClass()->DescriptorEquals("Ljava/io/UnixFileSystem;") ||
+      strcmp(WlSafeName(called_method), "getLength") != 0) {
+    return false;
+  }
+
+  uint32_t shorty_len = 0;
+  const char* shorty =
+      called_method->GetInterfaceMethodIfProxy(kRuntimePointerSize)->GetShorty(&shorty_len);
+  if (shorty == nullptr || strcmp(shorty, "JL") != 0) {
+    return false;
+  }
+
+  const auto reg_at = [&](uint32_t input_index) -> uint32_t {
+    return is_range ? (vregC + input_index) : arg[input_index];
+  };
+
+  ObjPtr<mirror::Object> file = shadow_frame.GetVRegReference(reg_at(1));
+  if (file == nullptr) {
+    ThrowNullPointerExceptionFromInterpreter();
+    result->SetJ(0);
+    return true;
+  }
+
+  std::string path;
+  ArtField* path_field = file->GetClass()->FindInstanceField("path", "Ljava/lang/String;");
+  if (path_field != nullptr) {
+    ObjPtr<mirror::Object> path_obj = path_field->GetObject(file);
+    if (path_obj != nullptr && path_obj->IsString()) {
+      path = path_obj->AsString()->ToModifiedUtf8();
+    }
+  }
+
+  int64_t length = 0;
+  struct stat sb;
+  if (!path.empty() && stat(path.c_str(), &sb) == 0 && S_ISREG(sb.st_mode)) {
+    length = static_cast<int64_t>(sb.st_size);
+  }
+
+  static thread_local int unixfs_length_count = 0;
+  if (unixfs_length_count < 120) {
+    unixfs_length_count++;
+    fprintf(stderr,
+            "[PFCUT] UnixFileSystem.getLength intrinsic path=%s length=%lld\n",
+            path.empty() ? "<unknown>" : path.c_str(),
+            static_cast<long long>(length));
+    fflush(stderr);
+  }
+  result->SetJ(length);
+  return true;
+}
+
+template <bool is_range>
 static inline bool PFCutTryUnixFileSystemCanonicalizeIntrinsic(
     ArtMethod* called_method,
     Thread* self,
@@ -3055,8 +3563,8 @@ static inline bool PFCutTryUnixFileSystemCanonicalizeIntrinsic(
       number_of_inputs != 2u ||
       called_method->GetDeclaringClass() == nullptr ||
       !called_method->GetDeclaringClass()->DescriptorEquals("Ljava/io/UnixFileSystem;") ||
-      (strcmp(called_method->GetName(), "canonicalize0") != 0 &&
-       strcmp(called_method->GetName(), "canonicalize") != 0)) {
+      (strcmp(WlSafeName(called_method), "canonicalize0") != 0 &&
+       strcmp(WlSafeName(called_method), "canonicalize") != 0)) {
     return false;
   }
 
@@ -3094,7 +3602,7 @@ static inline bool PFCutTryUnixFileSystemCanonicalizeIntrinsic(
     canonicalize_count++;
     fprintf(stderr,
             "[PFCUT] UnixFileSystem.%s intrinsic path=%s result=%s\n",
-            called_method->GetName(),
+            WlSafeName(called_method),
             path.c_str(),
             out != nullptr ? out->ToModifiedUtf8().c_str() : "<null>");
     fflush(stderr);
@@ -3118,7 +3626,7 @@ static inline bool PFCutTryLinuxOpenIntrinsic(
       number_of_inputs != 4u ||
       called_method->GetDeclaringClass() == nullptr ||
       !called_method->GetDeclaringClass()->DescriptorEquals("Llibcore/io/Linux;") ||
-      strcmp(called_method->GetName(), "open") != 0) {
+      strcmp(WlSafeName(called_method), "open") != 0) {
     return false;
   }
 
@@ -3154,6 +3662,31 @@ static inline bool PFCutTryLinuxOpenIntrinsic(
     saved_errno = errno;
   }
 
+  // WESTLAKE §293h (2026-07-23): SystemFonts hard-codes /system/etc/fonts.xml, but an OH app
+  // sandbox does not mount /system/etc. MEASURED from inside the ability process:
+  //   etc/fonts.xml=0  android/etc/fonts.xml=0  ttf=1  fontsdir=1
+  // i.e. the .ttf files ARE reachable but the config is not. With no config the system font map
+  // comes back empty, so Typeface.DEFAULT stays null and Typeface.create(family,style) NPEs on
+  // family.mStyle inside loadPreinstalledSystemFontMap -> ensureBindApplication FAILS ->
+  // mInitialApplication null -> Application.getResources() NPE -> the app dies.
+  // Retry from a sandbox-readable copy. Only fires when the stock open already FAILED, so the
+  // appspawn-x child (which can read /system/etc) is completely unaffected.
+  if (fd < 0 && path.find("fonts.xml") != std::string::npos) {
+    static const char* kFontCfgFallback[] = {
+      "/data/storage/el1/base/asx/fonts.xml",  // ability process (app sandbox)
+      "/data/local/tmp/asx/fonts.xml",         // appspawn-x staging
+    };
+    for (const char* cand : kFontCfgFallback) {
+      fd = ::open(cand, static_cast<int>(flags), static_cast<mode_t>(mode));
+      if (fd >= 0) {
+        fprintf(stderr, "[WESTLAKE] fonts.xml redirect %s -> %s\n", path.c_str(), cand);
+        fflush(stderr);
+        break;
+      }
+    }
+    if (fd < 0) { saved_errno = errno; }
+  }
+
   bool used_dev_null = false;
   const int access_mode = flags & O_ACCMODE;
   const bool wants_write = access_mode == O_WRONLY ||
@@ -3177,7 +3710,7 @@ static inline bool PFCutTryLinuxOpenIntrinsic(
   }
 
   ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
-  StackHandleScope<4> hs(self);
+  StackHandleScope<6> hs(self);
   Handle<mirror::Class> h_fd_class(
       hs.NewHandle(class_linker->FindSystemClass(self, "Ljava/io/FileDescriptor;")));
   if (h_fd_class == nullptr) {
@@ -3259,7 +3792,7 @@ static inline bool PFCutTryClassGetDeclaredFieldIntrinsic(
       number_of_inputs != 2u ||
       called_method->GetDeclaringClass() == nullptr ||
       !called_method->GetDeclaringClass()->DescriptorEquals("Ljava/lang/Class;") ||
-      strcmp(called_method->GetName(), "getDeclaredField") != 0) {
+      strcmp(WlSafeName(called_method), "getDeclaredField") != 0) {
     return false;
   }
 
@@ -3368,7 +3901,7 @@ static inline bool PFCutTryClassNewInstanceIntrinsic(
       number_of_inputs != 1u ||
       called_method->GetDeclaringClass() == nullptr ||
       !called_method->GetDeclaringClass()->DescriptorEquals("Ljava/lang/Class;") ||
-      strcmp(called_method->GetName(), "newInstance") != 0) {
+      strcmp(WlSafeName(called_method), "newInstance") != 0) {
     return false;
   }
 
@@ -3475,7 +4008,7 @@ static inline bool PFCutTryMethodHandlesLookupIntrinsic(ArtMethod* called_method
     return false;
   }
 
-  const char* method_name = called_method->GetName();
+  const char* method_name = WlSafeName(called_method);
   if (method_name == nullptr || strcmp(method_name, "lookup") != 0) {
     return false;
   }
@@ -3541,7 +4074,7 @@ static inline bool PFCutTryDexPathListFindLibraryIntrinsic(
     return false;
   }
 
-  const char* method_name = called_method->GetName();
+  const char* method_name = WlSafeName(called_method);
   if (method_name == nullptr || strcmp(method_name, "findLibrary") != 0 ||
       number_of_inputs < 2u) {
     return false;
@@ -3617,7 +4150,7 @@ static inline bool PFCutTryFileSystemsGetDefaultFallback(ArtMethod* called_metho
       number_of_inputs != 0u ||
       called_method->GetDeclaringClass() == nullptr ||
       !called_method->GetDeclaringClass()->DescriptorEquals("Ljava/nio/file/FileSystems;") ||
-      strcmp(called_method->GetName(), "getDefault") != 0) {
+      strcmp(WlSafeName(called_method), "getDefault") != 0) {
     return false;
   }
 
@@ -3782,6 +4315,392 @@ static inline bool PFCutTryMcdLoggerNoop(ArtMethod* called_method,
   return true;
 }
 
+static inline bool PFCutTryMcdJustFlipEventNoop(ArtMethod* called_method,
+                                                JValue* result)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (called_method == nullptr ||
+      called_method->GetDeclaringClass() == nullptr ||
+      strcmp(WlSafeName(called_method), "c") != 0 ||
+      called_method->IsStatic() ||
+      !called_method->GetDeclaringClass()->DescriptorEquals(
+          "Lcom/mcdonalds/justflip_kmm/flag_providers/JustFlipBase;")) {
+    return false;
+  }
+
+  uint32_t shorty_len = 0;
+  const char* shorty =
+      called_method->GetInterfaceMethodIfProxy(kRuntimePointerSize)->GetShorty(&shorty_len);
+  if (shorty == nullptr || strcmp(shorty, "VL") != 0) {
+    return false;
+  }
+
+  static thread_local int justflip_event_noop_count = 0;
+  if (justflip_event_noop_count < 40 || WestlakeTraceVerboseCalls()) {
+    justflip_event_noop_count++;
+    fprintf(stderr,
+            "[PFCUT-MCD] JustFlipBase.c event emission noop %s shorty=%s\n",
+            called_method->PrettyMethod().c_str(),
+            shorty);
+    fflush(stderr);
+  }
+  result->SetJ(0);
+  return true;
+}
+
+static inline bool PFCutSetMcdNetworkStringResponse(ArtMethod* called_method,
+                                                    JValue* result,
+                                                    int32_t status,
+                                                    const std::string& body_text)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  Thread* self = Thread::Current();
+  if (self == nullptr || called_method == nullptr || result == nullptr ||
+      called_method->GetDeclaringClass() == nullptr) {
+    return false;
+  }
+
+  ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
+  StackHandleScope<4> hs(self);
+  Handle<mirror::ClassLoader> h_loader(
+      hs.NewHandle(called_method->GetDeclaringClass()->GetClassLoader()));
+  Handle<mirror::Class> h_response_class(hs.NewHandle(class_linker->FindClass(
+      self, "Lcom/mcdonalds/mcdcoreapp/network/Response;", h_loader)));
+  if (h_response_class == nullptr || self->IsExceptionPending()) {
+    if (self->IsExceptionPending()) {
+      self->ClearException();
+    }
+    result->SetL(nullptr);
+    return true;
+  }
+  if (!class_linker->EnsureInitialized(self, h_response_class, true, true)) {
+    if (self->IsExceptionPending()) {
+      self->ClearException();
+    }
+    result->SetL(nullptr);
+    return true;
+  }
+
+  Handle<mirror::Object> h_response(hs.NewHandle(h_response_class->AllocObject(self)));
+  if (h_response == nullptr || self->IsExceptionPending()) {
+    if (self->IsExceptionPending()) {
+      self->ClearException();
+    }
+    result->SetL(nullptr);
+    return true;
+  }
+
+  ArtField* status_field = h_response_class->FindInstanceField("b", "I");
+  ArtField* body_field = h_response_class->FindInstanceField("d", "Ljava/lang/Object;");
+  if (status_field != nullptr) {
+    status_field->SetInt<false>(h_response.Get(), status);
+  }
+  if (body_field != nullptr) {
+    ObjPtr<mirror::String> body =
+        mirror::String::AllocFromModifiedUtf8(self, body_text.c_str());
+    if (body != nullptr && !self->IsExceptionPending()) {
+      Handle<mirror::String> h_body(hs.NewHandle(body));
+      body_field->SetObject<false>(h_response.Get(), h_body.Get());
+    } else if (self->IsExceptionPending()) {
+      self->ClearException();
+    }
+  }
+  result->SetL(h_response.Get());
+  return true;
+}
+
+static inline bool PFCutLogMcdRequestProvider(Thread* self,
+                                              ArtMethod* called_method,
+                                              ObjPtr<mirror::Object> provider,
+                                              std::string* out_url,
+                                              int32_t* out_method_type,
+                                              std::string* out_response_type)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (out_url != nullptr) {
+    *out_url = "<unknown>";
+  }
+  if (out_method_type != nullptr) {
+    *out_method_type = -1;
+  }
+  if (out_response_type != nullptr) {
+    *out_response_type = "<unknown>";
+  }
+  if (self == nullptr || called_method == nullptr || provider == nullptr ||
+      provider->GetClass() == nullptr) {
+    return false;
+  }
+
+  ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
+  StackHandleScope<4> hs(self);
+  Handle<mirror::Object> h_provider(hs.NewHandle(provider));
+  Handle<mirror::ClassLoader> h_loader(
+      hs.NewHandle(called_method->GetDeclaringClass()->GetClassLoader()));
+  Handle<mirror::Class> h_provider_interface(hs.NewHandle(class_linker->FindClass(
+      self, "Lcom/mcdonalds/mcdcoreapp/network/RequestProvider;", h_loader)));
+  if (h_provider_interface == nullptr || self->IsExceptionPending()) {
+    if (self->IsExceptionPending()) {
+      self->ClearException();
+    }
+    return false;
+  }
+
+  ArtMethod* url_method = h_provider_interface->FindInterfaceMethod(
+      "b", "()Ljava/lang/String;", kRuntimePointerSize);
+  ArtMethod* method_type_method = h_provider_interface->FindInterfaceMethod(
+      "a", "()I", kRuntimePointerSize);
+  ArtMethod* response_type_method = h_provider_interface->FindInterfaceMethod(
+      "c", "()Ljava/lang/Class;", kRuntimePointerSize);
+
+  std::string url = "<unknown>";
+  int32_t method_type = -1;
+  std::string response_type = "<unknown>";
+  ScopedObjectAccessUnchecked soa(self);
+  ScopedJniEnvLocalRefState env_state(soa.Env());
+  jobject receiver = soa.AddLocalReference<jobject>(h_provider.Get());
+
+  if (url_method != nullptr) {
+    JValue url_result =
+        InvokeVirtualOrInterfaceWithJValues(soa, receiver, url_method, nullptr);
+    if (self->IsExceptionPending()) {
+      self->ClearException();
+      url = "<exception>";
+    } else if (url_result.GetL() != nullptr &&
+               url_result.GetL()->GetClass()->DescriptorEquals("Ljava/lang/String;")) {
+      url = url_result.GetL()->AsString()->ToModifiedUtf8();
+    }
+  }
+
+  if (method_type_method != nullptr) {
+    JValue method_result =
+        InvokeVirtualOrInterfaceWithJValues(soa, receiver, method_type_method, nullptr);
+    if (self->IsExceptionPending()) {
+      self->ClearException();
+      method_type = -2;
+    } else {
+      method_type = method_result.GetI();
+    }
+  }
+
+  if (response_type_method != nullptr) {
+    JValue response_result =
+        InvokeVirtualOrInterfaceWithJValues(soa, receiver, response_type_method, nullptr);
+    if (self->IsExceptionPending()) {
+      self->ClearException();
+      response_type = "<exception>";
+    } else if (response_result.GetL() != nullptr && response_result.GetL()->IsClass()) {
+      response_type = response_result.GetL()->AsClass()->PrettyDescriptor();
+    }
+  }
+
+  static thread_local int mcd_network_provider_count = 0;
+  if (mcd_network_provider_count < 120 || WestlakeTraceMcdCalls()) {
+    mcd_network_provider_count++;
+    fprintf(stderr,
+            "[PFCUT-MCD-NET] provider method=%s httpMethodType=%d response=%s url=%s\n",
+            called_method->PrettyMethod().c_str(),
+            method_type,
+            response_type.c_str(),
+            url.c_str());
+    fflush(stderr);
+  }
+  if (out_url != nullptr) {
+    *out_url = url;
+  }
+  if (out_method_type != nullptr) {
+    *out_method_type = method_type;
+  }
+  if (out_response_type != nullptr) {
+    *out_response_type = response_type;
+  }
+  return true;
+}
+
+static inline bool PFCutTryMcdBridgeHttpGetResponse(ArtMethod* called_method,
+                                                    const std::string& url,
+                                                    JValue* result)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  Thread* self = Thread::Current();
+  if (self == nullptr || called_method == nullptr || result == nullptr ||
+      url.empty() || url == "<unknown>" || url == "<exception>") {
+    return false;
+  }
+
+  ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
+  StackHandleScope<6> hs(self);
+  Handle<mirror::ClassLoader> h_loader(
+      hs.NewHandle(called_method->GetDeclaringClass()->GetClassLoader()));
+  Handle<mirror::Class> h_launcher(hs.NewHandle(class_linker->FindClass(
+      self, "Lcom/westlake/engine/WestlakeLauncher;", h_loader)));
+  if (h_launcher == nullptr || self->IsExceptionPending()) {
+    if (self->IsExceptionPending()) {
+      self->ClearException();
+    }
+    return false;
+  }
+  if (!class_linker->EnsureInitialized(self, h_launcher, true, true)) {
+    if (self->IsExceptionPending()) {
+      self->ClearException();
+    }
+    return false;
+  }
+
+  ArtMethod* bridge_method = h_launcher->FindClassMethod(
+      "bridgeHttpGetBytes", "(Ljava/lang/String;II)[B", kRuntimePointerSize);
+  ArtMethod* last_status_method = h_launcher->FindClassMethod(
+      "bridgeHttpLastStatus", "()I", kRuntimePointerSize);
+  ArtMethod* last_error_method = h_launcher->FindClassMethod(
+      "bridgeHttpLastError", "()Ljava/lang/String;", kRuntimePointerSize);
+  if (bridge_method == nullptr || last_status_method == nullptr) {
+    return false;
+  }
+
+  Handle<mirror::String> h_url(
+      hs.NewHandle(mirror::String::AllocFromModifiedUtf8(self, url.c_str())));
+  if (h_url == nullptr || self->IsExceptionPending()) {
+    if (self->IsExceptionPending()) {
+      self->ClearException();
+    }
+    return false;
+  }
+
+  ScopedObjectAccessUnchecked soa(self);
+  ScopedJniEnvLocalRefState env_state(soa.Env());
+  jvalue args[3] = {};
+  args[0].l = soa.AddLocalReference<jobject>(h_url.Get());
+  args[1].i = 512 * 1024;
+  args[2].i = 20000;
+  JValue bytes_result = InvokeWithJValues(soa, nullptr, bridge_method, args);
+  bool bridge_threw = false;
+  if (self->IsExceptionPending()) {
+    self->ClearException();
+    bridge_threw = true;
+  }
+
+  int32_t status = -599;
+  JValue status_result = InvokeWithJValues(soa, nullptr, last_status_method, nullptr);
+  if (self->IsExceptionPending()) {
+    self->ClearException();
+  } else {
+    status = status_result.GetI();
+  }
+
+  std::string error = "";
+  if (last_error_method != nullptr) {
+    JValue error_result = InvokeWithJValues(soa, nullptr, last_error_method, nullptr);
+    if (self->IsExceptionPending()) {
+      self->ClearException();
+    } else if (error_result.GetL() != nullptr &&
+               error_result.GetL()->GetClass()->DescriptorEquals("Ljava/lang/String;")) {
+      error = error_result.GetL()->AsString()->ToModifiedUtf8();
+    }
+  }
+
+  std::string body = "{}";
+  ObjPtr<mirror::Object> bytes_object = bytes_result.GetL();
+  if (!bridge_threw && bytes_object != nullptr && bytes_object->IsByteArray()) {
+    ObjPtr<mirror::ByteArray> bytes = bytes_object->AsByteArray();
+    const int32_t length = bytes->GetLength();
+    if (length > 0) {
+      body.assign(reinterpret_cast<const char*>(bytes->GetData()),
+                  reinterpret_cast<const char*>(bytes->GetData()) + length);
+    }
+  }
+  if (status <= 0) {
+    status = 503;
+  }
+
+  static thread_local int mcd_network_bridge_count = 0;
+  if (mcd_network_bridge_count < 120 || WestlakeTraceMcdCalls()) {
+    mcd_network_bridge_count++;
+    fprintf(stderr,
+            "[PFCUT-MCD-NET] bridge response status=%d bytes=%zu error=%s url=%s\n",
+            status,
+            body.size(),
+            error.empty() ? "<none>" : error.c_str(),
+            url.c_str());
+    fflush(stderr);
+  }
+
+  return PFCutSetMcdNetworkStringResponse(called_method, result, status, body);
+}
+
+template <bool is_range>
+static inline bool PFCutTryMcdNetworkBoundaryNoop(ArtMethod* called_method,
+                                                  Thread* self,
+                                                  ShadowFrame& shadow_frame,
+                                                  JValue* result,
+                                                  uint16_t number_of_inputs,
+                                                  uint32_t (&arg)[Instruction::kMaxVarArgRegs],
+                                                  uint32_t vregC)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (called_method == nullptr || called_method->GetDeclaringClass() == nullptr) {
+    return false;
+  }
+
+  std::string descriptor_storage;
+  const char* descriptor =
+      called_method->GetDeclaringClass()->GetDescriptor(&descriptor_storage);
+  if (descriptor == nullptr ||
+      strcmp(descriptor, "Lcom/mcdonalds/mcdcoreapp/network/McDRequestManager;") != 0) {
+    return false;
+  }
+
+  uint32_t shorty_len = 0;
+  const char* shorty =
+      called_method->GetInterfaceMethodIfProxy(kRuntimePointerSize)->GetShorty(&shorty_len);
+  const char* name = WlSafeName(called_method);
+  if (shorty == nullptr || name == nullptr) {
+    return false;
+  }
+
+  const bool async_request_entry =
+      !called_method->IsStatic() && strcmp(name, "e") == 0 && strcmp(shorty, "VLL") == 0;
+  const bool request_callable =
+      called_method->IsStatic() &&
+      (strcmp(name, "a") == 0 || strcmp(name, "d") == 0) &&
+      strcmp(shorty, "LL") == 0;
+  if (!async_request_entry && !request_callable) {
+    return false;
+  }
+
+  const auto reg_at = [&](uint32_t input_index) -> uint32_t {
+    return is_range ? (vregC + input_index) : arg[input_index];
+  };
+  std::string provider_url;
+  int32_t provider_method_type = -1;
+  std::string provider_response_type;
+  if (number_of_inputs >= (called_method->IsStatic() ? 1u : 2u)) {
+    const uint32_t provider_slot = called_method->IsStatic() ? 0u : 1u;
+    PFCutLogMcdRequestProvider(
+        self,
+        called_method,
+        shadow_frame.GetVRegReference(reg_at(provider_slot)),
+        &provider_url,
+        &provider_method_type,
+        &provider_response_type);
+  }
+
+  if (async_request_entry) {
+    return false;
+  }
+
+  static thread_local int mcd_network_noop_count = 0;
+  if (mcd_network_noop_count < 80 || WestlakeTraceMcdCalls()) {
+    mcd_network_noop_count++;
+    fprintf(stderr,
+            "[PFCUT-MCD] network boundary live passthrough %s shorty=%s quick=%p code=%p\n",
+            called_method->PrettyMethod().c_str(),
+            shorty,
+            called_method->GetEntryPointFromQuickCompiledCode(),
+            called_method->GetCodeItem());
+    fflush(stderr);
+  }
+
+  if (provider_method_type == 0 &&
+      PFCutTryMcdBridgeHttpGetResponse(called_method, provider_url, result)) {
+    return true;
+  }
+  return PFCutSetMcdNetworkStringResponse(called_method, result, 503, "{}");
+}
+
 template <bool is_range>
 static inline bool PFCutTryMcdPerfAnalyticsNoop(ArtMethod* called_method,
                                                 Thread* self,
@@ -3835,7 +4754,7 @@ static inline bool PFCutTryMcdPerfAnalyticsNoop(ArtMethod* called_method,
     fflush(stderr);
   }
 
-  const char* name = called_method->GetName();
+  const char* name = WlSafeName(called_method);
   if (name != nullptr &&
       strcmp(name, "H") == 0 &&
       called_method->IsStatic() &&
@@ -3870,7 +4789,7 @@ static inline bool PFCutTryNumberFormatCurrencyFallback(ArtMethod* called_method
       number_of_inputs != 1u ||
       called_method->GetDeclaringClass() == nullptr ||
       !called_method->GetDeclaringClass()->DescriptorEquals("Ljava/text/NumberFormat;") ||
-      strcmp(called_method->GetName(), "getCurrencyInstance") != 0) {
+      strcmp(WlSafeName(called_method), "getCurrencyInstance") != 0) {
     return false;
   }
 
@@ -3901,7 +4820,7 @@ static inline bool PFCutTryVMClassLoaderGetResourceFallback(ArtMethod* called_me
       number_of_inputs != 1u ||
       called_method->GetDeclaringClass() == nullptr ||
       !called_method->GetDeclaringClass()->DescriptorEquals("Ljava/lang/VMClassLoader;") ||
-      strcmp(called_method->GetName(), "getResource") != 0) {
+      strcmp(WlSafeName(called_method), "getResource") != 0) {
     return false;
   }
 
@@ -3934,7 +4853,7 @@ static inline bool PFCutTryVMClassLoaderGetResourcesFallback(ArtMethod* called_m
       number_of_inputs != 1u ||
       called_method->GetDeclaringClass() == nullptr ||
       !called_method->GetDeclaringClass()->DescriptorEquals("Ljava/lang/VMClassLoader;") ||
-      strcmp(called_method->GetName(), "getResources") != 0) {
+      strcmp(WlSafeName(called_method), "getResources") != 0) {
     return false;
   }
 
@@ -4012,10 +4931,10 @@ static inline bool PFCutTryIcuDataPathPropertyFallback(
 
   const bool is_icu_config =
       called_method->GetDeclaringClass()->DescriptorEquals("Landroid/icu/impl/ICUConfig;") &&
-      strcmp(called_method->GetName(), "get") == 0;
+      strcmp(WlSafeName(called_method), "get") == 0;
   const bool is_system_property =
       called_method->GetDeclaringClass()->DescriptorEquals("Ljava/lang/System;") &&
-      strcmp(called_method->GetName(), "getProperty") == 0;
+      strcmp(WlSafeName(called_method), "getProperty") == 0;
   if (!is_icu_config && !is_system_property) {
     return false;
   }
@@ -4071,7 +4990,7 @@ static inline bool PFCutTryCurrencyInstanceFallback(ArtMethod* called_method,
       number_of_inputs != 1u ||
       called_method->GetDeclaringClass() == nullptr ||
       !called_method->GetDeclaringClass()->DescriptorEquals("Ljava/util/Currency;") ||
-      strcmp(called_method->GetName(), "getInstance") != 0) {
+      strcmp(WlSafeName(called_method), "getInstance") != 0) {
     return false;
   }
 
@@ -4134,7 +5053,7 @@ static inline bool PFCutTryCurrencyMethodFallback(ArtMethod* called_method,
     return false;
   }
 
-  const char* name = called_method->GetName();
+  const char* name = WlSafeName(called_method);
   if (strcmp(name, "getSymbol") != 0 &&
       strcmp(name, "getDisplayName") != 0 &&
       strcmp(name, "getDefaultFractionDigits") != 0 &&
@@ -4234,7 +5153,7 @@ static inline bool PFCutTryULocaleForLocaleFallback(ArtMethod* called_method,
       number_of_inputs != 1u ||
       called_method->GetDeclaringClass() == nullptr ||
       !called_method->GetDeclaringClass()->DescriptorEquals("Landroid/icu/util/ULocale;") ||
-      strcmp(called_method->GetName(), "forLocale") != 0) {
+      strcmp(WlSafeName(called_method), "forLocale") != 0) {
     return false;
   }
 
@@ -4285,7 +5204,7 @@ static inline bool PFCutTryULocaleGetDefaultFallback(ArtMethod* called_method,
       !called_method->IsStatic() ||
       called_method->GetDeclaringClass() == nullptr ||
       !called_method->GetDeclaringClass()->DescriptorEquals("Landroid/icu/util/ULocale;") ||
-      strcmp(called_method->GetName(), "getDefault") != 0) {
+      strcmp(WlSafeName(called_method), "getDefault") != 0) {
     return false;
   }
 
@@ -4329,6 +5248,17 @@ static inline bool PFCutTryULocaleGetDefaultFallback(ArtMethod* called_method,
 }
 
 template <bool is_range>
+// WESTLAKE §667 (2026-08-16): NEVER fabricate a null KClass — fall through to the real method.
+// This shim builds a minimal kotlin ClassReference as a *fallback*, but on ANY failure it did
+// `result->SetL(nullptr); return true;`, i.e. it CLAIMED the call and handed back a null KClass with
+// no exception. That is the origin of Toutiao's blocker: androidx lifecycle 2.9's
+// `ViewModelProvider.get(Class)` is a thin adapter that calls
+// `JvmClassMappingKt.getKotlinClass(Class)` and passes the result to `get(KClass)`, whose Kotlin
+// intrinsic then throws "Parameter specified as non-null is null: … parameter modelClass" one frame
+// later. CONST_CLASS and the whole argument path were verified innocent (§664/§666).
+// `kotlin.reflect.jvm.internal.ReflectionFactoryImpl` IS bundled (classes14.dex) and its
+// implementation is trivial, so returning FALSE lets the app's own, correct code run.
+// Logging is file-gated (`touch /data/local/tmp/asx/ARGNULL`) and names which exit fired.
 static inline bool PFCutTryKotlinReflectionFallback(ArtMethod* called_method,
                                                     Thread* self,
                                                     ShadowFrame& shadow_frame,
@@ -4348,7 +5278,7 @@ static inline bool PFCutTryKotlinReflectionFallback(ArtMethod* called_method,
     return false;
   }
 
-  const char* name = called_method->GetName();
+  const char* name = WlSafeName(called_method);
   if (name == nullptr || strcmp(name, "getOrCreateKotlinClass") != 0) {
     return false;
   }
@@ -4365,8 +5295,14 @@ static inline bool PFCutTryKotlinReflectionFallback(ArtMethod* called_method,
   const uint32_t class_arg_reg = is_range ? vregC + 1u : arg[1];
   ObjPtr<mirror::Object> java_class = shadow_frame.GetVRegReference(class_arg_reg);
   if (java_class == nullptr) {
-    result->SetL(nullptr);
-    return true;
+    if (access("/data/local/tmp/asx/ARGNULL", F_OK) == 0) {
+      static thread_local int wl_kr = 0;
+      if (wl_kr < 8) { wl_kr++;
+        fprintf(stderr, "[WL-KREFL] getOrCreateKotlinClass fallback exit reason=1"
+                        " -> deferring to the real method\n");
+        fflush(stderr); }
+    }
+    return false;  // §667: do NOT claim the call; let real Kotlin reflection run.
   }
 
   StackHandleScope<3> hs(self);
@@ -4380,28 +5316,52 @@ static inline bool PFCutTryKotlinReflectionFallback(ArtMethod* called_method,
     if (self->IsExceptionPending()) {
       self->ClearException();
     }
-    result->SetL(nullptr);
-    return true;
+    if (access("/data/local/tmp/asx/ARGNULL", F_OK) == 0) {
+      static thread_local int wl_kr = 0;
+      if (wl_kr < 8) { wl_kr++;
+        fprintf(stderr, "[WL-KREFL] getOrCreateKotlinClass fallback exit reason=2"
+                        " -> deferring to the real method\n");
+        fflush(stderr); }
+    }
+    return false;  // §667: do NOT claim the call; let real Kotlin reflection run.
   }
 
   if (!class_linker->EnsureInitialized(self, h_class_reference, true, true)) {
     if (self->IsExceptionPending()) {
       self->ClearException();
     }
-    result->SetL(nullptr);
-    return true;
+    if (access("/data/local/tmp/asx/ARGNULL", F_OK) == 0) {
+      static thread_local int wl_kr = 0;
+      if (wl_kr < 8) { wl_kr++;
+        fprintf(stderr, "[WL-KREFL] getOrCreateKotlinClass fallback exit reason=3"
+                        " -> deferring to the real method\n");
+        fflush(stderr); }
+    }
+    return false;  // §667: do NOT claim the call; let real Kotlin reflection run.
   }
 
   ObjPtr<mirror::Object> class_reference = h_class_reference->AllocObject(self);
   if (class_reference == nullptr) {
-    result->SetL(nullptr);
-    return true;
+    if (access("/data/local/tmp/asx/ARGNULL", F_OK) == 0) {
+      static thread_local int wl_kr = 0;
+      if (wl_kr < 8) { wl_kr++;
+        fprintf(stderr, "[WL-KREFL] getOrCreateKotlinClass fallback exit reason=4"
+                        " -> deferring to the real method\n");
+        fflush(stderr); }
+    }
+    return false;  // §667: do NOT claim the call; let real Kotlin reflection run.
   }
   ArtField* j_class_field =
       h_class_reference->FindInstanceField("jClass", "Ljava/lang/Class;");
   if (j_class_field == nullptr) {
-    result->SetL(nullptr);
-    return true;
+    if (access("/data/local/tmp/asx/ARGNULL", F_OK) == 0) {
+      static thread_local int wl_kr = 0;
+      if (wl_kr < 8) { wl_kr++;
+        fprintf(stderr, "[WL-KREFL] getOrCreateKotlinClass fallback exit reason=5"
+                        " -> deferring to the real method\n");
+        fflush(stderr); }
+    }
+    return false;  // §667: do NOT claim the call; let real Kotlin reflection run.
   }
   j_class_field->SetObject<false>(class_reference, h_java_class.Get());
 
@@ -4416,6 +5376,203 @@ static inline bool PFCutTryKotlinReflectionFallback(ArtMethod* called_method,
   }
 
   result->SetL(class_reference);
+  return true;
+}
+
+template <bool is_range>
+static inline bool PFCutTryAndroidxLifecycleFactoryDefaultCreateBroadFallback(
+    ArtMethod* called_method,
+    Thread* self,
+    ShadowFrame& shadow_frame,
+    JValue* result,
+    uint16_t number_of_inputs,
+    uint32_t (&arg)[Instruction::kMaxVarArgRegs],
+    uint32_t vregC)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (called_method == nullptr ||
+      self == nullptr ||
+      called_method->IsStatic() ||
+      number_of_inputs < 2u ||
+      called_method->GetDeclaringClass() == nullptr ||
+      !called_method->GetDeclaringClass()->DescriptorEquals(
+          "Landroidx/lifecycle/ViewModelProvider$Factory;") ||
+      strcmp(WlSafeName(called_method), "create") != 0) {
+    return false;
+  }
+
+  const std::string pretty = called_method->PrettyMethod();
+  if (pretty.find("androidx.lifecycle.viewmodel.CreationExtras") == std::string::npos ||
+      pretty.find("java.lang.Class") == std::string::npos) {
+    return false;
+  }
+
+  auto input_reg = [&](uint32_t input_index) -> uint32_t {
+    return is_range ? vregC + input_index : arg[input_index];
+  };
+
+  ObjPtr<mirror::Object> receiver = shadow_frame.GetVRegReference(input_reg(0));
+  if (receiver == nullptr) {
+    ThrowNullPointerExceptionFromInterpreter();
+    result->SetJ(0);
+    return true;
+  }
+
+  ObjPtr<mirror::Object> java_class_object = nullptr;
+  for (uint32_t i = 1; i < number_of_inputs; ++i) {
+    ObjPtr<mirror::Object> candidate = shadow_frame.GetVRegReference(input_reg(i));
+    if (candidate != nullptr && candidate->IsClass()) {
+      java_class_object = candidate;
+      break;
+    }
+  }
+  if (java_class_object == nullptr) {
+    result->SetL(nullptr);
+    return true;
+  }
+
+  ObjPtr<mirror::Class> requested_model_class = java_class_object->AsClass();
+  if (requested_model_class == nullptr || !requested_model_class->IsInstantiable()) {
+    result->SetL(nullptr);
+    return true;
+  }
+
+  ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
+  StackHandleScope<2> hs(self);
+  Handle<mirror::Class> h_requested_model_class(hs.NewHandle(requested_model_class));
+  if (!class_linker->EnsureInitialized(self, h_requested_model_class, true, true)) {
+    if (self->IsExceptionPending()) {
+      self->ClearException();
+    }
+    result->SetL(nullptr);
+    return true;
+  }
+
+  ArtMethod* init_method =
+      h_requested_model_class->FindConstructor("()V", class_linker->GetImagePointerSize());
+  Handle<mirror::Object> h_model(hs.NewHandle(h_requested_model_class->AllocObject(self)));
+  if (self->IsExceptionPending()) {
+    self->ClearException();
+  }
+  if (h_model == nullptr) {
+    result->SetL(nullptr);
+    return true;
+  }
+
+  if (init_method != nullptr) {
+    EnterInterpreterFromInvoke(self, init_method, h_model.Get(), nullptr, nullptr);
+    if (self->IsExceptionPending()) {
+      self->ClearException();
+      result->SetL(nullptr);
+      return true;
+    }
+  } else {
+    const std::string model_descriptor = requested_model_class->PrettyDescriptor();
+    if (model_descriptor.find("androidx.lifecycle.") != 0) {
+      result->SetL(nullptr);
+      return true;
+    }
+  }
+
+  static thread_local int lifecycle_default_broad_count = 0;
+  if (lifecycle_default_broad_count < 160 || WestlakeTraceVerboseCalls()) {
+    lifecycle_default_broad_count++;
+    fprintf(stderr,
+            "[PFCUT] AndroidX ViewModelFactory default create broad fallback model %s inputs=%u\n",
+            requested_model_class->PrettyDescriptor().c_str(),
+            number_of_inputs);
+    fflush(stderr);
+  }
+  result->SetL(h_model.Get());
+  return true;
+}
+
+template <bool is_range>
+static inline bool PFCutTryHiltViewModelFactoryCreateFallback(
+    ArtMethod* called_method,
+    Thread* self,
+    ShadowFrame& shadow_frame,
+    JValue* result,
+    uint16_t number_of_inputs,
+    uint32_t (&arg)[Instruction::kMaxVarArgRegs],
+    uint32_t vregC)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (called_method == nullptr ||
+      self == nullptr ||
+      called_method->IsStatic() ||
+      (number_of_inputs != 2u && number_of_inputs != 3u) ||
+      called_method->GetDeclaringClass() == nullptr ||
+      strcmp(WlSafeName(called_method), "create") != 0) {
+    return false;
+  }
+
+  const std::string declaring_descriptor =
+      called_method->GetDeclaringClass()->PrettyDescriptor();
+  if (declaring_descriptor.find("dagger.hilt.android.internal.lifecycle.HiltViewModelFactory") ==
+      std::string::npos) {
+    return false;
+  }
+
+  auto input_reg = [&](uint32_t input_index) -> uint32_t {
+    return is_range ? vregC + input_index : arg[input_index];
+  };
+
+  ObjPtr<mirror::Object> receiver = shadow_frame.GetVRegReference(input_reg(0));
+  ObjPtr<mirror::Object> java_class_object = shadow_frame.GetVRegReference(input_reg(1));
+  if (receiver == nullptr) {
+    ThrowNullPointerExceptionFromInterpreter();
+    result->SetJ(0);
+    return true;
+  }
+  if (java_class_object == nullptr || !java_class_object->IsClass()) {
+    result->SetL(nullptr);
+    return true;
+  }
+
+  ObjPtr<mirror::Class> requested_model_class = java_class_object->AsClass();
+  if (requested_model_class == nullptr || !requested_model_class->IsInstantiable()) {
+    return false;
+  }
+
+  ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
+  StackHandleScope<2> hs(self);
+  Handle<mirror::Class> h_requested_model_class(hs.NewHandle(requested_model_class));
+  if (!class_linker->EnsureInitialized(self, h_requested_model_class, true, true)) {
+    if (self->IsExceptionPending()) {
+      self->ClearException();
+    }
+    return false;
+  }
+
+  ArtMethod* init_method =
+      h_requested_model_class->FindConstructor("()V", class_linker->GetImagePointerSize());
+  if (init_method == nullptr) {
+    return false;
+  }
+
+  Handle<mirror::Object> h_model(hs.NewHandle(h_requested_model_class->AllocObject(self)));
+  if (self->IsExceptionPending()) {
+    self->ClearException();
+  }
+  if (h_model == nullptr) {
+    return false;
+  }
+
+  EnterInterpreterFromInvoke(self, init_method, h_model.Get(), nullptr, nullptr);
+  if (self->IsExceptionPending()) {
+    self->ClearException();
+    return false;
+  }
+
+  static thread_local int hilt_viewmodel_ctor_count = 0;
+  if (hilt_viewmodel_ctor_count < 120 || WestlakeTraceVerboseCalls()) {
+    hilt_viewmodel_ctor_count++;
+    fprintf(stderr,
+            "[PFCUT] Hilt ViewModelFactory create constructed model %s via %s\n",
+            requested_model_class->PrettyDescriptor().c_str(),
+            called_method->PrettyMethod().c_str());
+    fflush(stderr);
+  }
+  result->SetL(h_model.Get());
   return true;
 }
 
@@ -4436,7 +5593,7 @@ static inline bool PFCutTryAndroidxLifecycleKClassFactoryFallback(
       called_method->GetDeclaringClass() == nullptr ||
       !called_method->GetDeclaringClass()->DescriptorEquals(
           "Landroidx/lifecycle/ViewModelProvider$Factory;") ||
-      strcmp(called_method->GetName(), "create") != 0) {
+      strcmp(WlSafeName(called_method), "create") != 0) {
     return false;
   }
 
@@ -4487,6 +5644,50 @@ static inline bool PFCutTryAndroidxLifecycleKClassFactoryFallback(
   Handle<mirror::Object> h_extras(hs.NewHandle(extras));
   Handle<mirror::Class> h_factory_class(hs.NewHandle(called_method->GetDeclaringClass()));
 
+  const std::string receiver_descriptor = h_receiver->GetClass()->PrettyDescriptor();
+  const bool direct_hilt_viewmodel_factory =
+      receiver_descriptor.find("HiltViewModelFactory") != std::string::npos;
+  if (direct_hilt_viewmodel_factory && h_java_class_object.Get()->IsClass()) {
+    ObjPtr<mirror::Class> requested_model_class = h_java_class_object.Get()->AsClass();
+    if (requested_model_class != nullptr &&
+        requested_model_class->IsInstantiable() &&
+        !requested_model_class->DescriptorEquals(
+            "Ldagger/hilt/android/internal/managers/ActivityRetainedComponentManager$"
+            "ActivityRetainedComponentViewModel;")) {
+      ClassLinker* direct_class_linker = Runtime::Current()->GetClassLinker();
+      Handle<mirror::Class> h_requested_model_class(hs.NewHandle(requested_model_class));
+      if (direct_class_linker->EnsureInitialized(
+              self, h_requested_model_class, true, true)) {
+        ArtMethod* init_method = h_requested_model_class->FindConstructor(
+            "()V", direct_class_linker->GetImagePointerSize());
+        Handle<mirror::Object> h_fallback_model(
+            hs.NewHandle(h_requested_model_class->AllocObject(self)));
+        if (self->IsExceptionPending()) {
+          self->ClearException();
+        }
+        if (init_method != nullptr && h_fallback_model != nullptr) {
+          EnterInterpreterFromInvoke(self, init_method, h_fallback_model.Get(), nullptr, nullptr);
+          if (self->IsExceptionPending()) {
+            self->ClearException();
+          } else {
+            static thread_local int lifecycle_kclass_direct_alloc_count = 0;
+            if (lifecycle_kclass_direct_alloc_count < 120 || WestlakeTraceVerboseCalls()) {
+              lifecycle_kclass_direct_alloc_count++;
+              fprintf(stderr,
+                      "[PFCUT] AndroidX ViewModelFactory KClass create constructed model %s\n",
+                      requested_model_class->PrettyDescriptor().c_str());
+              fflush(stderr);
+            }
+            result->SetL(h_fallback_model.Get());
+            return true;
+          }
+        }
+      } else if (self->IsExceptionPending()) {
+        self->ClearException();
+      }
+    }
+  }
+
   static constexpr const char* kClassCreateSignature =
       "(Ljava/lang/Class;Landroidx/lifecycle/viewmodel/CreationExtras;)"
       "Landroidx/lifecycle/ViewModel;";
@@ -4504,6 +5705,57 @@ static inline bool PFCutTryAndroidxLifecycleKClassFactoryFallback(
   }
 
   if (class_create_method != nullptr) {
+    const std::string class_create_pretty = class_create_method->PrettyMethod();
+    if (class_create_pretty.find(
+            "androidx.lifecycle.ViewModelProvider$Factory.create") != std::string::npos &&
+        h_java_class_object.Get()->IsClass()) {
+      ObjPtr<mirror::Class> requested_model_class = h_java_class_object.Get()->AsClass();
+      if (requested_model_class != nullptr && requested_model_class->IsInstantiable()) {
+        ClassLinker* direct_class_linker = Runtime::Current()->GetClassLinker();
+        Handle<mirror::Class> h_requested_model_class(hs.NewHandle(requested_model_class));
+        if (direct_class_linker->EnsureInitialized(self, h_requested_model_class, true, true)) {
+          ArtMethod* init_method = h_requested_model_class->FindConstructor(
+              "()V", direct_class_linker->GetImagePointerSize());
+          Handle<mirror::Object> h_fallback_model(
+              hs.NewHandle(h_requested_model_class->AllocObject(self)));
+          if (self->IsExceptionPending()) {
+            self->ClearException();
+          }
+          if (h_fallback_model != nullptr) {
+            bool model_ready = false;
+            if (init_method != nullptr) {
+              EnterInterpreterFromInvoke(self, init_method, h_fallback_model.Get(), nullptr, nullptr);
+              if (self->IsExceptionPending()) {
+                self->ClearException();
+              } else {
+                model_ready = true;
+              }
+            } else {
+              const std::string model_descriptor =
+                  h_requested_model_class->PrettyDescriptor();
+              model_ready = model_descriptor.find("androidx.lifecycle.") == 0;
+            }
+            if (model_ready) {
+              static thread_local int lifecycle_helper_default_synth_count = 0;
+              if (lifecycle_helper_default_synth_count < 160 ||
+                  WestlakeTraceVerboseCalls()) {
+                lifecycle_helper_default_synth_count++;
+                fprintf(stderr,
+                        "[PFCUT] AndroidX ViewModelProviderImpl KClass helper synthesized "
+                        "default Factory.create model %s\n",
+                        h_requested_model_class->PrettyDescriptor().c_str());
+                fflush(stderr);
+              }
+              result->SetL(h_fallback_model.Get());
+              return true;
+            }
+          }
+        } else if (self->IsExceptionPending()) {
+          self->ClearException();
+        }
+      }
+    }
+
     ScopedObjectAccessUnchecked soa(self);
     ScopedJniEnvLocalRefState env_state(soa.Env());
     jobject receiver_jobj = soa.AddLocalReference<jobject>(h_receiver.Get());
@@ -4618,10 +5870,55 @@ static inline bool PFCutTryAndroidxLifecycleKClassHelperFallback(
     return true;
   }
 
-  StackHandleScope<5> hs(self);
+  StackHandleScope<7> hs(self);
   Handle<mirror::Object> h_receiver(hs.NewHandle(receiver));
   Handle<mirror::Object> h_java_class_object(hs.NewHandle(java_class_object));
   Handle<mirror::Object> h_extras(hs.NewHandle(extras));
+
+  const std::string receiver_descriptor = h_receiver->GetClass()->PrettyDescriptor();
+  const bool direct_hilt_viewmodel_factory =
+      receiver_descriptor.find("HiltViewModelFactory") != std::string::npos;
+  if (direct_hilt_viewmodel_factory && h_java_class_object.Get()->IsClass()) {
+    ObjPtr<mirror::Class> requested_model_class = h_java_class_object.Get()->AsClass();
+    if (requested_model_class != nullptr &&
+        requested_model_class->IsInstantiable() &&
+        !requested_model_class->DescriptorEquals(
+            "Ldagger/hilt/android/internal/managers/ActivityRetainedComponentManager$"
+            "ActivityRetainedComponentViewModel;")) {
+      ClassLinker* direct_class_linker = Runtime::Current()->GetClassLinker();
+      Handle<mirror::Class> h_requested_model_class(hs.NewHandle(requested_model_class));
+      if (direct_class_linker->EnsureInitialized(
+              self, h_requested_model_class, true, true)) {
+        ArtMethod* init_method = h_requested_model_class->FindConstructor(
+            "()V", direct_class_linker->GetImagePointerSize());
+        Handle<mirror::Object> h_fallback_model(
+            hs.NewHandle(h_requested_model_class->AllocObject(self)));
+        if (self->IsExceptionPending()) {
+          self->ClearException();
+        }
+        if (init_method != nullptr && h_fallback_model != nullptr) {
+          EnterInterpreterFromInvoke(self, init_method, h_fallback_model.Get(), nullptr, nullptr);
+          if (self->IsExceptionPending()) {
+            self->ClearException();
+          } else {
+            static thread_local int lifecycle_helper_direct_alloc_count = 0;
+            if (lifecycle_helper_direct_alloc_count < 120 || WestlakeTraceVerboseCalls()) {
+              lifecycle_helper_direct_alloc_count++;
+              fprintf(stderr,
+                      "[PFCUT] AndroidX ViewModelProviderImpl KClass helper constructed model %s\n",
+                      requested_model_class->PrettyDescriptor().c_str());
+              fflush(stderr);
+            }
+            result->SetL(h_fallback_model.Get());
+            return true;
+          }
+        }
+      } else if (self->IsExceptionPending()) {
+        self->ClearException();
+      }
+    }
+  }
+
   Handle<mirror::ClassLoader> h_loader(
       hs.NewHandle(called_method->GetDeclaringClass()->GetClassLoader()));
   ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
@@ -4649,6 +5946,57 @@ static inline bool PFCutTryAndroidxLifecycleKClassHelperFallback(
   }
 
   if (class_create_method != nullptr) {
+    const std::string class_create_pretty = class_create_method->PrettyMethod();
+    if (class_create_pretty.find(
+            "androidx.lifecycle.ViewModelProvider$Factory.create") != std::string::npos &&
+        h_java_class_object.Get()->IsClass()) {
+      ObjPtr<mirror::Class> requested_model_class = h_java_class_object.Get()->AsClass();
+      if (requested_model_class != nullptr && requested_model_class->IsInstantiable()) {
+        ClassLinker* direct_class_linker = Runtime::Current()->GetClassLinker();
+        Handle<mirror::Class> h_requested_model_class(hs.NewHandle(requested_model_class));
+        if (direct_class_linker->EnsureInitialized(self, h_requested_model_class, true, true)) {
+          ArtMethod* init_method = h_requested_model_class->FindConstructor(
+              "()V", direct_class_linker->GetImagePointerSize());
+          Handle<mirror::Object> h_fallback_model(
+              hs.NewHandle(h_requested_model_class->AllocObject(self)));
+          if (self->IsExceptionPending()) {
+            self->ClearException();
+          }
+          if (h_fallback_model != nullptr) {
+            bool model_ready = false;
+            if (init_method != nullptr) {
+              EnterInterpreterFromInvoke(self, init_method, h_fallback_model.Get(), nullptr, nullptr);
+              if (self->IsExceptionPending()) {
+                self->ClearException();
+              } else {
+                model_ready = true;
+              }
+            } else {
+              const std::string model_descriptor =
+                  h_requested_model_class->PrettyDescriptor();
+              model_ready = model_descriptor.find("androidx.lifecycle.") == 0;
+            }
+            if (model_ready) {
+              static thread_local int lifecycle_helper_default_synth_count = 0;
+              if (lifecycle_helper_default_synth_count < 160 ||
+                  WestlakeTraceVerboseCalls()) {
+                lifecycle_helper_default_synth_count++;
+                fprintf(stderr,
+                        "[PFCUT] AndroidX ViewModelProviderImpl KClass helper synthesized "
+                        "default Factory.create model %s\n",
+                        h_requested_model_class->PrettyDescriptor().c_str());
+                fflush(stderr);
+              }
+              result->SetL(h_fallback_model.Get());
+              return true;
+            }
+          }
+        } else if (self->IsExceptionPending()) {
+          self->ClearException();
+        }
+      }
+    }
+
     ScopedObjectAccessUnchecked soa(self);
     ScopedJniEnvLocalRefState env_state(soa.Env());
     jobject receiver_jobj = soa.AddLocalReference<jobject>(h_receiver.Get());
@@ -4744,6 +6092,171 @@ static inline bool PFCutTryAndroidxLifecycleKClassHelperFallback(
   return true;
 }
 
+template <bool is_range>
+static inline bool PFCutTryAndroidxLifecycleClassFactoryFallback(
+    ArtMethod* called_method,
+    Thread* self,
+    ShadowFrame& shadow_frame,
+    JValue* result,
+    uint16_t number_of_inputs,
+    uint32_t (&arg)[Instruction::kMaxVarArgRegs],
+    uint32_t vregC)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (called_method == nullptr ||
+      self == nullptr ||
+      called_method->IsStatic() ||
+      (number_of_inputs != 2u && number_of_inputs != 3u) ||
+      called_method->GetDeclaringClass() == nullptr ||
+      !called_method->GetDeclaringClass()->DescriptorEquals(
+          "Landroidx/lifecycle/ViewModelProvider$Factory;") ||
+      strcmp(WlSafeName(called_method), "create") != 0) {
+    return false;
+  }
+
+  const std::string pretty = called_method->PrettyMethod();
+  const bool has_extras =
+      pretty.find("androidx.lifecycle.viewmodel.CreationExtras") != std::string::npos;
+  if (number_of_inputs == 3u && !has_extras) {
+    return false;
+  }
+  if (pretty.find("java.lang.Class") == std::string::npos) {
+    return false;
+  }
+
+  uint32_t shorty_len = 0;
+  const char* shorty =
+      called_method->GetInterfaceMethodIfProxy(kRuntimePointerSize)->GetShorty(&shorty_len);
+  if (shorty == nullptr ||
+      ((number_of_inputs == 2u && strcmp(shorty, "LL") != 0) ||
+       (number_of_inputs == 3u && strcmp(shorty, "LLL") != 0))) {
+    return false;
+  }
+
+  auto input_reg = [&](uint32_t input_index) -> uint32_t {
+    return is_range ? vregC + input_index : arg[input_index];
+  };
+
+  ObjPtr<mirror::Object> receiver = shadow_frame.GetVRegReference(input_reg(0));
+  ObjPtr<mirror::Object> java_class_object = shadow_frame.GetVRegReference(input_reg(1));
+  ObjPtr<mirror::Object> extras =
+      number_of_inputs == 3u ? shadow_frame.GetVRegReference(input_reg(2)) : nullptr;
+  if (receiver == nullptr) {
+    ThrowNullPointerExceptionFromInterpreter();
+    result->SetJ(0);
+    return true;
+  }
+  if (java_class_object == nullptr || !java_class_object->IsClass()) {
+    result->SetL(nullptr);
+    return true;
+  }
+
+  StackHandleScope<3> hs(self);
+  Handle<mirror::Object> h_receiver(hs.NewHandle(receiver));
+  Handle<mirror::Object> h_java_class_object(hs.NewHandle(java_class_object));
+  Handle<mirror::Object> h_extras(hs.NewHandle(extras));
+
+  ObjPtr<mirror::Class> requested_model_class = h_java_class_object.Get()->AsClass();
+  if (requested_model_class != nullptr && requested_model_class->IsInstantiable()) {
+    ObjPtr<mirror::Object> fallback_model = requested_model_class->AllocObject(self);
+    if (self->IsExceptionPending()) {
+      self->ClearException();
+    }
+    if (fallback_model != nullptr) {
+      static thread_local int lifecycle_class_direct_alloc_count = 0;
+      if (lifecycle_class_direct_alloc_count < 120 || WestlakeTraceVerboseCalls()) {
+        lifecycle_class_direct_alloc_count++;
+        fprintf(stderr,
+                "[PFCUT] AndroidX ViewModelFactory Class create direct allocated model without ctor %s\n",
+                requested_model_class->PrettyDescriptor().c_str());
+        fflush(stderr);
+      }
+      result->SetL(fallback_model);
+      return true;
+    }
+  }
+
+  auto try_invoke_receiver = [&](const char* signature,
+                                 bool pass_extras,
+                                 const char* label) -> ObjPtr<mirror::Object> {
+    ArtMethod* receiver_method =
+        h_receiver->GetClass()->FindClassMethod("create", signature, kRuntimePointerSize);
+    if (receiver_method == nullptr ||
+        receiver_method == called_method ||
+        receiver_method->IsAbstract() ||
+        receiver_method->GetDeclaringClass() == called_method->GetDeclaringClass()) {
+      return nullptr;
+    }
+
+    ScopedObjectAccessUnchecked soa(self);
+    ScopedJniEnvLocalRefState env_state(soa.Env());
+    jobject receiver_jobj = soa.AddLocalReference<jobject>(h_receiver.Get());
+    jvalue create_args[2] = {};
+    create_args[0].l = soa.AddLocalReference<jobject>(h_java_class_object.Get());
+    if (pass_extras) {
+      create_args[1].l = soa.AddLocalReference<jobject>(h_extras.Get());
+    }
+
+    JValue create_result = InvokeWithJValues(soa, receiver_jobj, receiver_method, create_args);
+    if (!self->IsExceptionPending() && create_result.GetL() != nullptr) {
+      static thread_local int lifecycle_class_delegate_count = 0;
+      if (lifecycle_class_delegate_count < 80) {
+        lifecycle_class_delegate_count++;
+        fprintf(stderr,
+                "[PFCUT] AndroidX ViewModelFactory Class create delegated %s via %s\n",
+                receiver_method->PrettyMethod().c_str(),
+                label);
+        fflush(stderr);
+      }
+      return create_result.GetL();
+    }
+    if (self->IsExceptionPending()) {
+      self->ClearException();
+    }
+    return nullptr;
+  };
+
+  static constexpr const char* kClassCreateWithExtrasSignature =
+      "(Ljava/lang/Class;Landroidx/lifecycle/viewmodel/CreationExtras;)"
+      "Landroidx/lifecycle/ViewModel;";
+  static constexpr const char* kClassCreateSignature =
+      "(Ljava/lang/Class;)Landroidx/lifecycle/ViewModel;";
+
+  ObjPtr<mirror::Object> created = nullptr;
+  if (number_of_inputs == 3u) {
+    created = try_invoke_receiver(kClassCreateWithExtrasSignature, true, "Class+Extras");
+  }
+  if (created == nullptr) {
+    created = try_invoke_receiver(kClassCreateSignature, false, "Class");
+  }
+  if (created != nullptr) {
+    result->SetL(created);
+    return true;
+  }
+
+  ObjPtr<mirror::Class> model_class = java_class_object->AsClass();
+  if (model_class != nullptr && model_class->IsInstantiable()) {
+    ObjPtr<mirror::Object> fallback_model = model_class->AllocObject(self);
+    if (self->IsExceptionPending()) {
+      self->ClearException();
+    }
+    if (fallback_model != nullptr) {
+      static thread_local int lifecycle_class_alloc_count = 0;
+      if (lifecycle_class_alloc_count < 80) {
+        lifecycle_class_alloc_count++;
+        fprintf(stderr,
+                "[PFCUT] AndroidX ViewModelFactory Class create allocated model without ctor %s\n",
+                model_class->PrettyDescriptor().c_str());
+        fflush(stderr);
+      }
+      result->SetL(fallback_model);
+      return true;
+    }
+  }
+
+  result->SetL(nullptr);
+  return true;
+}
+
 static inline void PFCutSetDefaultResultForShorty(const char* shorty, JValue* result) {
   if (shorty == nullptr || shorty[0] == '\0' || result == nullptr) {
     return;
@@ -4780,8 +6293,2762 @@ static inline void PFCutSetDefaultResultForShorty(const char* shorty, JValue* re
   }
 }
 
-static inline bool PFCutTryRealmNativeBoundaryNoop(ArtMethod* called_method,
-                                                   JValue* result)
+static inline int64_t PFCutNextRealmPseudoHandle() {
+  static std::atomic<int64_t> next_handle(0x570000000000LL);
+  return next_handle.fetch_add(0x10, std::memory_order_relaxed);
+}
+
+struct PFCutRealmPropertyState {
+  std::string table;
+  std::string name;
+  int64_t column_key = 0;
+  int32_t type = 0;
+
+  // Keep the weak move-assignment symbol stable across diagnostic-only build
+  // variants.  The quiet compiler otherwise elides its sole out-of-line use,
+  // producing an unnecessary dynsym difference from the deployed baseline.
+  __attribute__((used)) PFCutRealmPropertyState& operator=(PFCutRealmPropertyState&&) = default;
+};
+
+struct PFCutRealmTableState {
+  std::string name;
+};
+
+struct PFCutRealmSchemaState {
+  std::string class_name;
+};
+
+struct PFCutRealmQueryState {
+  int64_t table_handle = 0;
+  std::string table;
+  std::string predicate;
+  std::vector<int64_t> bind_handles;
+  std::vector<std::string> bind_strings;
+  std::vector<int64_t> bind_longs;
+  std::vector<int64_t> row_ids;
+};
+
+struct PFCutRealmResultState {
+  int64_t table_handle = 0;
+  int64_t query_handle = 0;
+  std::string table;
+  std::vector<int64_t> row_ids;
+};
+
+struct PFCutRealmRowState {
+  std::string table;
+  int64_t row_id = -1;
+  std::unordered_map<std::string, std::string> strings;
+  std::unordered_map<std::string, int64_t> longs;
+  std::unordered_map<std::string, std::vector<int64_t>> link_lists;
+};
+
+struct PFCutRealmAnyState {
+  std::string kind;
+  std::string string_value;
+  int64_t long_value = 0;
+  bool bool_value = false;
+};
+
+struct PFCutRealmBuilderState {
+  std::unordered_map<std::string, std::string> strings;
+  std::unordered_map<std::string, int64_t> longs;
+  std::unordered_map<std::string, std::vector<int64_t>> link_lists;
+};
+
+struct PFCutRealmListState {
+  std::string table;
+  int64_t owner_row_id = -1;
+  std::string column;
+  std::string target_table;
+  std::vector<int64_t> row_ids;
+};
+
+struct PFCutRealmSharedRealmState {
+  int32_t owner_tid = 0;
+  uint32_t close_count = 0;
+  bool closed = false;
+};
+
+struct PFCutRealmState {
+  std::mutex mu;
+  int64_t next_row_id = 1;
+  std::unordered_map<int64_t, PFCutRealmPropertyState> properties;
+  std::unordered_map<int64_t, PFCutRealmTableState> tables;
+  std::unordered_map<int64_t, PFCutRealmSchemaState> schemas;
+  std::unordered_map<int64_t, PFCutRealmQueryState> queries;
+  std::unordered_map<int64_t, PFCutRealmResultState> results;
+  std::unordered_map<int64_t, PFCutRealmRowState> rows;
+  std::unordered_map<int64_t, PFCutRealmAnyState> native_any;
+  std::unordered_map<int64_t, PFCutRealmBuilderState> builders;
+  std::unordered_map<int64_t, PFCutRealmListState> lists;
+  std::unordered_map<std::string, PFCutRealmRowState> row_templates;
+  std::unordered_map<std::string, int64_t> table_handles;
+  std::unordered_map<std::string, int64_t> schema_handles;
+  std::unordered_map<std::string, int64_t> column_keys;
+  std::unordered_map<int64_t, std::string> column_names;
+  std::unordered_set<int64_t> open_transactions;
+  std::unordered_set<int64_t> closed_realms;
+  std::unordered_map<int64_t, PFCutRealmSharedRealmState> shared_realms;
+  std::unordered_set<int64_t> released_handles;
+};
+
+static PFCutRealmState& PFCutRealmGlobalState() {
+  static PFCutRealmState* state = new PFCutRealmState();
+  return *state;
+}
+
+static inline int32_t PFCutRealmCurrentTid() {
+  Thread* self = Thread::Current();
+  return self != nullptr ? static_cast<int32_t>(self->GetTid()) : 0;
+}
+
+static const char* PFCutRealmHandleKindLocked(PFCutRealmState& state, int64_t handle) {
+  if (handle == 0) {
+    return "zero";
+  }
+  if (state.shared_realms.find(handle) != state.shared_realms.end()) {
+    return "shared-realm";
+  }
+  if (state.tables.find(handle) != state.tables.end()) {
+    return "table";
+  }
+  if (state.schemas.find(handle) != state.schemas.end()) {
+    return "schema";
+  }
+  if (state.properties.find(handle) != state.properties.end()) {
+    return "property";
+  }
+  if (state.queries.find(handle) != state.queries.end()) {
+    return "query";
+  }
+  if (state.results.find(handle) != state.results.end()) {
+    return "result";
+  }
+  if (state.rows.find(handle) != state.rows.end()) {
+    return "row";
+  }
+  if (state.native_any.find(handle) != state.native_any.end()) {
+    return "native-any";
+  }
+  if (state.builders.find(handle) != state.builders.end()) {
+    return "builder";
+  }
+  if (state.lists.find(handle) != state.lists.end()) {
+    return "list";
+  }
+  return "unknown";
+}
+
+static void PFCutRealmReleaseHandleLocked(PFCutRealmState& state,
+                                          int64_t native_ptr,
+                                          const char** out_kind,
+                                          bool* out_first_release) {
+  const char* kind = PFCutRealmHandleKindLocked(state, native_ptr);
+  bool first_release = false;
+  if (native_ptr != 0) {
+    first_release = state.released_handles.insert(native_ptr).second;
+    auto realm_it = state.shared_realms.find(native_ptr);
+    if (realm_it != state.shared_realms.end()) {
+      state.open_transactions.erase(native_ptr);
+      state.closed_realms.insert(native_ptr);
+      realm_it->second.closed = true;
+    }
+  }
+  if (out_kind != nullptr) {
+    *out_kind = kind;
+  }
+  if (out_first_release != nullptr) {
+    *out_first_release = first_release;
+  }
+}
+
+static inline std::string PFCutRealmStringParam(ObjPtr<mirror::Object> object)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (object == nullptr || !object->IsString()) {
+    return std::string();
+  }
+  return object->AsString()->ToModifiedUtf8();
+}
+
+static inline bool PFCutRealmParamReg(const char* shorty,
+                                      bool is_static,
+                                      uint16_t number_of_inputs,
+                                      uint32_t (&arg)[Instruction::kMaxVarArgRegs],
+                                      uint32_t vregC,
+                                      uint32_t param_index,
+                                      bool is_range,
+                                      uint32_t* out_reg) {
+  if (shorty == nullptr || out_reg == nullptr) {
+    return false;
+  }
+  uint32_t input_slot = is_static ? 0u : 1u;
+  uint32_t current_param = 0u;
+  for (uint32_t shorty_index = 1; shorty[shorty_index] != '\0'; ++shorty_index) {
+    const char kind = shorty[shorty_index];
+    if (input_slot >= number_of_inputs) {
+      return false;
+    }
+    const uint32_t reg = is_range ? (vregC + input_slot) : arg[input_slot];
+    if (current_param == param_index) {
+      *out_reg = reg;
+      return true;
+    }
+    input_slot += (kind == 'J' || kind == 'D') ? 2u : 1u;
+    current_param++;
+  }
+  return false;
+}
+
+template <bool is_range>
+static inline std::string PFCutRealmGetStringParam(ArtMethod* called_method,
+                                                   const char* shorty,
+                                                   ShadowFrame& shadow_frame,
+                                                   uint16_t number_of_inputs,
+                                                   uint32_t (&arg)[Instruction::kMaxVarArgRegs],
+                                                   uint32_t vregC,
+                                                   uint32_t param_index)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  uint32_t reg = 0;
+  if (!PFCutRealmParamReg(shorty,
+                         called_method->IsStatic(),
+                         number_of_inputs,
+                         arg,
+                         vregC,
+                         param_index,
+                         is_range,
+                         &reg)) {
+    return std::string();
+  }
+  return PFCutRealmStringParam(shadow_frame.GetVRegReference(reg));
+}
+
+template <bool is_range>
+static inline int64_t PFCutRealmGetLongParam(ArtMethod* called_method,
+                                             const char* shorty,
+                                             ShadowFrame& shadow_frame,
+                                             uint16_t number_of_inputs,
+                                             uint32_t (&arg)[Instruction::kMaxVarArgRegs],
+                                             uint32_t vregC,
+                                             uint32_t param_index,
+                                             int64_t fallback = 0)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  uint32_t reg = 0;
+  if (!PFCutRealmParamReg(shorty,
+                         called_method->IsStatic(),
+                         number_of_inputs,
+                         arg,
+                         vregC,
+                         param_index,
+                         is_range,
+                         &reg)) {
+    return fallback;
+  }
+  return shadow_frame.GetVRegLong(reg);
+}
+
+template <bool is_range>
+static inline int32_t PFCutRealmGetIntParam(ArtMethod* called_method,
+                                            const char* shorty,
+                                            ShadowFrame& shadow_frame,
+                                            uint16_t number_of_inputs,
+                                            uint32_t (&arg)[Instruction::kMaxVarArgRegs],
+                                            uint32_t vregC,
+                                            uint32_t param_index,
+                                            int32_t fallback = 0)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  uint32_t reg = 0;
+  if (!PFCutRealmParamReg(shorty,
+                         called_method->IsStatic(),
+                         number_of_inputs,
+                         arg,
+                         vregC,
+                         param_index,
+                         is_range,
+                         &reg)) {
+    return fallback;
+  }
+  return static_cast<int32_t>(shadow_frame.GetVReg(reg));
+}
+
+template <bool is_range>
+static inline bool PFCutRealmGetBoolParam(ArtMethod* called_method,
+                                          const char* shorty,
+                                          ShadowFrame& shadow_frame,
+                                          uint16_t number_of_inputs,
+                                          uint32_t (&arg)[Instruction::kMaxVarArgRegs],
+                                          uint32_t vregC,
+                                          uint32_t param_index,
+                                          bool fallback = false)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  uint32_t reg = 0;
+  if (!PFCutRealmParamReg(shorty,
+                         called_method->IsStatic(),
+                         number_of_inputs,
+                         arg,
+                         vregC,
+                         param_index,
+                         is_range,
+                         &reg)) {
+    return fallback;
+  }
+  return shadow_frame.GetVReg(reg) != 0;
+}
+
+template <bool is_range>
+static inline std::vector<int64_t> PFCutRealmGetLongArrayParam(
+    ArtMethod* called_method,
+    const char* shorty,
+    ShadowFrame& shadow_frame,
+    uint16_t number_of_inputs,
+    uint32_t (&arg)[Instruction::kMaxVarArgRegs],
+    uint32_t vregC,
+    uint32_t param_index)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  uint32_t reg = 0;
+  if (!PFCutRealmParamReg(shorty,
+                         called_method->IsStatic(),
+                         number_of_inputs,
+                         arg,
+                         vregC,
+                         param_index,
+                         is_range,
+                         &reg)) {
+    return {};
+  }
+  ObjPtr<mirror::Object> object = shadow_frame.GetVRegReference(reg);
+  if (object == nullptr || !object->IsLongArray()) {
+    return {};
+  }
+  ObjPtr<mirror::LongArray> array = object->AsLongArray();
+  std::vector<int64_t> values;
+  values.reserve(static_cast<size_t>(array->GetLength()));
+  for (int32_t i = 0; i < array->GetLength(); ++i) {
+    values.push_back(array->GetWithoutChecks(i));
+  }
+  return values;
+}
+
+static inline std::string PFCutRealmNormalizeTableName(const std::string& raw) {
+  if (raw == "KeyValueStore" || raw == "class_KeyValueStore") {
+    return "class_KeyValueStore";
+  }
+  if (raw == "BaseCart" || raw == "class_BaseCart") {
+    return "class_BaseCart";
+  }
+  if (raw == "CartProduct" || raw == "class_CartProduct") {
+    return "class_CartProduct";
+  }
+  if (raw == "Configuration" || raw == "class_Configuration") {
+    return "class_Configuration";
+  }
+  return raw;
+}
+
+static inline std::string PFCutRealmClassNameFromTable(const std::string& table) {
+  if (table.compare(0, 6, "class_") == 0) {
+    return table.substr(6);
+  }
+  return table;
+}
+
+static inline std::string PFCutRealmColumnMapKey(const std::string& table,
+                                                 const std::string& column) {
+  return PFCutRealmNormalizeTableName(table) + "." + column;
+}
+
+static inline bool PFCutRealmIsTrackedTable(const std::string& table) {
+  const std::string normalized = PFCutRealmNormalizeTableName(table);
+  return normalized == "class_KeyValueStore" ||
+      normalized == "class_BaseCart" ||
+      normalized == "class_CartProduct" ||
+      normalized == "class_Configuration";
+}
+
+static int64_t PFCutRealmStableColumnKeyLocked(PFCutRealmState& state,
+                                               const std::string& table,
+                                               const std::string& column) {
+  const std::string normalized_table = PFCutRealmNormalizeTableName(table);
+  const std::string key = PFCutRealmColumnMapKey(normalized_table, column);
+  auto it = state.column_keys.find(key);
+  if (it != state.column_keys.end()) {
+    return it->second;
+  }
+  const int64_t value = 0x4d430000LL +
+      static_cast<int64_t>(state.column_keys.size() + 1u);
+  state.column_keys[key] = value;
+  state.column_names[value] = column;
+  fprintf(stderr,
+          "[PFCUT-REALM-STATE] column table=%s name=%s key=%lld\n",
+          normalized_table.c_str(),
+          column.c_str(),
+          static_cast<long long>(value));
+  fflush(stderr);
+  return value;
+}
+
+static int64_t PFCutRealmTableHandleLocked(PFCutRealmState& state,
+                                           const std::string& table) {
+  const std::string normalized = PFCutRealmNormalizeTableName(table);
+  auto it = state.table_handles.find(normalized);
+  if (it != state.table_handles.end()) {
+    return it->second;
+  }
+  const int64_t handle = PFCutNextRealmPseudoHandle();
+  state.table_handles[normalized] = handle;
+  state.tables[handle] = {normalized};
+  fprintf(stderr,
+          "[PFCUT-REALM-STATE] table name=%s handle=%lld tracked=%d\n",
+          normalized.c_str(),
+          static_cast<long long>(handle),
+          PFCutRealmIsTrackedTable(normalized) ? 1 : 0);
+  fflush(stderr);
+  return handle;
+}
+
+static int64_t PFCutRealmSchemaHandleLocked(PFCutRealmState& state,
+                                            const std::string& class_name) {
+  const std::string table = PFCutRealmNormalizeTableName(class_name);
+  const std::string normalized_class = PFCutRealmClassNameFromTable(table);
+  auto it = state.schema_handles.find(normalized_class);
+  if (it != state.schema_handles.end()) {
+    return it->second;
+  }
+  const int64_t handle = PFCutNextRealmPseudoHandle();
+  state.schema_handles[normalized_class] = handle;
+  state.schemas[handle] = {normalized_class};
+  fprintf(stderr,
+          "[PFCUT-REALM-STATE] schema class=%s handle=%lld\n",
+          normalized_class.c_str(),
+          static_cast<long long>(handle));
+  fflush(stderr);
+  return handle;
+}
+
+static int64_t PFCutRealmPropertyHandleLocked(PFCutRealmState& state,
+                                              const std::string& table,
+                                              const std::string& column,
+                                              int32_t type) {
+  const int64_t column_key = PFCutRealmStableColumnKeyLocked(state, table, column);
+  const int64_t handle = PFCutNextRealmPseudoHandle();
+  state.properties[handle] = {PFCutRealmNormalizeTableName(table), column, column_key, type};
+  fprintf(stderr,
+          "[PFCUT-REALM-STATE] property table=%s name=%s handle=%lld columnKey=%lld type=%d\n",
+          PFCutRealmNormalizeTableName(table).c_str(),
+          column.c_str(),
+          static_cast<long long>(handle),
+          static_cast<long long>(column_key),
+          type);
+  fflush(stderr);
+  return handle;
+}
+
+static std::string PFCutRealmColumnNameLocked(PFCutRealmState& state, int64_t column_key) {
+  auto it = state.column_names.find(column_key);
+  return it != state.column_names.end() ? it->second : std::string();
+}
+
+static int64_t PFCutRealmResultSizeLocked(const PFCutRealmResultState& result_state) {
+  return static_cast<int64_t>(result_state.row_ids.size());
+}
+
+static std::string PFCutRealmRowTemplateKey(const std::string& table, int64_t row_id) {
+  return PFCutRealmNormalizeTableName(table) + "#" + std::to_string(row_id);
+}
+
+static std::string PFCutRealmColumnAlias(const std::string& column) {
+  if (column == "_createdOn") {
+    return "createdOn";
+  }
+  if (column == "_maxAge") {
+    return "maxAge";
+  }
+  return column;
+}
+
+static std::string PFCutRealmLinkListTargetTable(const std::string& owner_table,
+                                                 const std::string& column) {
+  const std::string normalized_column = PFCutRealmColumnAlias(column);
+  (void)owner_table;
+  if (normalized_column == "cartProducts" ||
+      normalized_column == "components" ||
+      normalized_column == "choices" ||
+      normalized_column == "customizations" ||
+      normalized_column == "selectedChoices") {
+    return "class_CartProduct";
+  }
+  return "";
+}
+
+static bool PFCutRealmSeededKeyValueValue(const std::string& key, std::string* out) {
+  if (out == nullptr) {
+    return false;
+  }
+  if (key == "language" || key == "languageName") {
+    *out = "en-US";
+    return true;
+  }
+  if (key == "country" || key == "market") {
+    *out = "US";
+    return true;
+  }
+  if (key == "marketId") {
+    *out = "usdap_prod";
+    return true;
+  }
+  if (key == "currentAppVersion" || key == "applicationVersion") {
+    *out = "7.0.0";
+    return true;
+  }
+  if (key == "currentAppVersionCode") {
+    *out = "700000";
+    return true;
+  }
+  if (key == "deviceToken") {
+    *out = "westlake-device-token";
+    return true;
+  }
+  if (key == "SERVER_AUTH_TOKEN" || key == "serverAuthToken") {
+    *out = "westlake-offline-auth-token";
+    return true;
+  }
+  if (key == "SELECTED_CONFIG" || key == "selectedConfig") {
+    *out =
+        "{\"marketId\":\"usdap_prod\",\"country\":\"US\",\"language\":\"en-US\","
+        "\"currencyCode\":\"USD\",\"currencySymbol\":\"$\","
+        "\"justFlip.splitEnvironmentId\":\"474f8810-15c1-11ee-b490-4afd76afc5e7\","
+        "\"justFlip.splitApiKey\":\"offline\","
+        "\"baseUrl\":\"https://us-prod.api.mcd.com/exp/v1/\","
+        "\"tokenUrl\":\"https://us-prod.api.mcd.com/v1/security/auth/token\","
+        "\"configMap\":{\"justFlip.splitEnvironmentId\":"
+        "\"474f8810-15c1-11ee-b490-4afd76afc5e7\"}}";
+    return true;
+  }
+  if (key == "homeDashboardSections") {
+    *out =
+        "[{\"Enabled\":true,\"Name\":\"HERO\"},"
+        "{\"Enabled\":true,\"Name\":\"MENU\"},"
+        "{\"Enabled\":true,\"Name\":\"DEALS\"},"
+        "{\"Enabled\":true,\"Name\":\"PROMOTION\"}]";
+    return true;
+  }
+  if (key == "user_interface.order.menu") {
+    *out = "[]";
+    return true;
+  }
+  if (key == "AppFeature.AppParameter") {
+    *out =
+        "{\"BOTH\":{\"currentOperationMode\":\"BOTH\","
+        "\"operationModes\":[{\"name\":\"BOTH\",\"enabled\":true}]},"
+        "\"US\":{\"currentOperationMode\":\"BOTH\","
+        "\"operationModes\":[{\"name\":\"BOTH\",\"enabled\":true}]},"
+        "\"usdap_prod\":{\"currentOperationMode\":\"BOTH\","
+        "\"operationModes\":[{\"name\":\"BOTH\",\"enabled\":true}]}}";
+    return true;
+  }
+  return false;
+}
+
+static std::string PFCutRealmSeededServerConfigJson() {
+  return
+      "{\"marketId\":\"usdap_prod\",\"country\":\"US\",\"language\":\"en-US\","
+      "\"currencyCode\":\"USD\",\"currencySymbol\":\"$\","
+      "\"homeDashboardSections\":["
+      "{\"Enabled\":true,\"Name\":\"HERO\"},"
+      "{\"Enabled\":true,\"Name\":\"MENU\"},"
+      "{\"Enabled\":true,\"Name\":\"DEALS\"},"
+      "{\"Enabled\":true,\"Name\":\"PROMOTION\"}],"
+      "\"user_interface\":{\"order\":{\"menu\":[]}},"
+      "\"AppFeature\":{\"AppParameter\":{\"BOTH\":{\"currentOperationMode\":\"BOTH\","
+      "\"operationModes\":[{\"name\":\"BOTH\",\"enabled\":true}]}}},"
+      "\"justFlip.splitEnvironmentId\":\"474f8810-15c1-11ee-b490-4afd76afc5e7\","
+      "\"justFlip.splitApiKey\":\"offline\","
+      "\"baseUrl\":\"https://us-prod.api.mcd.com/exp/v1/\","
+      "\"tokenUrl\":\"https://us-prod.api.mcd.com/v1/security/auth/token\"}";
+}
+
+static int64_t PFCutRealmEnsureKeyValueRowLocked(PFCutRealmState& state,
+                                                 const std::string& key,
+                                                 const std::string& value) {
+  const std::string table = "class_KeyValueStore";
+  for (const auto& entry : state.row_templates) {
+    if (entry.second.table != table) {
+      continue;
+    }
+    const auto key_it = entry.second.strings.find("key");
+    if (key_it != entry.second.strings.end() && key_it->second == key) {
+      return entry.second.row_id;
+    }
+  }
+
+  const int64_t row_id = state.next_row_id++;
+  PFCutRealmRowState row;
+  row.table = table;
+  row.row_id = row_id;
+  row.longs["createdOn"] = 0;
+  row.longs["maxAge"] = -1;
+  row.strings["key"] = key;
+  row.strings["value"] = value;
+  state.row_templates[PFCutRealmRowTemplateKey(table, row_id)] = row;
+  fprintf(stderr,
+          "[PFCUT-REALM-STATE] keyvalue-row key=%s row=%lld valueLen=%zu\n",
+          key.c_str(),
+          static_cast<long long>(row_id),
+          value.size());
+  fflush(stderr);
+  return row_id;
+}
+
+static int64_t PFCutRealmEnsureConfigurationRowLocked(PFCutRealmState& state,
+                                                      const std::string& name) {
+  const std::string table = "class_Configuration";
+  for (const auto& entry : state.row_templates) {
+    if (entry.second.table != table) {
+      continue;
+    }
+    const auto name_it = entry.second.strings.find("name");
+    if (name_it != entry.second.strings.end() && name_it->second == name) {
+      return entry.second.row_id;
+    }
+  }
+
+  const int64_t row_id = state.next_row_id++;
+  PFCutRealmRowState row;
+  row.table = table;
+  row.row_id = row_id;
+  row.longs["createdOn"] = 0;
+  row.longs["maxAge"] = -1;
+  row.longs["configVersion"] = 1;
+  row.strings["name"] = name;
+  row.strings["config"] = PFCutRealmSeededServerConfigJson();
+  row.strings["configId"] = "westlake-usdap-prod";
+  row.strings["configVersion"] = "1";
+  row.strings["modifiedDateTime"] = "2026-04-30T00:00:00Z";
+  state.row_templates[PFCutRealmRowTemplateKey(table, row_id)] = row;
+  fprintf(stderr,
+          "[PFCUT-REALM-STATE] configuration-row name=%s row=%lld configLen=%zu\n",
+          name.c_str(),
+          static_cast<long long>(row_id),
+          row.strings["config"].size());
+  fflush(stderr);
+  return row_id;
+}
+
+static PFCutRealmRowState& PFCutRealmEnsureRowTemplateLocked(PFCutRealmState& state,
+                                                             const std::string& table,
+                                                             int64_t row_id) {
+  std::string key = PFCutRealmRowTemplateKey(table, row_id);
+  auto it = state.row_templates.find(key);
+  if (it == state.row_templates.end()) {
+    PFCutRealmRowState row;
+    row.table = PFCutRealmNormalizeTableName(table);
+    row.row_id = row_id;
+    it = state.row_templates.emplace(key, std::move(row)).first;
+  }
+  return it->second;
+}
+
+static int64_t PFCutRealmCreateRowTemplateLocked(PFCutRealmState& state,
+                                                 const std::string& table) {
+  const int64_t row_id = state.next_row_id++;
+  PFCutRealmEnsureRowTemplateLocked(state, table, row_id);
+  return row_id;
+}
+
+static void PFCutRealmStoreLongLocked(PFCutRealmState& state,
+                                      const std::string& table,
+                                      int64_t row_id,
+                                      const std::string& column,
+                                      int64_t value) {
+  PFCutRealmRowState& row = PFCutRealmEnsureRowTemplateLocked(state, table, row_id);
+  row.longs[PFCutRealmColumnAlias(column)] = value;
+}
+
+static void PFCutRealmStoreStringLocked(PFCutRealmState& state,
+                                        const std::string& table,
+                                        int64_t row_id,
+                                        const std::string& column,
+                                        const std::string& value) {
+  PFCutRealmRowState& row = PFCutRealmEnsureRowTemplateLocked(state, table, row_id);
+  row.strings[PFCutRealmColumnAlias(column)] = value;
+}
+
+static int64_t PFCutRealmEnsureBaseCartRowLocked(PFCutRealmState& state) {
+  const std::string table = "class_BaseCart";
+  const int64_t basecart_row_id = 0;
+  PFCutRealmRowState& row = PFCutRealmEnsureRowTemplateLocked(state, table, basecart_row_id);
+  if (row.longs.find("cartStatus") != row.longs.end() ||
+      row.strings.find("cartUuid") != row.strings.end() ||
+      row.link_lists.find("cartProducts") != row.link_lists.end()) {
+    return basecart_row_id;
+  }
+  const int64_t row_id = basecart_row_id;
+  PFCutRealmStoreLongLocked(state, table, row_id, "createdOn", 0);
+  PFCutRealmStoreLongLocked(state, table, row_id, "maxAge", 0);
+  PFCutRealmStoreLongLocked(state, table, row_id, "cartStatus", 1);
+  PFCutRealmStoreLongLocked(state, table, row_id, "orderValue", 0);
+  PFCutRealmStoreLongLocked(state, table, row_id, "totalValue", 0);
+  PFCutRealmStoreLongLocked(state, table, row_id, "totalDue", 0);
+  PFCutRealmStoreLongLocked(state, table, row_id, "totalTax", 0);
+  PFCutRealmStoreLongLocked(state, table, row_id, "totalDiscount", 0);
+  PFCutRealmStoreLongLocked(state, table, row_id, "totalEnergy", 0);
+  PFCutRealmStoreLongLocked(state, table, row_id, "deliveryFee", 0);
+  PFCutRealmStoreLongLocked(state, table, row_id, "confirmationNeeded", 0);
+  PFCutRealmStoreLongLocked(state, table, row_id, "isEdtCalculationEnabled", 0);
+  PFCutRealmStoreLongLocked(state, table, row_id, "isLargeOrder", 0);
+  PFCutRealmStoreLongLocked(state, table, row_id, "isPaidOrder", 0);
+  PFCutRealmStoreLongLocked(state, table, row_id, "isSpotNumberRequired", 0);
+  PFCutRealmStoreLongLocked(state, table, row_id, "isTpOrder", 0);
+  PFCutRealmStoreLongLocked(state, table, row_id, "lastValidatedTime", 0);
+  PFCutRealmStoreLongLocked(state, table, row_id, "resultCode", 0);
+  PFCutRealmStoreStringLocked(state, table, row_id, "cartUuid", "westlake-cart");
+  PFCutRealmStoreStringLocked(state, table, row_id, "storeId", "westlake-store");
+  PFCutRealmStoreStringLocked(state, table, row_id, "marketId", "us");
+  PFCutRealmStoreStringLocked(state, table, row_id, "languageName", "en-US");
+  PFCutRealmStoreStringLocked(state, table, row_id, "nickName", "");
+  PFCutRealmStoreStringLocked(state, table, row_id, "orderPaymentId", "");
+  PFCutRealmStoreStringLocked(state, table, row_id, "productionResponse", "");
+  PFCutRealmStoreStringLocked(state, table, row_id, "estimatedDeliveryTime", "");
+  PFCutRealmStoreStringLocked(state, table, row_id, "orderDate", "");
+  PFCutRealmStoreStringLocked(state, table, row_id, "orderId", "");
+  PFCutRealmStoreStringLocked(state, table, row_id, "orderNumber", "");
+  PFCutRealmStoreStringLocked(state, table, row_id, "orderStatus", "");
+  PFCutRealmStoreStringLocked(state, table, row_id, "tenderType", "");
+  PFCutRealmStoreStringLocked(state, table, row_id, "randomCode", "");
+  PFCutRealmStoreStringLocked(state, table, row_id, "barCode", "");
+  PFCutRealmStoreStringLocked(state, table, row_id, "checkInCode", "");
+  PFCutRealmStoreStringLocked(state, table, row_id, "orderTinData", "");
+  PFCutRealmStoreStringLocked(state, table, row_id, "validationType", "");
+  PFCutRealmStoreStringLocked(state, table, row_id, "operationMode", "");
+  PFCutRealmStoreStringLocked(state, table, row_id, "options", "");
+  PFCutRealmStoreStringLocked(state, table, row_id, "priceType", "");
+  PFCutRealmStoreStringLocked(state, table, row_id, "offersValidation", "");
+  fprintf(stderr, "[PFCUT-REALM-WRITE] basecart-seed row=%lld reason=ensure\n",
+          static_cast<long long>(row_id));
+  fflush(stderr);
+  return row_id;
+}
+
+static void PFCutRealmApplyBuilderLocked(PFCutRealmState& state,
+                                         const std::string& table,
+                                         int64_t row_id,
+                                         int64_t builder_handle) {
+  const auto builder_it = state.builders.find(builder_handle);
+  if (builder_it == state.builders.end()) {
+    return;
+  }
+  PFCutRealmRowState& row = PFCutRealmEnsureRowTemplateLocked(state, table, row_id);
+  for (const auto& entry : builder_it->second.longs) {
+    row.longs[PFCutRealmColumnAlias(entry.first)] = entry.second;
+  }
+  for (const auto& entry : builder_it->second.strings) {
+    row.strings[PFCutRealmColumnAlias(entry.first)] = entry.second;
+  }
+  for (const auto& entry : builder_it->second.link_lists) {
+    row.link_lists[PFCutRealmColumnAlias(entry.first)] = entry.second;
+    fprintf(stderr,
+            "[PFCUT-REALM-WRITE] builder-commit-list table=%s row=%lld column=%s count=%zu\n",
+            PFCutRealmNormalizeTableName(table).c_str(),
+            static_cast<long long>(row_id),
+            PFCutRealmColumnAlias(entry.first).c_str(),
+            entry.second.size());
+    fflush(stderr);
+  }
+}
+
+static void PFCutRealmDecodeQueryBindsLocked(PFCutRealmState& state,
+                                             PFCutRealmQueryState* query) {
+  if (query == nullptr) {
+    return;
+  }
+  query->bind_strings.clear();
+  query->bind_longs.clear();
+  for (int64_t handle : query->bind_handles) {
+    auto it = state.native_any.find(handle);
+    if (it == state.native_any.end()) {
+      continue;
+    }
+    if (it->second.kind == "string") {
+      query->bind_strings.push_back(it->second.string_value);
+    } else if (it->second.kind == "long" || it->second.kind == "date") {
+      query->bind_longs.push_back(it->second.long_value);
+    } else if (it->second.kind == "bool") {
+      query->bind_longs.push_back(it->second.bool_value ? 1 : 0);
+    }
+  }
+}
+
+static void PFCutRealmMaybePopulateQueryRowsLocked(PFCutRealmState& state,
+                                                   PFCutRealmQueryState* query) {
+  if (query == nullptr) {
+    return;
+  }
+  query->row_ids.clear();
+  const std::string table = PFCutRealmNormalizeTableName(query->table);
+  const std::string bind0 = query->bind_strings.empty() ? "" : query->bind_strings.front();
+  const int64_t bind0l = query->bind_longs.empty() ? 0 : query->bind_longs.front();
+  if (!bind0.empty() &&
+      table == "class_KeyValueStore" &&
+      query->predicate.find("key = $0") != std::string::npos) {
+    std::string value;
+    if (!PFCutRealmSeededKeyValueValue(bind0, &value)) {
+      return;
+    }
+    query->row_ids.push_back(PFCutRealmEnsureKeyValueRowLocked(state, bind0, value));
+    return;
+  }
+  if (!bind0.empty() &&
+      table == "class_Configuration" &&
+      (query->predicate.find("name =[c] $0") != std::string::npos ||
+       query->predicate.find("name = $0") != std::string::npos) &&
+      bind0 == "serverConfig") {
+    query->row_ids.push_back(PFCutRealmEnsureConfigurationRowLocked(state, bind0));
+    return;
+  }
+  if (table == "class_BaseCart") {
+    const bool active_cart_predicate =
+        query->predicate.empty() ||
+        query->predicate.find("cartStatus = $0") != std::string::npos ||
+        query->predicate.find("_maxAge < $0") != std::string::npos ||
+        query->predicate.find("maxAge < $0") != std::string::npos ||
+        query->predicate.find("_maxAge != $0") != std::string::npos ||
+        query->predicate.find("maxAge != $0") != std::string::npos;
+    if (active_cart_predicate) {
+      const int64_t row_id = PFCutRealmEnsureBaseCartRowLocked(state);
+      query->row_ids.push_back(row_id);
+      fprintf(stderr,
+              "[PFCUT-REALM-STATE] basecart-active-query row=%lld predicate=%s bind0=%lld\n",
+              static_cast<long long>(row_id),
+              query->predicate.c_str(),
+              static_cast<long long>(bind0l));
+      fflush(stderr);
+    }
+  }
+}
+
+static PFCutRealmRowState PFCutRealmRowFromTemplateLocked(PFCutRealmState& state,
+                                                          const std::string& table,
+                                                          int64_t row_id) {
+  const auto it = state.row_templates.find(PFCutRealmRowTemplateKey(table, row_id));
+  if (it != state.row_templates.end()) {
+    return it->second;
+  }
+  PFCutRealmRowState row;
+  row.table = PFCutRealmNormalizeTableName(table);
+  row.row_id = row_id;
+  return row;
+}
+
+static int64_t PFCutRealmCreateRowHandleLocked(PFCutRealmState& state,
+                                               const std::string& table,
+                                               int64_t row_id) {
+  if (row_id < 0) {
+    return 0;
+  }
+  const int64_t row_handle = PFCutNextRealmPseudoHandle();
+  state.rows[row_handle] = PFCutRealmRowFromTemplateLocked(state, table, row_id);
+  return row_handle;
+}
+
+static std::vector<std::string> PFCutRealmKnownColumnsForTable(const std::string& table) {
+  const std::string normalized = PFCutRealmNormalizeTableName(table);
+  if (normalized == "class_KeyValueStore") {
+    return {"createdOn", "maxAge", "key", "value"};
+  }
+  if (normalized == "class_BaseCart") {
+    return {
+        "createdOn",
+        "maxAge",
+        "cartUuid",
+        "cartStatus",
+        "storeId",
+        "nickName",
+        "orderPaymentId",
+        "deliveryFee",
+        "productionResponse",
+        "confirmationNeeded",
+        "estimatedDeliveryTime",
+        "isEdtCalculationEnabled",
+        "isLargeOrder",
+        "isPaidOrder",
+        "isSpotNumberRequired",
+        "marketId",
+        "languageName",
+        "orderDate",
+        "orderId",
+        "orderNumber",
+        "orderStatus",
+        "orderValue",
+        "tenderType",
+        "totalValue",
+        "totalDue",
+        "totalTax",
+        "totalDiscount",
+        "totalEnergy",
+        "randomCode",
+        "barCode",
+        "checkInCode",
+        "orderTinData",
+        "payments",
+        "estimatedInStoreDeliveryTime",
+        "cartOffers",
+        "cartPromotions",
+        "cartProducts",
+        "deposits",
+        "fees",
+        "cumulatedTaxInfo",
+        "savings",
+        "validationType",
+        "operationMode",
+        "options",
+        "isTpOrder",
+        "priceType",
+        "lastValidatedTime",
+        "resultCode",
+        "offersValidation"};
+  }
+  if (normalized == "class_CartProduct") {
+    return {
+        "createdOn",
+        "maxAge",
+        "productCode",
+        "quantity",
+        "productType",
+        "isCustom",
+        "basePrice",
+        "totalPrice"};
+  }
+  if (normalized == "class_Configuration") {
+    return {"createdOn",
+            "maxAge",
+            "name",
+            "config",
+            "configId",
+            "configVersion",
+            "modifiedDateTime"};
+  }
+  return {};
+}
+
+static std::string PFCutRealmTableForHandleLocked(PFCutRealmState& state, int64_t handle) {
+  auto table_it = state.tables.find(handle);
+  if (table_it != state.tables.end()) {
+    return table_it->second.name;
+  }
+  auto query_it = state.queries.find(handle);
+  if (query_it != state.queries.end()) {
+    return query_it->second.table;
+  }
+  auto result_it = state.results.find(handle);
+  if (result_it != state.results.end()) {
+    return result_it->second.table;
+  }
+  auto row_it = state.rows.find(handle);
+  if (row_it != state.rows.end()) {
+    return row_it->second.table;
+  }
+  return std::string();
+}
+
+static bool PFCutRealmSetStringResult(Thread* self,
+                                      const std::string& value,
+                                      JValue* result)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  ObjPtr<mirror::String> str = mirror::String::AllocFromModifiedUtf8(self, value.c_str());
+  if (self->IsExceptionPending()) {
+    self->ClearException();
+    return false;
+  }
+  result->SetL(str);
+  return true;
+}
+
+static bool PFCutRealmSetStringArrayResult(Thread* self,
+                                           const std::vector<std::string>& values,
+                                           JValue* result)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  StackHandleScope<1> hs(self);
+  Handle<mirror::ObjectArray<mirror::String>> h_array(hs.NewHandle(
+      mirror::ObjectArray<mirror::String>::Alloc(
+          self,
+          GetClassRoot<mirror::ObjectArray<mirror::String>>(),
+          static_cast<int32_t>(values.size()))));
+  if (h_array == nullptr || self->IsExceptionPending()) {
+    if (self->IsExceptionPending()) {
+      self->ClearException();
+    }
+    result->SetL(nullptr);
+    return false;
+  }
+  for (int32_t i = 0; i < static_cast<int32_t>(values.size()); ++i) {
+    ObjPtr<mirror::String> entry =
+        mirror::String::AllocFromModifiedUtf8(self, values[i].c_str());
+    if (entry == nullptr || self->IsExceptionPending()) {
+      if (self->IsExceptionPending()) {
+        self->ClearException();
+      }
+      result->SetL(nullptr);
+      return false;
+    }
+    h_array->SetWithoutChecks</*kTransactionActive=*/ false,
+                               /*kCheckTransaction=*/ false>(i, entry);
+  }
+  result->SetL(h_array.Get());
+  return true;
+}
+
+static bool PFCutRealmSetLongPairResult(Thread* self,
+                                        int64_t first,
+                                        int64_t second,
+                                        JValue* result)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  ObjPtr<mirror::LongArray> array = mirror::LongArray::Alloc(self, 2);
+  if (array == nullptr || self->IsExceptionPending()) {
+    if (self->IsExceptionPending()) {
+      self->ClearException();
+    }
+    result->SetL(nullptr);
+    return false;
+  }
+  array->Set(0, first);
+  array->Set(1, second);
+  result->SetL(array);
+  return true;
+}
+
+template <bool is_range>
+static bool PFCutTryRealmNativeState(ArtMethod* called_method,
+                                     const char* descriptor,
+                                     const char* shorty,
+                                     ShadowFrame& shadow_frame,
+                                     JValue* result,
+                                     uint16_t number_of_inputs,
+                                     uint32_t (&arg)[Instruction::kMaxVarArgRegs],
+                                     uint32_t vregC)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (called_method == nullptr || descriptor == nullptr || shorty == nullptr || result == nullptr) {
+    return false;
+  }
+  const char* method_name = WlSafeName(called_method);
+  if (method_name == nullptr) {
+    return false;
+  }
+
+  Thread* self = Thread::Current();
+  PFCutRealmState& state = PFCutRealmGlobalState();
+
+  if (strcmp(descriptor, "Lio/realm/internal/NativeObjectReference;") == 0) {
+    if (strcmp(method_name, "nativeCleanUp") == 0) {
+      const int64_t finalizer_ptr = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      const int64_t native_ptr = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 1u, 0);
+      const char* kind = "unknown";
+      bool first_release = false;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        PFCutRealmReleaseHandleLocked(state, native_ptr, &kind, &first_release);
+      }
+      fprintf(stderr,
+              "[PFCUT-REALM-FINALIZER] cleanup finalizer=%lld handle=%lld kind=%s first=%d\n",
+              static_cast<long long>(finalizer_ptr),
+              static_cast<long long>(native_ptr),
+              kind,
+              first_release ? 1 : 0);
+      fflush(stderr);
+      PFCutSetDefaultResultForShorty(shorty, result);
+      return true;
+    }
+    return false;
+  }
+
+  if (strcmp(descriptor, "Lio/realm/internal/core/NativeRealmAny;") == 0) {
+    if (strcmp(method_name, "nativeCreateString") == 0 ||
+        strcmp(method_name, "nativeCreateObjectId") == 0 ||
+        strcmp(method_name, "nativeCreateUUID") == 0) {
+      const std::string value = PFCutRealmGetStringParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u);
+      const int64_t handle = PFCutNextRealmPseudoHandle();
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        state.native_any[handle] = {"string", value, 0, false};
+      }
+      fprintf(stderr,
+              "[PFCUT-REALM-STATE] native-any-create method=%s handle=%lld kind=string value=%s\n",
+              method_name,
+              static_cast<long long>(handle),
+              value.c_str());
+      fflush(stderr);
+      result->SetJ(handle);
+      return true;
+    }
+    if (strcmp(method_name, "nativeCreateLong") == 0 ||
+        strcmp(method_name, "nativeCreateDate") == 0) {
+      const int64_t value = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      const int64_t handle = PFCutNextRealmPseudoHandle();
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        state.native_any[handle] = {
+            strcmp(method_name, "nativeCreateDate") == 0 ? "date" : "long", "", value, false};
+      }
+      fprintf(stderr,
+              "[PFCUT-REALM-STATE] native-any-create method=%s handle=%lld kind=long value=%lld\n",
+              method_name,
+              static_cast<long long>(handle),
+              static_cast<long long>(value));
+      fflush(stderr);
+      result->SetJ(handle);
+      return true;
+    }
+    if (strcmp(method_name, "nativeCreateBoolean") == 0) {
+      const bool value = PFCutRealmGetBoolParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, false);
+      const int64_t handle = PFCutNextRealmPseudoHandle();
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        state.native_any[handle] = {"bool", "", 0, value};
+      }
+      fprintf(stderr,
+              "[PFCUT-REALM-STATE] native-any-create method=%s handle=%lld kind=bool value=%d\n",
+              method_name,
+              static_cast<long long>(handle),
+              value ? 1 : 0);
+      fflush(stderr);
+      result->SetJ(handle);
+      return true;
+    }
+    if (strcmp(method_name, "nativeCreateNull") == 0) {
+      const int64_t handle = PFCutNextRealmPseudoHandle();
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        state.native_any[handle] = {"null", "", 0, false};
+      }
+      result->SetJ(handle);
+      return true;
+    }
+    if (strcmp(method_name, "nativeAsString") == 0 ||
+        strcmp(method_name, "nativeAsObjectId") == 0 ||
+        strcmp(method_name, "nativeAsUUID") == 0 ||
+        strcmp(method_name, "nativeGetRealmModelTableName") == 0) {
+      const int64_t handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      std::string value;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        const auto it = state.native_any.find(handle);
+        if (it != state.native_any.end() && it->second.kind == "string") {
+          value = it->second.string_value;
+        }
+      }
+      return PFCutRealmSetStringResult(self, value, result);
+    }
+    if (strcmp(method_name, "nativeAsLong") == 0 ||
+        strcmp(method_name, "nativeAsDate") == 0 ||
+        strcmp(method_name, "nativeGetRealmModelRowKey") == 0) {
+      const int64_t handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      int64_t value = 0;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        const auto it = state.native_any.find(handle);
+        if (it != state.native_any.end()) {
+          value = it->second.long_value;
+        }
+      }
+      result->SetJ(value);
+      return true;
+    }
+    if (strcmp(method_name, "nativeAsBoolean") == 0) {
+      const int64_t handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      bool value = false;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        const auto it = state.native_any.find(handle);
+        if (it != state.native_any.end()) {
+          value = it->second.bool_value;
+        }
+      }
+      result->SetZ(value);
+      return true;
+    }
+    if (strcmp(method_name, "nativeEquals") == 0) {
+      const int64_t lhs = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      const int64_t rhs = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 1u, 0);
+      result->SetZ(lhs == rhs);
+      return true;
+    }
+    if (strcmp(method_name, "nativeGetType") == 0) {
+      const int64_t handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      int32_t type = 11;  // RealmAny.Type.NULL ordinal in the Java SDK shape used by McD.
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        const auto it = state.native_any.find(handle);
+        if (it != state.native_any.end()) {
+          if (it->second.kind == "long") {
+            type = 0;
+          } else if (it->second.kind == "bool") {
+            type = 1;
+          } else if (it->second.kind == "string") {
+            type = 2;
+          } else if (it->second.kind == "date") {
+            type = 4;
+          }
+        }
+      }
+      result->SetI(type);
+      return true;
+    }
+    if (shorty[0] == 'J') {
+      result->SetJ(0);
+      return true;
+    }
+    if (shorty[0] == 'Z') {
+      result->SetZ(false);
+      return true;
+    }
+    return false;
+  }
+
+  if (strcmp(descriptor, "Lio/realm/internal/Property;") == 0) {
+    if (strcmp(method_name, "nativeCreatePersistedProperty") == 0 ||
+        strcmp(method_name, "nativeCreatePersistedLinkProperty") == 0 ||
+        strcmp(method_name, "nativeCreateComputedLinkProperty") == 0) {
+      const std::string column = PFCutRealmGetStringParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u);
+      const int32_t type = PFCutRealmGetIntParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 2u, 0);
+      std::lock_guard<std::mutex> lock(state.mu);
+      const int64_t handle = PFCutNextRealmPseudoHandle();
+      state.properties[handle] = {"", column, 0, type};
+      fprintf(stderr,
+              "[PFCUT-REALM-STATE] property-create name=%s handle=%lld type=%d\n",
+              column.c_str(),
+              static_cast<long long>(handle),
+              type);
+      fflush(stderr);
+      result->SetJ(handle);
+      return true;
+    }
+    if (strcmp(method_name, "nativeGetColumnKey") == 0) {
+      const int64_t property_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      int64_t column_key = 0;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        auto it = state.properties.find(property_handle);
+        if (it != state.properties.end()) {
+          if (it->second.column_key == 0) {
+            it->second.column_key =
+                PFCutRealmStableColumnKeyLocked(state, it->second.table, it->second.name);
+          }
+          column_key = it->second.column_key;
+        }
+      }
+      fprintf(stderr,
+              "[PFCUT-REALM-STATE] property-column-key property=%lld key=%lld\n",
+              static_cast<long long>(property_handle),
+              static_cast<long long>(column_key));
+      fflush(stderr);
+      result->SetJ(column_key);
+      return true;
+    }
+    if (strcmp(method_name, "nativeGetType") == 0) {
+      result->SetI(0);
+      return true;
+    }
+    if (strcmp(method_name, "nativeGetLinkedObjectName") == 0) {
+      return PFCutRealmSetStringResult(self, "", result);
+    }
+    return false;
+  }
+
+  if (strcmp(descriptor, "Lio/realm/internal/OsObjectSchemaInfo;") == 0) {
+    if (strcmp(method_name, "nativeCreateRealmObjectSchema") == 0) {
+      std::string class_name = PFCutRealmGetStringParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 1u);
+      if (class_name.empty()) {
+        class_name = PFCutRealmGetStringParam<is_range>(
+            called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u);
+      }
+      int64_t schema_handle = 0;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        schema_handle = PFCutRealmSchemaHandleLocked(state, class_name);
+        PFCutRealmTableHandleLocked(state, class_name);
+      }
+      result->SetJ(schema_handle);
+      return true;
+    }
+    if (strcmp(method_name, "nativeAddProperties") == 0) {
+      const int64_t schema_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      std::lock_guard<std::mutex> lock(state.mu);
+      const auto schema_it = state.schemas.find(schema_handle);
+      fprintf(stderr,
+              "[PFCUT-REALM-STATE] schema-add-properties schema=%lld class=%s\n",
+              static_cast<long long>(schema_handle),
+              schema_it != state.schemas.end() ? schema_it->second.class_name.c_str() : "");
+      fflush(stderr);
+      PFCutSetDefaultResultForShorty(shorty, result);
+      return true;
+    }
+    if (strcmp(method_name, "nativeGetProperty") == 0) {
+      const int64_t schema_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      const std::string column = PFCutRealmGetStringParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 1u);
+      int64_t property_handle = 0;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        std::string table;
+        const auto schema_it = state.schemas.find(schema_handle);
+        if (schema_it != state.schemas.end()) {
+          table = PFCutRealmNormalizeTableName(schema_it->second.class_name);
+        }
+        if (table.empty()) {
+          table = "class_KeyValueStore";
+        }
+        property_handle = PFCutRealmPropertyHandleLocked(state, table, column, 0);
+      }
+      result->SetJ(property_handle);
+      return true;
+    }
+    if (strcmp(method_name, "nativeGetClassName") == 0) {
+      const int64_t schema_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      std::string class_name;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        const auto schema_it = state.schemas.find(schema_handle);
+        if (schema_it != state.schemas.end()) {
+          class_name = schema_it->second.class_name;
+        }
+      }
+      return PFCutRealmSetStringResult(self, class_name, result);
+    }
+    if (strcmp(method_name, "nativeGetPrimaryKeyProperty") == 0) {
+      result->SetJ(0);
+      return true;
+    }
+    if (strcmp(method_name, "nativeIsEmbedded") == 0) {
+      result->SetZ(false);
+      return true;
+    }
+    return false;
+  }
+
+  if (strcmp(descriptor, "Lio/realm/internal/OsSchemaInfo;") == 0) {
+    if (strcmp(method_name, "nativeCreateFromList") == 0) {
+      const int64_t handle = PFCutNextRealmPseudoHandle();
+      fprintf(stderr,
+              "[PFCUT-REALM-STATE] schema-list handle=%lld\n",
+              static_cast<long long>(handle));
+      fflush(stderr);
+      result->SetJ(handle);
+      return true;
+    }
+    if (strcmp(method_name, "nativeGetObjectSchemaInfo") == 0) {
+      const std::string class_name = PFCutRealmGetStringParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 1u);
+      int64_t schema_handle = 0;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        schema_handle = PFCutRealmSchemaHandleLocked(state, class_name);
+        PFCutRealmTableHandleLocked(state, class_name);
+      }
+      result->SetJ(schema_handle);
+      return true;
+    }
+    return false;
+  }
+
+  if (strcmp(descriptor, "Lio/realm/internal/OsRealmConfig;") == 0) {
+    if (strcmp(method_name, "nativeCreate") == 0) {
+      const int64_t handle = PFCutNextRealmPseudoHandle();
+      fprintf(stderr,
+              "[PFCUT-REALM-STATE] config handle=%lld\n",
+              static_cast<long long>(handle));
+      fflush(stderr);
+      result->SetJ(handle);
+      return true;
+    }
+    if (strstr(method_name, "nativeSet") == method_name ||
+        strcmp(method_name, "nativeEnableChangeNotification") == 0) {
+      PFCutSetDefaultResultForShorty(shorty, result);
+      return true;
+    }
+    return false;
+  }
+
+  if (strcmp(descriptor, "Lio/realm/internal/OsSharedRealm;") == 0) {
+    const bool returns_shared_realm = strcmp(method_name, "nativeGetSharedRealm") == 0 ||
+        strcmp(method_name, "nativeFreeze") == 0;
+    if (returns_shared_realm ||
+        strcmp(method_name, "nativeGetSchemaInfo") == 0 ||
+        strcmp(method_name, "nativeGetActiveSubscriptionSet") == 0 ||
+        strcmp(method_name, "nativeGetLatestSubscriptionSet") == 0) {
+      const int64_t handle = PFCutNextRealmPseudoHandle();
+      int32_t owner_tid = 0;
+      if (returns_shared_realm) {
+        owner_tid = PFCutRealmCurrentTid();
+        std::lock_guard<std::mutex> lock(state.mu);
+        state.shared_realms[handle] = {owner_tid, 0, false};
+        state.closed_realms.erase(handle);
+        state.released_handles.erase(handle);
+      }
+      fprintf(stderr,
+              "[PFCUT-REALM-STATE] shared-realm-handle method=%s handle=%lld ownerTid=%d tracked=%d\n",
+              method_name,
+              static_cast<long long>(handle),
+              owner_tid,
+              returns_shared_realm ? 1 : 0);
+      fflush(stderr);
+      result->SetJ(handle);
+      return true;
+    }
+    if (strcmp(method_name, "nativeGetTableRef") == 0 ||
+        strcmp(method_name, "nativeCreateTable") == 0 ||
+        strcmp(method_name, "nativeCreateTableWithPrimaryKeyField") == 0) {
+      const std::string table = PFCutRealmGetStringParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 1u);
+      int64_t table_handle = 0;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        table_handle = PFCutRealmTableHandleLocked(state, table);
+      }
+      result->SetJ(table_handle);
+      return true;
+    }
+    if (strcmp(method_name, "nativeHasTable") == 0) {
+      const std::string table = PFCutRealmGetStringParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 1u);
+      result->SetZ(PFCutRealmIsTrackedTable(table));
+      return true;
+    }
+    if (strcmp(method_name, "nativeGetTablesName") == 0) {
+      return PFCutRealmSetStringArrayResult(
+          self,
+          {"class_KeyValueStore", "class_BaseCart", "class_CartProduct", "class_Configuration"},
+          result);
+    }
+    if (strcmp(method_name, "nativeGetVersionID") == 0) {
+      PFCutSetDefaultResultForShorty(shorty, result);
+      return true;
+    }
+    if (strcmp(method_name, "nativeBeginTransaction") == 0) {
+      const int64_t realm_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      int32_t owner_tid = 0;
+      bool closed = realm_handle == 0;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        if (realm_handle != 0) {
+          PFCutRealmSharedRealmState& realm = state.shared_realms[realm_handle];
+          if (realm.owner_tid == 0) {
+            realm.owner_tid = PFCutRealmCurrentTid();
+          }
+          owner_tid = realm.owner_tid;
+          closed = realm.closed ||
+              state.closed_realms.find(realm_handle) != state.closed_realms.end() ||
+              state.released_handles.find(realm_handle) != state.released_handles.end();
+          if (!closed) {
+            state.open_transactions.insert(realm_handle);
+          }
+        }
+      }
+      fprintf(stderr,
+              "[PFCUT-REALM-WRITE] transaction-begin realm=%lld ownerTid=%d closed=%d\n",
+              static_cast<long long>(realm_handle),
+              owner_tid,
+              closed ? 1 : 0);
+      fflush(stderr);
+      PFCutSetDefaultResultForShorty(shorty, result);
+      return true;
+    }
+    if (strcmp(method_name, "nativeCommitTransaction") == 0 ||
+        strcmp(method_name, "nativeCancelTransaction") == 0) {
+      const int64_t realm_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      bool was_open = false;
+      bool closed = realm_handle == 0;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        was_open = state.open_transactions.erase(realm_handle) > 0;
+        auto realm_it = state.shared_realms.find(realm_handle);
+        if (realm_it != state.shared_realms.end()) {
+          closed = realm_it->second.closed;
+        }
+        closed = closed ||
+            state.closed_realms.find(realm_handle) != state.closed_realms.end() ||
+            state.released_handles.find(realm_handle) != state.released_handles.end();
+      }
+      fprintf(stderr,
+              "[PFCUT-REALM-WRITE] transaction-%s realm=%lld wasOpen=%d closed=%d\n",
+              strcmp(method_name, "nativeCommitTransaction") == 0 ? "commit" : "cancel",
+              static_cast<long long>(realm_handle),
+              was_open ? 1 : 0,
+              closed ? 1 : 0);
+      fflush(stderr);
+      PFCutSetDefaultResultForShorty(shorty, result);
+      return true;
+    }
+    if (strcmp(method_name, "nativeCloseSharedRealm") == 0) {
+      const int64_t realm_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      const int32_t tid = PFCutRealmCurrentTid();
+      int32_t owner_tid = 0;
+      uint32_t close_count = 0;
+      bool already_closed = realm_handle == 0;
+      bool first_release = false;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        if (realm_handle != 0) {
+          PFCutRealmSharedRealmState& realm = state.shared_realms[realm_handle];
+          if (realm.owner_tid == 0) {
+            realm.owner_tid = tid;
+          }
+          owner_tid = realm.owner_tid;
+          already_closed = realm.closed ||
+              state.closed_realms.find(realm_handle) != state.closed_realms.end() ||
+              state.released_handles.find(realm_handle) != state.released_handles.end();
+          realm.closed = true;
+          realm.close_count++;
+          close_count = realm.close_count;
+          state.open_transactions.erase(realm_handle);
+          state.closed_realms.insert(realm_handle);
+          first_release = state.released_handles.insert(realm_handle).second;
+        }
+      }
+      fprintf(stderr,
+              "[PFCUT-REALM-CLOSE] realm=%lld tid=%d ownerTid=%d alreadyClosed=%d closeCount=%u firstRelease=%d\n",
+              static_cast<long long>(realm_handle),
+              tid,
+              owner_tid,
+              already_closed ? 1 : 0,
+              close_count,
+              first_release ? 1 : 0);
+      fflush(stderr);
+      PFCutSetDefaultResultForShorty(shorty, result);
+      return true;
+    }
+    if (strcmp(method_name, "nativeIsInTransaction") == 0 ||
+        strcmp(method_name, "nativeIsClosed") == 0) {
+      const int64_t realm_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      bool value = false;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        bool closed = realm_handle == 0;
+        auto realm_it = state.shared_realms.find(realm_handle);
+        if (realm_it != state.shared_realms.end()) {
+          closed = closed || realm_it->second.closed;
+        }
+        closed = closed ||
+            state.closed_realms.find(realm_handle) != state.closed_realms.end() ||
+            state.released_handles.find(realm_handle) != state.released_handles.end();
+        value = strcmp(method_name, "nativeIsInTransaction") == 0
+            ? (!closed && state.open_transactions.find(realm_handle) != state.open_transactions.end())
+            : closed;
+      }
+      result->SetZ(value);
+      return true;
+    }
+    if (shorty[0] == 'Z') {
+      result->SetZ(false);
+      return true;
+    }
+    if (shorty[0] == 'J') {
+      result->SetJ(0);
+      return true;
+    }
+    if (shorty[0] == 'V') {
+      PFCutSetDefaultResultForShorty(shorty, result);
+      return true;
+    }
+    return false;
+  }
+
+  if (strcmp(descriptor, "Lio/realm/internal/Table;") == 0) {
+    if (strcmp(method_name, "nativeGetName") == 0) {
+      const int64_t table_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      std::string table;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        table = PFCutRealmTableForHandleLocked(state, table_handle);
+      }
+      return PFCutRealmSetStringResult(self, table, result);
+    }
+    if (strcmp(method_name, "nativeGetColumnKey") == 0) {
+      const int64_t table_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      const std::string column = PFCutRealmGetStringParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 1u);
+      int64_t column_key = 0;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        std::string table = PFCutRealmTableForHandleLocked(state, table_handle);
+        column_key = PFCutRealmStableColumnKeyLocked(state, table, column);
+      }
+      result->SetJ(column_key);
+      return true;
+    }
+    if (strcmp(method_name, "nativeGetColumnName") == 0) {
+      const int64_t column_key = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 1u, 0);
+      std::string column;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        column = PFCutRealmColumnNameLocked(state, column_key);
+      }
+      return PFCutRealmSetStringResult(self, column, result);
+    }
+    if (strcmp(method_name, "nativeGetColumnNames") == 0) {
+      const int64_t table_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      std::vector<std::string> columns;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        columns = PFCutRealmKnownColumnsForTable(PFCutRealmTableForHandleLocked(state, table_handle));
+      }
+      return PFCutRealmSetStringArrayResult(self, columns, result);
+    }
+    if (strcmp(method_name, "nativeGetColumnCount") == 0) {
+      const int64_t table_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      int64_t count = 0;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        count = static_cast<int64_t>(
+            PFCutRealmKnownColumnsForTable(PFCutRealmTableForHandleLocked(state, table_handle)).size());
+      }
+      result->SetJ(count);
+      return true;
+    }
+    if (strcmp(method_name, "nativeGetColumnType") == 0) {
+      result->SetI(0);
+      return true;
+    }
+    if (strcmp(method_name, "nativeWhere") == 0) {
+      const int64_t table_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      int64_t query_handle = PFCutNextRealmPseudoHandle();
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        state.queries[query_handle] =
+            {table_handle, PFCutRealmTableForHandleLocked(state, table_handle), ""};
+      }
+      fprintf(stderr,
+              "[PFCUT-REALM-STATE] query tableHandle=%lld query=%lld\n",
+              static_cast<long long>(table_handle),
+              static_cast<long long>(query_handle));
+      fflush(stderr);
+      result->SetJ(query_handle);
+      return true;
+    }
+    if (strcmp(method_name, "nativeGetRowPtr") == 0) {
+      const int64_t table_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      const int64_t row_id = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 1u, -1);
+      int64_t row_handle = 0;
+      std::string table;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        table = PFCutRealmTableForHandleLocked(state, table_handle);
+        row_handle = PFCutRealmCreateRowHandleLocked(state, table, row_id);
+      }
+      fprintf(stderr,
+              "[PFCUT-REALM-STATE] table-row table=%s row=%lld handle=%lld\n",
+              table.c_str(),
+              static_cast<long long>(row_id),
+              static_cast<long long>(row_handle));
+      fflush(stderr);
+      result->SetJ(row_handle);
+      return true;
+    }
+    if (strcmp(method_name, "nativeSize") == 0) {
+      const int64_t table_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      int64_t size = 0;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        const std::string table = PFCutRealmTableForHandleLocked(state, table_handle);
+        for (const auto& entry : state.row_templates) {
+          if (entry.second.table == table) {
+            size++;
+          }
+        }
+      }
+      result->SetJ(size);
+      return true;
+    }
+    if (strstr(method_name, "nativeSet") == method_name) {
+      const int64_t table_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      const int64_t column_key = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 1u, 0);
+      const int64_t row_id = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 2u, -1);
+      std::string table;
+      std::string column;
+      int64_t long_value = 0;
+      std::string string_value;
+      if (strcmp(method_name, "nativeSetString") == 0 ||
+          strcmp(method_name, "nativeSetObjectId") == 0 ||
+          strcmp(method_name, "nativeSetUUID") == 0) {
+        string_value = PFCutRealmGetStringParam<is_range>(
+            called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 3u);
+      } else if (strcmp(method_name, "nativeSetBoolean") == 0) {
+        long_value = PFCutRealmGetBoolParam<is_range>(
+            called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 3u, false) ? 1 : 0;
+      } else if (strcmp(method_name, "nativeSetNull") != 0) {
+        long_value = PFCutRealmGetLongParam<is_range>(
+            called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 3u, 0);
+      }
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        table = PFCutRealmTableForHandleLocked(state, table_handle);
+        column = PFCutRealmColumnAlias(PFCutRealmColumnNameLocked(state, column_key));
+        if (strcmp(method_name, "nativeSetNull") == 0) {
+          PFCutRealmRowState& row = PFCutRealmEnsureRowTemplateLocked(state, table, row_id);
+          row.longs.erase(column);
+          row.strings.erase(column);
+        } else if (!string_value.empty() || strcmp(method_name, "nativeSetString") == 0 ||
+                   strcmp(method_name, "nativeSetObjectId") == 0 ||
+                   strcmp(method_name, "nativeSetUUID") == 0) {
+          PFCutRealmStoreStringLocked(state, table, row_id, column, string_value);
+        } else {
+          PFCutRealmStoreLongLocked(state, table, row_id, column, long_value);
+        }
+      }
+      fprintf(stderr,
+              "[PFCUT-REALM-WRITE] table-set method=%s table=%s row=%lld column=%s long=%lld stringLen=%zu\n",
+              method_name,
+              table.c_str(),
+              static_cast<long long>(row_id),
+              column.c_str(),
+              static_cast<long long>(long_value),
+              string_value.size());
+      fflush(stderr);
+      PFCutSetDefaultResultForShorty(shorty, result);
+      return true;
+    }
+    if (shorty[0] == 'Z') {
+      result->SetZ(false);
+      return true;
+    }
+    if (shorty[0] == 'J') {
+      result->SetJ(0);
+      return true;
+    }
+    if (shorty[0] == 'V') {
+      PFCutSetDefaultResultForShorty(shorty, result);
+      return true;
+    }
+    return false;
+  }
+
+  if (strcmp(descriptor, "Lio/realm/internal/OsObject;") == 0) {
+    if (strcmp(method_name, "nativeCreateNewObject") == 0 ||
+        strcmp(method_name, "nativeCreateRow") == 0 ||
+        strstr(method_name, "nativeCreateNewObjectWith") == method_name ||
+        strstr(method_name, "nativeCreateRowWith") == method_name) {
+      const int64_t table_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      int64_t row_id = -1;
+      std::string table;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        table = PFCutRealmTableForHandleLocked(state, table_handle);
+        row_id = PFCutRealmCreateRowTemplateLocked(state, table);
+        if (strstr(method_name, "WithLongPrimaryKey") != nullptr) {
+          const int64_t column_key = PFCutRealmGetLongParam<is_range>(
+              called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 2u, 0);
+          const int64_t value = PFCutRealmGetLongParam<is_range>(
+              called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 3u, 0);
+          PFCutRealmStoreLongLocked(
+              state, table, row_id, PFCutRealmColumnNameLocked(state, column_key), value);
+        }
+      }
+      fprintf(stderr,
+              "[PFCUT-REALM-WRITE] row-create method=%s table=%s row=%lld\n",
+              method_name,
+              table.c_str(),
+              static_cast<long long>(row_id));
+      fflush(stderr);
+      result->SetJ(row_id);
+      return true;
+    }
+    if (strcmp(method_name, "nativeCreate") == 0 ||
+        strcmp(method_name, "nativeCreateEmbeddedObject") == 0) {
+      result->SetJ(PFCutNextRealmPseudoHandle());
+      return true;
+    }
+    if (shorty[0] == 'J') {
+      result->SetJ(0);
+      return true;
+    }
+    if (shorty[0] == 'V') {
+      PFCutSetDefaultResultForShorty(shorty, result);
+      return true;
+    }
+    return false;
+  }
+
+  if (strcmp(descriptor, "Lio/realm/internal/objectstore/OsObjectBuilder;") == 0) {
+    if (strcmp(method_name, "nativeCreateBuilder") == 0 ||
+        strcmp(method_name, "nativeStartList") == 0 ||
+        strcmp(method_name, "nativeStartSet") == 0 ||
+        strcmp(method_name, "nativeStartDictionary") == 0) {
+      const int64_t handle = PFCutNextRealmPseudoHandle();
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        if (strcmp(method_name, "nativeCreateBuilder") == 0) {
+          state.builders[handle] = {};
+        } else {
+          state.lists[handle] = {};
+        }
+      }
+      result->SetJ(handle);
+      return true;
+    }
+    if (strstr(method_name, "nativeAdd") == method_name) {
+      const int64_t builder_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      const int64_t column_key = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 1u, 0);
+      std::string column;
+      int64_t long_value = 0;
+      std::string string_value;
+      std::vector<int64_t> list_rows;
+      const bool is_string =
+          strstr(method_name, "String") != nullptr ||
+          strstr(method_name, "ObjectId") != nullptr ||
+          strstr(method_name, "UUID") != nullptr;
+      const bool is_bool = strstr(method_name, "Boolean") != nullptr;
+      const bool is_object_list = strcmp(method_name, "nativeAddObjectList") == 0;
+      if (is_string) {
+        string_value = PFCutRealmGetStringParam<is_range>(
+            called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 2u);
+      } else if (is_object_list) {
+        list_rows = PFCutRealmGetLongArrayParam<is_range>(
+            called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 2u);
+      } else if (is_bool) {
+        long_value = PFCutRealmGetBoolParam<is_range>(
+            called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 2u, false) ? 1 : 0;
+      } else if (strcmp(method_name, "nativeAddNull") != 0) {
+        long_value = PFCutRealmGetLongParam<is_range>(
+            called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 2u, 0);
+      }
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        column = PFCutRealmColumnAlias(PFCutRealmColumnNameLocked(state, column_key));
+        PFCutRealmBuilderState& builder = state.builders[builder_handle];
+        if (is_string) {
+          builder.strings[column] = string_value;
+        } else if (is_object_list) {
+          std::vector<int64_t> row_ids;
+          row_ids.reserve(list_rows.size());
+          for (int64_t row_value : list_rows) {
+            const auto row_it = state.rows.find(row_value);
+            row_ids.push_back(row_it != state.rows.end() ? row_it->second.row_id : row_value);
+          }
+          builder.link_lists[column] = row_ids;
+        } else if (strcmp(method_name, "nativeAddNull") != 0) {
+          builder.longs[column] = long_value;
+        }
+      }
+      fprintf(stderr,
+              "[PFCUT-REALM-WRITE] builder-add method=%s builder=%lld column=%s long=%lld stringLen=%zu listCount=%zu\n",
+              method_name,
+              static_cast<long long>(builder_handle),
+              column.c_str(),
+              static_cast<long long>(long_value),
+              string_value.size(),
+              list_rows.size());
+      fflush(stderr);
+      PFCutSetDefaultResultForShorty(shorty, result);
+      return true;
+    }
+    if (strcmp(method_name, "nativeCreateOrUpdateTopLevelObject") == 0 ||
+        strcmp(method_name, "nativeUpdateEmbeddedObject") == 0) {
+      const int64_t table_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 1u, 0);
+      const int64_t builder_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 2u, 0);
+      int64_t row_id = -1;
+      std::string table;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        table = PFCutRealmTableForHandleLocked(state, table_handle);
+        row_id = PFCutRealmNormalizeTableName(table) == "class_BaseCart" ?
+            PFCutRealmEnsureBaseCartRowLocked(state) :
+            PFCutRealmCreateRowTemplateLocked(state, table);
+        PFCutRealmApplyBuilderLocked(state, table, row_id, builder_handle);
+      }
+      fprintf(stderr,
+              "[PFCUT-REALM-WRITE] builder-commit method=%s table=%s builder=%lld row=%lld\n",
+              method_name,
+              table.c_str(),
+              static_cast<long long>(builder_handle),
+              static_cast<long long>(row_id));
+      fflush(stderr);
+      result->SetJ(row_id);
+      return true;
+    }
+    if (strcmp(method_name, "nativeDestroyBuilder") == 0) {
+      const int64_t builder_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        state.builders.erase(builder_handle);
+        state.lists.erase(builder_handle);
+      }
+      PFCutSetDefaultResultForShorty(shorty, result);
+      return true;
+    }
+    if (shorty[0] == 'J') {
+      result->SetJ(PFCutNextRealmPseudoHandle());
+      return true;
+    }
+    if (shorty[0] == 'V') {
+      PFCutSetDefaultResultForShorty(shorty, result);
+      return true;
+    }
+    return false;
+  }
+
+  if (strcmp(descriptor, "Lio/realm/internal/OsList;") == 0) {
+    if (strcmp(method_name, "nativeCreate") == 0) {
+      const int64_t row_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 1u, 0);
+      const int64_t column_key = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 2u, 0);
+      const int64_t list_handle = PFCutNextRealmPseudoHandle();
+      int64_t target_table_handle = 0;
+      std::string table;
+      std::string column;
+      std::string target_table;
+      int64_t size = 0;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        const auto row_it = state.rows.find(row_handle);
+        if (row_it != state.rows.end()) {
+          table = row_it->second.table;
+          column = PFCutRealmColumnAlias(PFCutRealmColumnNameLocked(state, column_key));
+          target_table = PFCutRealmLinkListTargetTable(table, column);
+          PFCutRealmRowState& owner =
+              PFCutRealmEnsureRowTemplateLocked(state, table, row_it->second.row_id);
+          PFCutRealmListState list_state;
+          list_state.table = table;
+          list_state.owner_row_id = row_it->second.row_id;
+          list_state.column = column;
+          list_state.target_table = target_table;
+          const auto persisted_it = owner.link_lists.find(column);
+          if (persisted_it != owner.link_lists.end()) {
+            list_state.row_ids = persisted_it->second;
+          }
+          size = static_cast<int64_t>(list_state.row_ids.size());
+          state.lists[list_handle] = std::move(list_state);
+          if (!target_table.empty()) {
+            target_table_handle = PFCutRealmTableHandleLocked(state, target_table);
+          }
+        } else {
+          state.lists[list_handle] = {};
+        }
+      }
+      fprintf(stderr,
+              "[PFCUT-REALM-WRITE] list-create list=%lld ownerTable=%s column=%s targetTable=%lld size=%lld\n",
+              static_cast<long long>(list_handle),
+              table.c_str(),
+              column.c_str(),
+              static_cast<long long>(target_table_handle),
+              static_cast<long long>(size));
+      fflush(stderr);
+      return PFCutRealmSetLongPairResult(self, list_handle, target_table_handle, result);
+    }
+    if (strcmp(method_name, "nativeAddRow") == 0 ||
+        strcmp(method_name, "nativeInsertRow") == 0) {
+      const int64_t list_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      const uint32_t row_param = strcmp(method_name, "nativeInsertRow") == 0 ? 2u : 1u;
+      const int64_t row_arg = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, row_param, -1);
+      int64_t row_id = row_arg;
+      std::string table;
+      std::string column;
+      int64_t size = 0;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        PFCutRealmListState& list_state = state.lists[list_handle];
+        const auto row_it = state.rows.find(row_arg);
+        if (row_it != state.rows.end()) {
+          row_id = row_it->second.row_id;
+        }
+        if (strcmp(method_name, "nativeInsertRow") == 0) {
+          const int64_t index = PFCutRealmGetLongParam<is_range>(
+              called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 1u, 0);
+          const size_t insert_at = index < 0 ? 0 :
+              std::min(static_cast<size_t>(index), list_state.row_ids.size());
+          list_state.row_ids.insert(list_state.row_ids.begin() + insert_at, row_id);
+        } else {
+          list_state.row_ids.push_back(row_id);
+        }
+        if (!list_state.table.empty() && list_state.owner_row_id >= 0 && !list_state.column.empty()) {
+          PFCutRealmRowState& owner = PFCutRealmEnsureRowTemplateLocked(
+              state, list_state.table, list_state.owner_row_id);
+          owner.link_lists[list_state.column] = list_state.row_ids;
+        }
+        table = list_state.table;
+        column = list_state.column;
+        size = static_cast<int64_t>(list_state.row_ids.size());
+      }
+      fprintf(stderr,
+              "[PFCUT-REALM-WRITE] list-row method=%s list=%lld ownerTable=%s column=%s row=%lld size=%lld\n",
+              method_name,
+              static_cast<long long>(list_handle),
+              table.c_str(),
+              column.c_str(),
+              static_cast<long long>(row_id),
+              static_cast<long long>(size));
+      fflush(stderr);
+      PFCutSetDefaultResultForShorty(shorty, result);
+      return true;
+    }
+    if (strcmp(method_name, "nativeGetRow") == 0) {
+      const int64_t list_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      const int64_t index = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 1u, 0);
+      int64_t row_id = -1;
+      int64_t row_handle = 0;
+      std::string target_table;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        const auto list_it = state.lists.find(list_handle);
+        if (list_it != state.lists.end() &&
+            index >= 0 &&
+            index < static_cast<int64_t>(list_it->second.row_ids.size())) {
+          row_id = list_it->second.row_ids[static_cast<size_t>(index)];
+          target_table = list_it->second.target_table;
+          if (target_table.empty()) {
+            target_table = PFCutRealmLinkListTargetTable(list_it->second.table,
+                                                        list_it->second.column);
+          }
+          if (!target_table.empty() && row_id >= 0) {
+            row_handle = PFCutRealmCreateRowHandleLocked(state, target_table, row_id);
+          }
+        }
+      }
+      fprintf(stderr,
+              "[PFCUT-REALM-STATE] list-get-row list=%lld index=%lld row=%lld handle=%lld target=%s\n",
+              static_cast<long long>(list_handle),
+              static_cast<long long>(index),
+              static_cast<long long>(row_id),
+              static_cast<long long>(row_handle),
+              target_table.c_str());
+      fflush(stderr);
+      result->SetJ(row_handle != 0 ? row_handle : row_id);
+      return true;
+    }
+    if (strstr(method_name, "nativeSize") != nullptr) {
+      const int64_t list_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      int64_t size = 0;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        const auto list_it = state.lists.find(list_handle);
+        if (list_it != state.lists.end()) {
+          size = static_cast<int64_t>(list_it->second.row_ids.size());
+        }
+      }
+      result->SetJ(size);
+      return true;
+    }
+    if (shorty[0] == 'J') {
+      result->SetJ(0);
+      return true;
+    }
+    if (shorty[0] == 'Z') {
+      result->SetZ(false);
+      return true;
+    }
+    if (shorty[0] == 'V') {
+      PFCutSetDefaultResultForShorty(shorty, result);
+      return true;
+    }
+    return false;
+  }
+
+  if (strcmp(descriptor, "Lio/realm/internal/TableQuery;") == 0) {
+    if (strcmp(method_name, "nativeRawPredicate") == 0) {
+      const int64_t query_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      const std::string predicate = PFCutRealmGetStringParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 1u);
+      const std::vector<int64_t> bind_handles = PFCutRealmGetLongArrayParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 2u);
+      std::string table;
+      std::string bind0s;
+      int64_t bind0l = 0;
+      size_t rows = 0;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        auto it = state.queries.find(query_handle);
+        if (it != state.queries.end()) {
+          it->second.predicate = predicate;
+          it->second.bind_handles = bind_handles;
+          PFCutRealmDecodeQueryBindsLocked(state, &it->second);
+          PFCutRealmMaybePopulateQueryRowsLocked(state, &it->second);
+          table = it->second.table;
+          if (!it->second.bind_strings.empty()) {
+            bind0s = it->second.bind_strings.front();
+          }
+          if (!it->second.bind_longs.empty()) {
+            bind0l = it->second.bind_longs.front();
+          }
+          rows = it->second.row_ids.size();
+        }
+      }
+      fprintf(stderr,
+              "[PFCUT-REALM-STATE] raw-predicate query=%lld table=%s predicate=%s binds=%zu bind0s=%s bind0l=%lld rows=%zu\n",
+              static_cast<long long>(query_handle),
+              table.c_str(),
+              predicate.c_str(),
+              bind_handles.size(),
+              bind0s.c_str(),
+              static_cast<long long>(bind0l),
+              rows);
+      fflush(stderr);
+      PFCutSetDefaultResultForShorty(shorty, result);
+      return true;
+    }
+    if (strcmp(method_name, "nativeFind") == 0 ||
+        strcmp(method_name, "nativeFindFirst") == 0) {
+      const int64_t query_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      int64_t row_id = -1;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        const auto it = state.queries.find(query_handle);
+        if (it != state.queries.end() && !it->second.row_ids.empty()) {
+          row_id = it->second.row_ids.front();
+        }
+      }
+      fprintf(stderr,
+              "[PFCUT-REALM-STATE] query-find query=%lld row=%lld\n",
+              static_cast<long long>(query_handle),
+              static_cast<long long>(row_id));
+      fflush(stderr);
+      result->SetJ(row_id);
+      return true;
+    }
+    if (strcmp(method_name, "nativeCount") == 0) {
+      const int64_t query_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      int64_t count = 0;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        const auto it = state.queries.find(query_handle);
+        if (it != state.queries.end()) {
+          count = static_cast<int64_t>(it->second.row_ids.size());
+        }
+      }
+      result->SetJ(count);
+      return true;
+    }
+    if (strcmp(method_name, "nativeRemove") == 0) {
+      result->SetJ(0);
+      return true;
+    }
+    if (shorty[0] == 'V') {
+      PFCutSetDefaultResultForShorty(shorty, result);
+      return true;
+    }
+    return false;
+  }
+
+  if (strcmp(descriptor, "Lio/realm/internal/OsResults;") == 0) {
+    if (strcmp(method_name, "nativeCreateResults") == 0) {
+      const int64_t query_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 1u, 0);
+      const int64_t result_handle = PFCutNextRealmPseudoHandle();
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        const auto query_it = state.queries.find(query_handle);
+        if (query_it != state.queries.end()) {
+          state.results[result_handle] =
+              {query_it->second.table_handle,
+               query_handle,
+               query_it->second.table,
+               query_it->second.row_ids};
+        } else {
+          state.results[result_handle] = {0, query_handle, "", {}};
+        }
+      }
+      size_t size = 0;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        const auto it = state.results.find(result_handle);
+        if (it != state.results.end()) {
+          size = it->second.row_ids.size();
+        }
+      }
+      fprintf(stderr,
+              "[PFCUT-REALM-STATE] result query=%lld result=%lld size=%zu\n",
+              static_cast<long long>(query_handle),
+              static_cast<long long>(result_handle),
+              size);
+      fflush(stderr);
+      result->SetJ(result_handle);
+      return true;
+    }
+    if (strcmp(method_name, "nativeSize") == 0) {
+      const int64_t result_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      int64_t size = 0;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        const auto it = state.results.find(result_handle);
+        if (it != state.results.end()) {
+          size = PFCutRealmResultSizeLocked(it->second);
+        }
+      }
+      fprintf(stderr,
+              "[PFCUT-REALM-STATE] result-size result=%lld size=%lld\n",
+              static_cast<long long>(result_handle),
+              static_cast<long long>(size));
+      fflush(stderr);
+      result->SetJ(size);
+      return true;
+    }
+    if (strcmp(method_name, "nativeGetTable") == 0) {
+      const int64_t result_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      int64_t table_handle = 0;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        const auto it = state.results.find(result_handle);
+        if (it != state.results.end()) {
+          table_handle = it->second.table_handle;
+        }
+      }
+      result->SetJ(table_handle);
+      return true;
+    }
+    if (strcmp(method_name, "nativeWhere") == 0) {
+      const int64_t result_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      int64_t query_handle = PFCutNextRealmPseudoHandle();
+      int64_t table_handle = 0;
+      std::string table;
+      size_t rows = 0;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        const auto it = state.results.find(result_handle);
+        if (it != state.results.end()) {
+          table_handle = it->second.table_handle;
+          table = it->second.table;
+          PFCutRealmQueryState query;
+          query.table_handle = table_handle;
+          query.table = table;
+          query.row_ids = it->second.row_ids;
+          rows = query.row_ids.size();
+          state.queries[query_handle] = query;
+        } else {
+          state.queries[query_handle] = {0, "", ""};
+        }
+      }
+      fprintf(stderr,
+              "[PFCUT-REALM-STATE] result-where result=%lld table=%s query=%lld rows=%zu\n",
+              static_cast<long long>(result_handle),
+              table.c_str(),
+              static_cast<long long>(query_handle),
+              rows);
+      fflush(stderr);
+      result->SetJ(query_handle);
+      return true;
+    }
+    if (strcmp(method_name, "nativeGetMode") == 0) {
+      result->SetB(0);
+      return true;
+    }
+    if (strcmp(method_name, "nativeFirstRow") == 0 ||
+        strcmp(method_name, "nativeLastRow") == 0 ||
+        strcmp(method_name, "nativeGetRow") == 0) {
+      const int64_t result_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      int64_t index = 0;
+      if (strcmp(method_name, "nativeLastRow") == 0) {
+        index = -1;
+      } else if (strcmp(method_name, "nativeGetRow") == 0) {
+        index = PFCutRealmGetLongParam<is_range>(
+            called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 1u, 0);
+      }
+      int64_t row_handle = 0;
+      int64_t row_id = -1;
+      std::string table;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        const auto it = state.results.find(result_handle);
+        if (it != state.results.end() && !it->second.row_ids.empty()) {
+          const int64_t resolved_index =
+              index < 0 ? static_cast<int64_t>(it->second.row_ids.size()) - 1 : index;
+          if (resolved_index >= 0 &&
+              resolved_index < static_cast<int64_t>(it->second.row_ids.size())) {
+            row_id = it->second.row_ids[static_cast<size_t>(resolved_index)];
+            table = it->second.table;
+            row_handle = PFCutRealmCreateRowHandleLocked(state, table, row_id);
+          }
+        }
+      }
+      fprintf(stderr,
+              "[PFCUT-REALM-STATE] result-row method=%s result=%lld table=%s row=%lld handle=%lld\n",
+              method_name,
+              static_cast<long long>(result_handle),
+              table.c_str(),
+              static_cast<long long>(row_id),
+              static_cast<long long>(row_handle));
+      fflush(stderr);
+      result->SetJ(row_handle);
+      return true;
+    }
+    if (strcmp(method_name, "nativeIndexOf") == 0) {
+      result->SetJ(-1);
+      return true;
+    }
+    if (shorty[0] == 'Z') {
+      result->SetZ(false);
+      return true;
+    }
+    if (shorty[0] == 'J') {
+      result->SetJ(0);
+      return true;
+    }
+    if (shorty[0] == 'V') {
+      PFCutSetDefaultResultForShorty(shorty, result);
+      return true;
+    }
+    return false;
+  }
+
+  if (strcmp(descriptor, "Lio/realm/internal/UncheckedRow;") == 0 ||
+      strcmp(descriptor, "Lio/realm/internal/CheckedRow;") == 0) {
+    if (strcmp(method_name, "nativeGetColumnKey") == 0) {
+      const int64_t row_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      const std::string column = PFCutRealmGetStringParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 1u);
+      int64_t column_key = 0;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        column_key =
+            PFCutRealmStableColumnKeyLocked(state, PFCutRealmTableForHandleLocked(state, row_handle), column);
+      }
+      result->SetJ(column_key);
+      return true;
+    }
+    if (strcmp(method_name, "nativeGetColumnNames") == 0) {
+      const int64_t row_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      std::vector<std::string> columns;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        columns = PFCutRealmKnownColumnsForTable(PFCutRealmTableForHandleLocked(state, row_handle));
+      }
+      return PFCutRealmSetStringArrayResult(self, columns, result);
+    }
+    if (strcmp(method_name, "nativeIsValid") == 0) {
+      const int64_t row_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      bool valid = false;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        valid = state.rows.find(row_handle) != state.rows.end();
+      }
+      result->SetZ(valid);
+      return true;
+    }
+    if (strcmp(method_name, "nativeGetObjectKey") == 0) {
+      const int64_t row_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      int64_t row_id = -1;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        const auto it = state.rows.find(row_handle);
+        if (it != state.rows.end()) {
+          row_id = it->second.row_id;
+        }
+      }
+      result->SetJ(row_id);
+      return true;
+    }
+    if (strcmp(method_name, "nativeGetLong") == 0 ||
+        strcmp(method_name, "nativeGetTimestamp") == 0) {
+      const int64_t row_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      const int64_t column_key = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 1u, 0);
+      int64_t value = 0;
+      std::string column;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        column = PFCutRealmColumnAlias(PFCutRealmColumnNameLocked(state, column_key));
+        const auto row_it = state.rows.find(row_handle);
+        if (row_it != state.rows.end()) {
+          const auto long_it = row_it->second.longs.find(column);
+          if (long_it != row_it->second.longs.end()) {
+            value = long_it->second;
+          }
+        }
+      }
+      fprintf(stderr,
+              "[PFCUT-REALM-STATE] row-long row=%lld column=%s value=%lld\n",
+              static_cast<long long>(row_handle),
+              column.c_str(),
+              static_cast<long long>(value));
+      fflush(stderr);
+      result->SetJ(value);
+      return true;
+    }
+    if (strcmp(method_name, "nativeGetString") == 0 ||
+        strcmp(method_name, "nativeGetObjectId") == 0 ||
+        strcmp(method_name, "nativeGetUUID") == 0) {
+      const int64_t row_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      const int64_t column_key = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 1u, 0);
+      std::string value;
+      std::string column;
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        column = PFCutRealmColumnAlias(PFCutRealmColumnNameLocked(state, column_key));
+        const auto row_it = state.rows.find(row_handle);
+        if (row_it != state.rows.end()) {
+          const auto str_it = row_it->second.strings.find(column);
+          if (str_it != row_it->second.strings.end()) {
+            value = str_it->second;
+          }
+        }
+      }
+      fprintf(stderr,
+              "[PFCUT-REALM-STATE] row-string row=%lld column=%s valueLen=%zu\n",
+              static_cast<long long>(row_handle),
+              column.c_str(),
+              value.size());
+      fflush(stderr);
+      return PFCutRealmSetStringResult(self, value, result);
+    }
+    if (strstr(method_name, "nativeSet") == method_name ||
+        strcmp(method_name, "nativeNullifyLink") == 0) {
+      const int64_t row_handle = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 0u, 0);
+      const int64_t column_key = PFCutRealmGetLongParam<is_range>(
+          called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 1u, 0);
+      std::string table;
+      std::string column;
+      int64_t row_id = -1;
+      int64_t long_value = 0;
+      std::string string_value;
+      const bool is_string =
+          strcmp(method_name, "nativeSetString") == 0 ||
+          strcmp(method_name, "nativeSetObjectId") == 0 ||
+          strcmp(method_name, "nativeSetUUID") == 0;
+      if (is_string) {
+        string_value = PFCutRealmGetStringParam<is_range>(
+            called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 2u);
+      } else if (strcmp(method_name, "nativeSetBoolean") == 0) {
+        long_value = PFCutRealmGetBoolParam<is_range>(
+            called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 2u, false) ? 1 : 0;
+      } else if (strcmp(method_name, "nativeSetNull") != 0 &&
+                 strcmp(method_name, "nativeNullifyLink") != 0) {
+        long_value = PFCutRealmGetLongParam<is_range>(
+            called_method, shorty, shadow_frame, number_of_inputs, arg, vregC, 2u, 0);
+      }
+      {
+        std::lock_guard<std::mutex> lock(state.mu);
+        const auto row_it = state.rows.find(row_handle);
+        if (row_it != state.rows.end()) {
+          table = row_it->second.table;
+          row_id = row_it->second.row_id;
+        }
+        column = PFCutRealmColumnAlias(PFCutRealmColumnNameLocked(state, column_key));
+        if (strcmp(method_name, "nativeSetNull") == 0 ||
+            strcmp(method_name, "nativeNullifyLink") == 0) {
+          PFCutRealmRowState& row = PFCutRealmEnsureRowTemplateLocked(state, table, row_id);
+          row.longs.erase(column);
+          row.strings.erase(column);
+        } else if (is_string) {
+          PFCutRealmStoreStringLocked(state, table, row_id, column, string_value);
+        } else {
+          PFCutRealmStoreLongLocked(state, table, row_id, column, long_value);
+        }
+      }
+      fprintf(stderr,
+              "[PFCUT-REALM-WRITE] row-set method=%s table=%s row=%lld column=%s long=%lld stringLen=%zu\n",
+              method_name,
+              table.c_str(),
+              static_cast<long long>(row_id),
+              column.c_str(),
+              static_cast<long long>(long_value),
+              string_value.size());
+      fflush(stderr);
+      PFCutSetDefaultResultForShorty(shorty, result);
+      return true;
+    }
+    if (shorty[0] == 'Z') {
+      result->SetZ(false);
+      return true;
+    }
+    if (shorty[0] == 'I') {
+      result->SetI(0);
+      return true;
+    }
+    if (shorty[0] == 'J') {
+      result->SetJ(0);
+      return true;
+    }
+    if (shorty[0] == 'V') {
+      PFCutSetDefaultResultForShorty(shorty, result);
+      return true;
+    }
+    return false;
+  }
+
+  return false;
+}
+
+static inline bool PFCutRealmNativeLongLooksLikeHandle(const char* method_name) {
+  if (method_name == nullptr) {
+    return false;
+  }
+  if (strcmp(method_name, "nativeGetFinalizerPtr") == 0 ||
+      strcmp(method_name, "nativeGetFinalizerMethodPtr") == 0 ||
+      strcmp(method_name, "nativeGetSchemaVersion") == 0 ||
+      strstr(method_name, "nativeSize") != nullptr ||
+      strstr(method_name, "nativeCount") != nullptr ||
+      strstr(method_name, "nativeFindFirst") != nullptr ||
+      strstr(method_name, "nativeGetColumnCount") != nullptr ||
+      strstr(method_name, "nativeGetColumnKey") != nullptr ||
+      strstr(method_name, "nativeGetColumnType") != nullptr ||
+      strstr(method_name, "nativeGetObjectKey") != nullptr ||
+      strstr(method_name, "nativeGetLong") != nullptr ||
+      strstr(method_name, "nativeGetTimestamp") != nullptr) {
+    return false;
+  }
+  return strstr(method_name, "nativeCreate") != nullptr ||
+      strstr(method_name, "nativeGetSharedRealm") != nullptr ||
+      strstr(method_name, "nativeGetSchemaInfo") != nullptr ||
+      strstr(method_name, "nativeGetTableRef") != nullptr ||
+      strstr(method_name, "nativeGetObjectSchemaInfo") != nullptr ||
+      strstr(method_name, "nativeWhere") != nullptr ||
+      strstr(method_name, "nativeFreeze") != nullptr ||
+      strstr(method_name, "nativeStart") != nullptr ||
+      strstr(method_name, "nativeGetRowPtr") != nullptr ||
+      strstr(method_name, "nativeGetLink") != nullptr ||
+      strstr(method_name, "nativeCreateMapping") != nullptr;
+}
+
+static inline bool PFCutRealmNativeLooksLikeDataAccess(const char* method_name) {
+  if (method_name == nullptr) {
+    return false;
+  }
+  return strstr(method_name, "nativeSize") != nullptr ||
+      strstr(method_name, "nativeFindFirst") != nullptr ||
+      strstr(method_name, "nativeFirstRow") != nullptr ||
+      strstr(method_name, "nativeLastRow") != nullptr ||
+      strstr(method_name, "nativeGetRow") != nullptr ||
+      strstr(method_name, "nativeGetValue") != nullptr ||
+      strstr(method_name, "nativeGetString") != nullptr ||
+      strstr(method_name, "nativeGetLong") != nullptr ||
+      strstr(method_name, "nativeGetBoolean") != nullptr ||
+      strstr(method_name, "nativeIndexOf") != nullptr ||
+      strstr(method_name, "nativeSet") != nullptr ||
+      strstr(method_name, "nativeAdd") != nullptr ||
+      strstr(method_name, "nativeCreateOrUpdate") != nullptr ||
+      strstr(method_name, "nativeCommitTransaction") != nullptr ||
+      strstr(method_name, "nativeBeginTransaction") != nullptr ||
+      strstr(method_name, "nativeCancelTransaction") != nullptr;
+}
+
+static inline bool PFCutTrySetRealmNativeBoundaryResult(ArtMethod* called_method,
+                                                        const char* shorty,
+                                                        JValue* result)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (called_method == nullptr || shorty == nullptr || result == nullptr) {
+    return false;
+  }
+  const char* method_name = WlSafeName(called_method);
+  if (method_name == nullptr) {
+    return false;
+  }
+  if (shorty[0] == 'J') {
+    int64_t value = 0;
+    if (strstr(method_name, "nativeFindFirst") != nullptr) {
+      value = -1;
+    } else if (PFCutRealmNativeLongLooksLikeHandle(method_name)) {
+      value = PFCutNextRealmPseudoHandle();
+    }
+    result->SetJ(value);
+    if (value != 0) {
+      static thread_local int realm_handle_count = 0;
+      if (realm_handle_count < 80 || WestlakeTraceVerboseCalls()) {
+        realm_handle_count++;
+        fprintf(stderr,
+                "[PFCUT-REALM] native boundary pseudo-handle %lld %s shorty=%s\n",
+                static_cast<long long>(value),
+                called_method->PrettyMethod().c_str(),
+                shorty);
+        fflush(stderr);
+      }
+    }
+    return true;
+  }
+  if (shorty[0] == 'Z') {
+    bool value = false;
+    if (strstr(method_name, "nativeIsValid") != nullptr ||
+        strstr(method_name, "nativeHasColumn") != nullptr ||
+        strstr(method_name, "nativeCallWithLock") != nullptr) {
+      value = true;
+    }
+    result->SetZ(value);
+    return true;
+  }
+  if (shorty[0] == 'L' &&
+      (strstr(method_name, "nativeGetName") != nullptr ||
+       strstr(method_name, "nativeGetString") != nullptr)) {
+    Thread* self = Thread::Current();
+    ObjPtr<mirror::String> value =
+        mirror::String::AllocFromModifiedUtf8(self, "");
+    if (self->IsExceptionPending()) {
+      self->ClearException();
+      return false;
+    }
+    result->SetL(value);
+    return true;
+  }
+  return false;
+}
+
+template <bool is_range>
+static inline void PFCutLogRealmNativeBoundaryArgs(
+    ArtMethod* called_method,
+    const char* descriptor,
+    const char* shorty,
+    ShadowFrame& shadow_frame,
+    uint16_t number_of_inputs,
+    uint32_t (&arg)[Instruction::kMaxVarArgRegs],
+    uint32_t vregC)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (called_method == nullptr || descriptor == nullptr || shorty == nullptr) {
+    return;
+  }
+  const char* method_name = WlSafeName(called_method);
+  const bool interesting =
+      PFCutRealmNativeLooksLikeDataAccess(method_name) ||
+      strcmp(descriptor, "Lio/realm/internal/OsSharedRealm;") == 0 ||
+      strcmp(descriptor, "Lio/realm/internal/NativeObjectReference;") == 0 ||
+      strcmp(descriptor, "Lio/realm/internal/Table;") == 0 ||
+      strcmp(descriptor, "Lio/realm/internal/TableQuery;") == 0 ||
+      strcmp(descriptor, "Lio/realm/internal/OsResults;") == 0 ||
+      strcmp(descriptor, "Lio/realm/internal/OsObject;") == 0 ||
+      strcmp(descriptor, "Lio/realm/internal/OsList;") == 0 ||
+      strcmp(descriptor, "Lio/realm/internal/objectstore/OsObjectBuilder;") == 0 ||
+      strcmp(descriptor, "Lio/realm/internal/UncheckedRow;") == 0 ||
+      strcmp(descriptor, "Lio/realm/internal/CheckedRow;") == 0;
+  if (!interesting) {
+    return;
+  }
+
+  static thread_local int realm_arg_log_count = 0;
+  if (realm_arg_log_count >= 260 && !WestlakeTraceVerboseCalls()) {
+    return;
+  }
+  realm_arg_log_count++;
+
+  const auto reg_at = [&](uint32_t input_index) -> uint32_t {
+    return is_range ? (vregC + input_index) : arg[input_index];
+  };
+  ArtMethod* caller = shadow_frame.GetMethod();
+  fprintf(stderr,
+          "[PFCUT-REALM-ARGS] callee=%s caller=%s inputs=%u static=%d args=",
+          called_method->PrettyMethod().c_str(),
+          caller != nullptr ? caller->PrettyMethod().c_str() : "<null>",
+          number_of_inputs,
+          called_method->IsStatic() ? 1 : 0);
+
+  uint32_t slot = 0;
+  if (!called_method->IsStatic() && slot < number_of_inputs) {
+    fprintf(stderr, " receiver(r%u)=", reg_at(slot));
+    PFCutPrintObjectSummary(shadow_frame.GetVRegReference(reg_at(slot)), 0);
+    slot++;
+  }
+
+  for (uint32_t shorty_index = 1; shorty[shorty_index] != '\0' && slot < number_of_inputs;
+       ++shorty_index) {
+    const char kind = shorty[shorty_index];
+    const uint32_t reg = reg_at(slot);
+    switch (kind) {
+      case 'J':
+        fprintf(stderr,
+                " J%u(r%u)=%lld",
+                shorty_index - 1,
+                reg,
+                static_cast<long long>(shadow_frame.GetVRegLong(reg)));
+        slot += 2;
+        break;
+      case 'D':
+        fprintf(stderr,
+                " D%u(r%u)=0x%llx",
+                shorty_index - 1,
+                reg,
+                static_cast<unsigned long long>(shadow_frame.GetVRegLong(reg)));
+        slot += 2;
+        break;
+      case 'F':
+      case 'I':
+      case 'B':
+      case 'C':
+      case 'S':
+      case 'Z':
+        fprintf(stderr,
+                " %c%u(r%u)=%d",
+                kind,
+                shorty_index - 1,
+                reg,
+                shadow_frame.GetVReg(reg));
+        slot++;
+        break;
+      case 'L':
+      case '[':
+        fprintf(stderr, " %c%u(r%u)=", kind, shorty_index - 1, reg);
+        PFCutPrintObjectSummary(shadow_frame.GetVRegReference(reg), 0);
+        slot++;
+        break;
+      default:
+        fprintf(stderr, " %c%u(r%u)=?", kind, shorty_index - 1, reg);
+        slot++;
+        break;
+    }
+  }
+  fprintf(stderr, "\n");
+  fflush(stderr);
+}
+
+template <bool is_range>
+static inline bool PFCutTryRealmNativeBoundaryNoop(
+    ArtMethod* called_method,
+    ShadowFrame& shadow_frame,
+    JValue* result,
+    uint16_t number_of_inputs,
+    uint32_t (&arg)[Instruction::kMaxVarArgRegs],
+    uint32_t vregC)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   if (called_method == nullptr ||
       !called_method->IsNative() ||
@@ -4803,9 +9070,72 @@ static inline bool PFCutTryRealmNativeBoundaryNoop(ArtMethod* called_method,
   if (shorty == nullptr || shorty_len == 0u) {
     return false;
   }
+  PFCutLogRealmNativeBoundaryArgs<is_range>(
+      called_method, descriptor, shorty, shadow_frame, number_of_inputs, arg, vregC);
+
+  if (strcmp(descriptor, "Lio/realm/internal/Util;") == 0 &&
+      strcmp(WlSafeName(called_method), "nativeGetTablePrefix") == 0) {
+    Thread* self = Thread::Current();
+    ObjPtr<mirror::String> prefix = mirror::String::AllocFromModifiedUtf8(self, "class_");
+    if (self->IsExceptionPending()) {
+      self->ClearException();
+      return false;
+    }
+    result->SetL(prefix);
+    static thread_local int realm_table_prefix_count = 0;
+    if (realm_table_prefix_count < 12 || WestlakeTraceVerboseCalls()) {
+      realm_table_prefix_count++;
+      fprintf(stderr,
+              "[PFCUT-REALM] native table prefix %s shorty=%s quick=%p jni=%p\n",
+              called_method->PrettyMethod().c_str(),
+              shorty,
+              called_method->GetEntryPointFromQuickCompiledCode(),
+              called_method->GetEntryPointFromJni());
+      fflush(stderr);
+    }
+    return true;
+  }
+
+  if (strcmp(descriptor, "Lio/realm/internal/TableQuery;") == 0 &&
+      strcmp(WlSafeName(called_method), "nativeValidateQuery") == 0) {
+    Thread* self = Thread::Current();
+    gc::AllocatorType allocator_type = Runtime::Current()->GetHeap()->GetCurrentAllocator();
+    ObjPtr<mirror::Object> empty = mirror::String::AllocEmptyString(self, allocator_type);
+    result->SetL(empty);
+    static thread_local int realm_validate_noop_count = 0;
+    if (realm_validate_noop_count < 12 || WestlakeTraceVerboseCalls()) {
+      realm_validate_noop_count++;
+      fprintf(stderr,
+              "[PFCUT-REALM] native boundary validate-ok %s shorty=%s quick=%p jni=%p\n",
+              called_method->PrettyMethod().c_str(),
+              shorty,
+              called_method->GetEntryPointFromQuickCompiledCode(),
+              called_method->GetEntryPointFromJni());
+      fflush(stderr);
+    }
+    return true;
+  }
+
+  if (PFCutTryRealmNativeState<is_range>(
+          called_method,
+          descriptor,
+          shorty,
+          shadow_frame,
+          result,
+          number_of_inputs,
+          arg,
+          vregC)) {
+    return true;
+  }
 
   static thread_local int realm_native_noop_count = 0;
-  if (realm_native_noop_count < 240) {
+  static thread_local int realm_native_data_probe_count = 0;
+  const bool data_probe = PFCutRealmNativeLooksLikeDataAccess(WlSafeName(called_method)) &&
+      realm_native_data_probe_count < 160;
+  if (data_probe) {
+    realm_native_data_probe_count++;
+  }
+  if (realm_native_noop_count < 24 || data_probe || WestlakeTraceVerboseCalls()) {
     realm_native_noop_count++;
     fprintf(stderr,
             "[PFCUT-REALM] native boundary noop %s shorty=%s quick=%p jni=%p\n",
@@ -4819,7 +9149,81 @@ static inline bool PFCutTryRealmNativeBoundaryNoop(ArtMethod* called_method,
   // Boundary probe only. Realm persistence is not implemented here; this
   // preserves ABI-shaped return values so the next app/runtime blocker is
   // visible while PF-494 tracks real portable APK native-library loading.
-  PFCutSetDefaultResultForShorty(shorty, result);
+  if (!PFCutTrySetRealmNativeBoundaryResult(called_method, shorty, result)) {
+    PFCutSetDefaultResultForShorty(shorty, result);
+  }
+  return true;
+}
+
+template <bool is_range>
+static inline bool PFCutTryAndroidxWorkManagerConstructorLite(
+    ArtMethod* called_method,
+    ShadowFrame& shadow_frame,
+    JValue* result,
+    uint16_t number_of_inputs,
+    uint32_t (&arg)[Instruction::kMaxVarArgRegs],
+    uint32_t vregC)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (called_method == nullptr ||
+      called_method->IsStatic() ||
+      number_of_inputs != 8u ||
+      called_method->GetDeclaringClass() == nullptr ||
+      !called_method->GetDeclaringClass()->DescriptorEquals(
+          "Landroidx/work/impl/WorkManagerImpl;") ||
+      strcmp(WlSafeName(called_method), "<init>") != 0) {
+    return false;
+  }
+
+  uint32_t shorty_len = 0;
+  const char* shorty =
+      called_method->GetInterfaceMethodIfProxy(kRuntimePointerSize)->GetShorty(&shorty_len);
+  if (shorty == nullptr || strcmp(shorty, "VLLLLLLL") != 0) {
+    return false;
+  }
+
+  const auto reg_at = [&](uint32_t input_index) -> uint32_t {
+    return is_range ? (vregC + input_index) : arg[input_index];
+  };
+  ObjPtr<mirror::Object> receiver = shadow_frame.GetVRegReference(reg_at(0));
+  if (receiver == nullptr) {
+    ThrowNullPointerExceptionFromInterpreter();
+    if (result != nullptr) {
+      result->SetJ(0);
+    }
+    return true;
+  }
+
+  ObjPtr<mirror::Class> klass = called_method->GetDeclaringClass();
+  const auto set_object_field = [&](const char* name,
+                                    const char* descriptor,
+                                    uint32_t input_index) {
+    ArtField* field = klass->FindInstanceField(name, descriptor);
+    if (field != nullptr) {
+      field->SetObject<false>(receiver, shadow_frame.GetVRegReference(reg_at(input_index)));
+    }
+  };
+
+  set_object_field("b", "Landroid/content/Context;", 1u);
+  set_object_field("c", "Landroidx/work/Configuration;", 2u);
+  set_object_field("e", "Landroidx/work/impl/utils/taskexecutor/TaskExecutor;", 3u);
+  set_object_field("d", "Landroidx/work/impl/WorkDatabase;", 4u);
+  set_object_field("f", "Ljava/util/List;", 5u);
+  set_object_field("g", "Landroidx/work/impl/Processor;", 6u);
+  set_object_field("k", "Landroidx/work/impl/constraints/trackers/Trackers;", 7u);
+
+  static thread_local int workmanager_lite_count = 0;
+  if (workmanager_lite_count < 24 || WestlakeTraceVerboseCalls()) {
+    workmanager_lite_count++;
+    fprintf(stderr,
+            "[PFCUT-WORK] WorkManagerImpl constructor-lite fields seeded %s shorty=%s\n",
+            called_method->PrettyMethod().c_str(),
+            shorty);
+    fflush(stderr);
+  }
+
+  if (result != nullptr) {
+    result->SetJ(0);
+  }
   return true;
 }
 
@@ -4869,7 +9273,7 @@ static inline bool PFCutTryAndroidxLifecycleGeneratedAdapterFallback(ArtMethod* 
       number_of_inputs != 2u ||
       called_method->GetDeclaringClass() == nullptr ||
       !called_method->GetDeclaringClass()->DescriptorEquals("Landroidx/lifecycle/Lifecycling;") ||
-      strcmp(called_method->GetName(), "b") != 0) {
+      strcmp(WlSafeName(called_method), "b") != 0) {
     return false;
   }
 
@@ -4899,63 +9303,12 @@ static inline bool PFCutTryAndroidxLifecycleGeneratedAdapterFallback(ArtMethod* 
 }
 
 template <bool is_range>
-static inline bool PFCutTryAndroidxLifecycleAnnotationBypass(
-    ArtMethod* called_method,
-    ShadowFrame& shadow_frame,
-    JValue* result,
-    uint16_t number_of_inputs,
-    uint32_t (&arg)[Instruction::kMaxVarArgRegs],
-    uint32_t vregC)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
-  if (called_method == nullptr ||
-      called_method->IsStatic() ||
-      number_of_inputs != 2u ||
-      called_method->GetDeclaringClass() == nullptr ||
-      !called_method->GetDeclaringClass()->DescriptorEquals("Ljava/lang/reflect/Method;") ||
-      strcmp(called_method->GetName(), "getAnnotation") != 0) {
-    return false;
-  }
-
-  uint32_t shorty_len = 0;
-  const char* shorty =
-      called_method->GetInterfaceMethodIfProxy(kRuntimePointerSize)->GetShorty(&shorty_len);
-  if (shorty == nullptr || strcmp(shorty, "LL") != 0) {
-    return false;
-  }
-
-  const uint32_t annotation_class_reg = is_range ? vregC + 1u : arg[1];
-  ObjPtr<mirror::Object> annotation_class_obj =
-      shadow_frame.GetVRegReference(annotation_class_reg);
-  if (annotation_class_obj == nullptr || !annotation_class_obj->IsClass()) {
-    return false;
-  }
-
-  ObjPtr<mirror::Class> annotation_class = annotation_class_obj->AsClass();
-  std::string descriptor_storage;
-  const char* descriptor = annotation_class->GetDescriptor(&descriptor_storage);
-  if (descriptor == nullptr ||
-      strcmp(descriptor, "Landroidx/lifecycle/OnLifecycleEvent;") != 0) {
-    return false;
-  }
-
-  static thread_local int lifecycle_annotation_bypass_count = 0;
-  if (lifecycle_annotation_bypass_count < 160) {
-    lifecycle_annotation_bypass_count++;
-    fprintf(stderr,
-            "[PFCUT] AndroidX OnLifecycleEvent annotation bypass %s\n",
-            called_method->PrettyMethod().c_str());
-    fflush(stderr);
-  }
-
-  // Returning null matches Method.getAnnotation() for an absent annotation and
-  // lets ClassesInfoCache produce an empty callback table.  This avoids dynamic
-  // annotation proxy creation until java.lang.reflect.Proxy/WeakCache is fully
-  // repaired in Westlake.
-  result->SetL(nullptr);
-  return true;
-}
-
-static inline bool PFCutTryNewRelicNoop(ArtMethod* called_method, JValue* result)
+static inline bool PFCutTryNewRelicNoop(ArtMethod* called_method,
+                                        ShadowFrame& shadow_frame,
+                                        JValue* result,
+                                        uint16_t number_of_inputs,
+                                        uint32_t (&arg)[Instruction::kMaxVarArgRegs],
+                                        uint32_t vregC)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   if (called_method == nullptr || called_method->GetDeclaringClass() == nullptr) {
     return false;
@@ -4969,8 +9322,12 @@ static inline bool PFCutTryNewRelicNoop(ArtMethod* called_method, JValue* result
   if (strcmp(descriptor, "Lcom/newrelic/agent/android/instrumentation/GsonInstrumentation;") == 0) {
     return false;
   }
+  if (strcmp(descriptor,
+             "Lcom/newrelic/agent/android/instrumentation/BitmapFactoryInstrumentation;") == 0) {
+    return false;
+  }
   if (strcmp(descriptor, "Lcom/newrelic/agent/android/util/Util;") == 0) {
-    const char* method_name = called_method->GetName();
+    const char* method_name = WlSafeName(called_method);
     if (method_name != nullptr && strcmp(method_name, "getRandom") == 0) {
       return false;
     }
@@ -4981,6 +9338,54 @@ static inline bool PFCutTryNewRelicNoop(ArtMethod* called_method, JValue* result
       called_method->GetInterfaceMethodIfProxy(kRuntimePointerSize)->GetShorty(&shorty_len);
   if (shorty == nullptr || shorty_len == 0u) {
     return false;
+  }
+
+  const char* method_name = WlSafeName(called_method);
+  if (strcmp(descriptor,
+             "Lcom/newrelic/agent/android/background/ApplicationStateMonitor;") == 0 &&
+      called_method->IsStatic() &&
+      method_name != nullptr &&
+      strcmp(method_name, "getInstance") == 0 &&
+      shorty[0] == 'L') {
+    Thread* self = Thread::Current();
+    ObjPtr<mirror::Object> monitor =
+        called_method->GetDeclaringClass()->AllocObject(self);
+    static thread_local int newrelic_monitor_count = 0;
+    if (newrelic_monitor_count < 20 || WestlakeTraceVerboseCalls()) {
+      newrelic_monitor_count++;
+      fprintf(stderr,
+              "[PFCUT] NewRelic ApplicationStateMonitor singleton allocated %s object=%p\n",
+              called_method->PrettyMethod().c_str(),
+              monitor.Ptr());
+      fflush(stderr);
+    }
+    result->SetL(monitor);
+    return true;
+  }
+
+  if (strcmp(descriptor,
+             "Lcom/newrelic/agent/android/instrumentation/URLConnectionInstrumentation;") == 0 &&
+      called_method->IsStatic() &&
+      method_name != nullptr &&
+      (strcmp(method_name, "openConnection") == 0 ||
+       strcmp(method_name, "openConnectionWithProxy") == 0) &&
+      strcmp(shorty, "LL") == 0 &&
+      number_of_inputs >= 1u) {
+    const auto reg_at = [&](uint32_t input_index) -> uint32_t {
+      return is_range ? (vregC + input_index) : arg[input_index];
+    };
+    ObjPtr<mirror::Object> connection = shadow_frame.GetVRegReference(reg_at(0));
+    static thread_local int newrelic_url_passthrough_count = 0;
+    if (newrelic_url_passthrough_count < 80 || WestlakeTraceVerboseCalls()) {
+      newrelic_url_passthrough_count++;
+      fprintf(stderr,
+              "[PFCUT] NewRelic URLConnection passthrough %s connection=%p\n",
+              called_method->PrettyMethod().c_str(),
+              connection.Ptr());
+      fflush(stderr);
+    }
+    result->SetL(connection);
+    return true;
   }
 
   static thread_local int newrelic_noop_count = 0;
@@ -5024,7 +9429,7 @@ static inline bool PFCutTryKotlinCoroutineExceptionNoop(ArtMethod* called_method
     return false;
   }
 
-  const char* method_name = called_method->GetName();
+  const char* method_name = WlSafeName(called_method);
   if (method_name == nullptr || strcmp(method_name, "a") != 0) {
     return false;
   }
@@ -5126,6 +9531,27 @@ bool MoveToExceptionHandler(Thread* self,
   bool clear_exception = false;
   uint32_t found_dex_pc = shadow_frame.GetMethod()->FindCatchBlock(
       hs.NewHandle(exception->GetClass()), shadow_frame.GetDexPC(), &clear_exception);
+  if (exception.Get() != nullptr &&
+      exception->GetClass() != nullptr &&
+      exception->GetClass()->DescriptorEquals("Ljava/lang/IllegalArgumentException;")) {
+    std::string message_storage;
+    const char* message = PFCutThrowableMessage(exception.Get(), &message_storage);
+    if (message != nullptr && strstr(message, "Failed requirement") != nullptr) {
+      static thread_local int failed_requirement_unwind_count = 0;
+      if (failed_requirement_unwind_count < 120) {
+        failed_requirement_unwind_count++;
+        ArtMethod* method = shadow_frame.GetMethod();
+        fprintf(stderr,
+                "[PFCUT-IAE-REQUIRE] method=%s dex_pc=%u catch=%u clear=%d message=%s\n",
+                method != nullptr ? method->PrettyMethod().c_str() : "<null>",
+                shadow_frame.GetDexPC(),
+                found_dex_pc,
+                clear_exception ? 1 : 0,
+                message);
+        fflush(stderr);
+      }
+    }
+  }
   if (found_dex_pc == dex::kDexNoIndex) {
     if (!skip_listeners) {
       if (shadow_frame.NeedsNotifyPop()) {
@@ -5355,14 +9781,22 @@ void ArtInterpreterToCompiledCodeBridge(Thread* self,
   if (jit != nullptr && caller != nullptr) {
     jit->NotifyInterpreterToCompiledCodeTransition(self, caller);
   }
-  if (!method->IsNative() && method->GetCodeItem() != nullptr) {
+  // WESTLAKE §601: do not force-interpret a method that HAS live JIT code -- that is the whole
+  // point of this bridge. Force-interpreting it re-entered Execute, which re-dispatched here,
+  // giving an infinite recursion that died as a StackOverflowError.
+  const void* wl_ep = method->GetEntryPointFromQuickCompiledCode();
+  const bool wl_has_jit_code =
+      (jit != nullptr && jit->GetCodeCache() != nullptr && wl_ep != nullptr &&
+       jit->GetCodeCache()->ContainsPc(wl_ep));
+  if (!wl_has_jit_code && !method->IsNative() && method->GetCodeItem() != nullptr) {
     CodeItemDataAccessor accessor(method->DexInstructionData());
     ArtInterpreterToInterpreterBridge(self, accessor, shadow_frame, result);
     return;
   }
-  static constexpr uintptr_t kPFCutStaleQuickEntry = 0xfffffffffffffb17ULL;
   const void* quick_entry = method->GetEntryPointFromQuickCompiledCode();
-  if (UNLIKELY(reinterpret_cast<uintptr_t>(quick_entry) == kPFCutStaleQuickEntry)) {
+  if (UNLIKELY(PFCutPf625EntryLooksInvalid(quick_entry))) {
+    PFCutPf625LogUnsafeNativeEntry(
+        "compiled-bridge", method, caller, quick_entry, method->GetEntryPointFromJni());
     if (method->IsNative()) {
       method->SetEntryPointFromQuickCompiledCode(GetQuickGenericJniStub());
     } else if (method->GetCodeItem() != nullptr) {
@@ -5373,10 +9807,10 @@ void ArtInterpreterToCompiledCodeBridge(Thread* self,
   }
   if (method->IsNative() &&
       method->IsStatic() &&
-      method->GetDeclaringClassDescriptor() != nullptr &&
-      strcmp(method->GetDeclaringClassDescriptor(), "Ljava/util/TimeZone;") == 0 &&
-      (strcmp(method->GetName(), "getDefault") == 0 ||
-       strcmp(method->GetName(), "getDefaultRef") == 0) &&
+      WlSafeDescriptor(method) != nullptr &&
+      strcmp(WlSafeDescriptor(method), "Ljava/util/TimeZone;") == 0 &&
+      (strcmp(WlSafeName(method), "getDefault") == 0 ||
+       strcmp(WlSafeName(method), "getDefaultRef") == 0) &&
       method->GetInterfaceMethodIfProxy(kRuntimePointerSize)->GetShortyView() == "L") {
     using FnType = jobject (*)(JNIEnv*, jclass);
     FnType fn = reinterpret_cast<FnType>(
@@ -6317,9 +10751,55 @@ static inline bool DoCallCommon(ArtMethod* called_method,
                                 uint32_t vregC,
                                 bool string_init) {
   ArtMethod* caller_method = shadow_frame.GetMethod();
+  // WESTLAKE §691: §690 proved KtR.h() does not unwind with an exception even though the mapped
+  // WebView remains url=""/started=0.  Record its resolved callees so we can distinguish a skipped
+  // loadDataWithBaseURL invoke from a framework/provider call that executes as a no-op.
+  if (caller_method != nullptr && called_method != nullptr) {
+    const std::string wl_caller = caller_method->PrettyMethod();
+    if (wl_caller.find(" X.KtR.h(") != std::string::npos) {
+      static thread_local int wl_kt_r_call_count = 0;
+      if (wl_kt_r_call_count < 240) {
+        ++wl_kt_r_call_count;
+        fprintf(stderr, "[WESTLAKE-KTR-CALL] dex_pc=%u callee=%s\n",
+                shadow_frame.GetDexPC(), called_method->PrettyMethod().c_str());
+        fflush(stderr);
+      }
+    }
+  }
+  // WESTLAKE 2026-07-22: the app SIGSEGVs here with an ArtMethod* whose value is ASCII text
+  // ("on/icon", fault addr 0x006e6f63692f6e6f). The faultlog is 96 frames of pure interpreter
+  // internals and cannot name the Java method, so identify it HERE. Inspect the POINTER VALUE
+  // ONLY -- never dereference called_method when it is structurally invalid.
+  //
+  // 2026-08-24: do not classify a pointer merely because its little-endian address bytes happen
+  // to be printable.  Valid, mapped, aligned ArtMethod pointers such as 0x7e5b350050 triggered
+  // that heuristic under some ASLR layouts and produced >10k false BADCALL/BADMETHOD pairs.
+  // The original "on/icon" value is both unaligned and non-canonical, so the structural test
+  // retains the crash guard without treating ASLR luck as memory corruption.
+  {
+    const uintptr_t m = reinterpret_cast<uintptr_t>(called_method);
+    // a real ArtMethod* on this board lives well below 1<<48 and is 4-byte aligned
+    const bool insane = (m & 0x3) != 0 || (m >> 48) != 0;
+    if (m != 0 && insane) {
+      char txt[9];
+      for (int i = 0; i < 8; ++i) {
+        const unsigned b = static_cast<unsigned>((m >> (i * 8)) & 0xff);
+        txt[i] = (b >= 0x20 && b <= 0x7e) ? static_cast<char>(b) : '.';
+      }
+      txt[8] = '\0';
+      fprintf(stderr,
+              "[WESTLAKE-BADMETHOD] corrupt called_method=%p ascii=\"%s\" caller=%s dex_pc=%u "
+              "inputs=%u vregC=%u string_init=%d\n",
+              called_method, txt,
+              caller_method != nullptr ? caller_method->PrettyMethod().c_str() : "<null>",
+              shadow_frame.GetDexPC(), number_of_inputs, vregC, string_init ? 1 : 0);
+      fflush(stderr);
+    }
+  }
   const bool pfc_l3_trace = PFCutIsL3OnCreate(caller_method);
   const bool pfc_diag = false;
   UNUSED(pfc_l3_trace);
+
 	  if (pfc_diag) {
 	    fprintf(stderr,
 	            "[PFCUT] DoCallCommon enter dexIdx=%u called_method=%p caller=%p flags=0x%x native=%d abstract=%d copied=%d default=%d miranda=%d quick=%p jni=%p code_item=%p inputs=%u vregC=%u string_init=%d top_shadow=%p top_quick=%p\n",
@@ -6406,6 +10886,12 @@ static inline bool DoCallCommon(ArtMethod* called_method,
   }
 
   if (!string_init &&
+      PFCutTryUnixFileSystemGetLengthIntrinsic<is_range>(
+          called_method, shadow_frame, result, number_of_inputs, arg, vregC)) {
+    return !self->IsExceptionPending();
+  }
+
+  if (!string_init &&
       PFCutTryUnixFileSystemCanonicalizeIntrinsic<is_range>(
           called_method, self, shadow_frame, result, number_of_inputs, arg, vregC)) {
     return !self->IsExceptionPending();
@@ -6440,13 +10926,25 @@ static inline bool DoCallCommon(ArtMethod* called_method,
     return !self->IsExceptionPending();
   }
 
-  if (!string_init && PFCutTryRealmNativeBoundaryNoop(called_method, result)) {
+  if (!string_init &&
+      PFCutTryRealmNativeBoundaryNoop<is_range>(
+          called_method, shadow_frame, result, number_of_inputs, arg, vregC)) {
+    return !self->IsExceptionPending();
+  }
+
+  if (!string_init &&
+      PFCutTryAndroidxWorkManagerConstructorLite<is_range>(
+          called_method, shadow_frame, result, number_of_inputs, arg, vregC)) {
     return !self->IsExceptionPending();
   }
 
   if (!string_init &&
       PFCutTryMcdLoggerNoop<is_range>(
           called_method, shadow_frame, result, number_of_inputs, arg, vregC)) {
+    return !self->IsExceptionPending();
+  }
+
+  if (!string_init && PFCutTryMcdJustFlipEventNoop(called_method, result)) {
     return !self->IsExceptionPending();
   }
 
@@ -6457,7 +10955,25 @@ static inline bool DoCallCommon(ArtMethod* called_method,
   }
 
   if (!string_init &&
+      PFCutTryMcdNetworkBoundaryNoop<is_range>(
+          called_method, self, shadow_frame, result, number_of_inputs, arg, vregC)) {
+    return !self->IsExceptionPending();
+  }
+
+  if (!string_init &&
       PFCutTryKotlinReflectionFallback<is_range>(
+          called_method, self, shadow_frame, result, number_of_inputs, arg, vregC)) {
+    return !self->IsExceptionPending();
+  }
+
+  if (!string_init &&
+      PFCutTryAndroidxLifecycleFactoryDefaultCreateBroadFallback<is_range>(
+          called_method, self, shadow_frame, result, number_of_inputs, arg, vregC)) {
+    return !self->IsExceptionPending();
+  }
+
+  if (!string_init &&
+      PFCutTryHiltViewModelFactoryCreateFallback<is_range>(
           called_method, self, shadow_frame, result, number_of_inputs, arg, vregC)) {
     return !self->IsExceptionPending();
   }
@@ -6474,6 +10990,12 @@ static inline bool DoCallCommon(ArtMethod* called_method,
     return !self->IsExceptionPending();
   }
 
+  if (!string_init &&
+      PFCutTryAndroidxLifecycleClassFactoryFallback<is_range>(
+          called_method, self, shadow_frame, result, number_of_inputs, arg, vregC)) {
+    return !self->IsExceptionPending();
+  }
+
   if (!string_init && PFCutTryAndroidxSplashNoop(called_method, result)) {
     return !self->IsExceptionPending();
   }
@@ -6485,12 +11007,8 @@ static inline bool DoCallCommon(ArtMethod* called_method,
   }
 
   if (!string_init &&
-      PFCutTryAndroidxLifecycleAnnotationBypass<is_range>(
+      PFCutTryNewRelicNoop<is_range>(
           called_method, shadow_frame, result, number_of_inputs, arg, vregC)) {
-    return !self->IsExceptionPending();
-  }
-
-  if (!string_init && PFCutTryNewRelicNoop(called_method, result)) {
     return !self->IsExceptionPending();
   }
 
@@ -6644,7 +11162,7 @@ static inline bool DoCallCommon(ArtMethod* called_method,
     static thread_local int trace_count = 0;
     ArtMethod* cm = shadow_frame.GetMethod();
     if (cm && shadow_frame.NumberOfVRegs() <= 4) {
-      const char* cn = cm->GetName();
+      const char* cn = WlSafeName(cm);
       if (cn && strcmp(cn, "lastIndexOf") == 0 && trace_count < 5) {
         trace_count++;
         int nr = shadow_frame.NumberOfVRegs();
@@ -6674,10 +11192,12 @@ static inline bool DoCallCommon(ArtMethod* called_method,
 
   bool use_interpreter_entrypoint = ShouldStayInSwitchInterpreter(called_method);
   bool pfc_had_stale_native_quick_entry = false;
-  static constexpr uintptr_t kPFCutStaleQuickEntry = 0xfffffffffffffb17ULL;
   const void* quick_entry = called_method->GetEntryPointFromQuickCompiledCode();
-  if (UNLIKELY(reinterpret_cast<uintptr_t>(quick_entry) == kPFCutStaleQuickEntry)) {
-    if (called_method->IsNative()) {
+  if (UNLIKELY(PFCutPf625EntryLooksInvalid(quick_entry))) {
+    PFCutPf625LogUnsafeNativeEntry(
+        "docall-preframe", called_method, caller_method, quick_entry,
+        called_method->GetEntryPointFromJni());
+  if (called_method->IsNative()) {
       pfc_had_stale_native_quick_entry = true;
       called_method->SetEntryPointFromQuickCompiledCode(GetQuickGenericJniStub());
       called_method->SetEntryPointFromJniPtrSize(nullptr, kRuntimePointerSize);
@@ -6850,7 +11370,7 @@ static inline bool DoCallCommon(ArtMethod* called_method,
               std::string temp1, temp2;
               self->ThrowNewExceptionF("Ljava/lang/InternalError;",
                                        "Invoking %s with bad arg %d, type '%s' not instance of '%s'",
-                                       new_shadow_frame->GetMethod()->GetName(), shorty_pos,
+                                       WlSafeName(new_shadow_frame->GetMethod()), shorty_pos,
                                        o->GetClass()->GetDescriptor(&temp1),
                                        arg_type->GetDescriptor(&temp2));
               return false;
@@ -6895,6 +11415,76 @@ static inline bool DoCallCommon(ArtMethod* called_method,
                             number_of_inputs);
 	    self->EndAssertNoThreadSuspension(old_cause);
 	  }
+
+  // WESTLAKE §739 (2026-08-20): preserve the proven main-Looper reference at
+  // the caller-frame -> callee-frame argument-copy boundary.
+  //
+  // §738 proved that BasicTikTokFragment's exact stock bytecode dataflow has a
+  // live sMainLooper reference in the source vreg immediately before
+  // Handler(Looper). §739 then proved that the first constructor frame receives
+  // it, but Handler's stock (Looper)->(Looper,Callback,Z)->(...,Z,Z) delegation
+  // loses it before the terminal constructor reads mQueue.  Cover each stock
+  // Looper-first Handler constructor and repair only a literal copy invariant:
+  // a non-null source argument may not become null in the just-built callee
+  // frame. Explicit Handler(null) calls remain untouched.
+  const std::string wl_handler_signature =
+      called_method != nullptr ? called_method->GetSignature().ToString() : std::string();
+  const bool wl_handler_looper_ctor =
+      called_method != nullptr && !string_init && number_of_inputs >= 2u &&
+      PFCutDeclaringClassPlausible(called_method) &&
+      called_method->GetDeclaringClass()->DescriptorEquals("Landroid/os/Handler;") &&
+      strcmp(WlSafeName(called_method), "<init>") == 0 &&
+      (wl_handler_signature == "(Landroid/os/Looper;)V" ||
+       wl_handler_signature ==
+           "(Landroid/os/Looper;Landroid/os/Handler$Callback;)V" ||
+       wl_handler_signature ==
+           "(Landroid/os/Looper;Landroid/os/Handler$Callback;Z)V" ||
+       wl_handler_signature ==
+           "(Landroid/os/Looper;Landroid/os/Handler$Callback;ZZ)V");
+  if (wl_handler_looper_ctor) {
+    const uint32_t source_reg = is_range ? vregC + 1u : arg[1];
+    ObjPtr<mirror::Object> source_looper = shadow_frame.GetVRegReference(source_reg);
+    ObjPtr<mirror::Object> copied_before =
+        new_shadow_frame->GetVRegReference(first_dest_reg + 1u);
+    ObjPtr<mirror::Object> static_main = nullptr;
+    const uint32_t current_pc = shadow_frame.GetDexPC();
+    const bool exact_flow =
+        g_westlake_last_main_looper_non_null &&
+        g_westlake_last_main_looper_method != nullptr &&
+        g_westlake_last_main_looper_caller == shadow_frame.GetMethod() &&
+        current_pc == g_westlake_last_main_looper_dex_pc + 4u;
+    if (exact_flow) {
+      ObjPtr<mirror::Class> looper_class =
+          g_westlake_last_main_looper_method->GetDeclaringClass();
+      if (looper_class != nullptr &&
+          looper_class->DescriptorEquals("Landroid/os/Looper;")) {
+        for (ArtField& field : looper_class->GetSFields()) {
+          if (strcmp(field.GetName(), "sMainLooper") == 0) {
+            static_main = field.GetObject(looper_class);
+            break;
+          }
+        }
+      }
+    }
+    const bool source_matches_static =
+        source_looper != nullptr && source_looper == static_main;
+    const bool repaired = source_looper != nullptr && copied_before == nullptr;
+    if (repaired) {
+      new_shadow_frame->SetVRegReference(first_dest_reg + 1u, source_looper);
+    }
+    fprintf(stderr,
+            "[WESTLAKE-MAINLOOPER-739] caller=%s source=%p copiedBefore=%p "
+            "target=%s copiedAfter=%p static=%p exactFlow=%d sourceMatches=%d repaired=%d\n",
+            shadow_frame.GetMethod() != nullptr
+                ? shadow_frame.GetMethod()->PrettyMethod().c_str() : "<null>",
+            source_looper.Ptr(), copied_before.Ptr(),
+            wl_handler_signature.c_str(),
+            new_shadow_frame->GetVRegReference(first_dest_reg + 1u),
+            static_main.Ptr(), exact_flow ? 1 : 0,
+            source_matches_static ? 1 : 0, repaired ? 1 : 0);
+    fflush(stderr);
+    g_westlake_last_main_looper_non_null = false;
+  }
 
 	  if (UNLIKELY(called_method->IsProxyMethod())) {
 	    if (!EnsureInitialized(self, new_shadow_frame)) {
@@ -6978,10 +11568,29 @@ static inline bool DoCallCommon(ArtMethod* called_method,
     if (!EnsureInitialized(self, new_shadow_frame)) {
       return false;
     }
+    // WESTLAKE §699 — trace the two Chromium navigation JNI handoffs without changing them.
+    //
+    // The Java-side §697 oracle proves AwContents, WebContentsImpl and
+    // NavigationControllerImpl all retain live, non-zero native peers.  Toutiao also reaches
+    // AwContents.q(), whose only two native operations are Me4$sHFE (attach the serialized
+    // load-data payload) and MAqmDh4t (NavigationController::LoadUrl).  Record entry/return and
+    // the first native peer argument here so a silent native return can be distinguished from a
+    // call which never enters JNI.  This is deliberately diagnostic-only: arguments, result and
+    // pending exceptions are left untouched.
+    const char* wl_chromium_native_name = nullptr;
+    bool wl_chromium_native_trace = false;
+    if (PFCutDeclaringClassPlausible(called_method) &&
+        called_method->GetDeclaringClass()->DescriptorEquals("LJ/N;")) {
+      wl_chromium_native_name = WlSafeName(called_method);
+      wl_chromium_native_trace =
+          wl_chromium_native_name != nullptr &&
+          (strcmp(wl_chromium_native_name, "Me4$sHFE") == 0 ||
+           strcmp(wl_chromium_native_name, "MAqmDh4t") == 0);
+    }
     if (UNLIKELY(called_method->IsStatic() &&
-                 called_method->GetDeclaringClass() != nullptr &&
+                 PFCutDeclaringClassPlausible(called_method) &&
                  called_method->GetDeclaringClass()->DescriptorEquals("Ldalvik/system/VMStack;") &&
-                 strcmp(called_method->GetName(), "getStackClass2") == 0)) {
+                 strcmp(WlSafeName(called_method), "getStackClass2") == 0)) {
       ShadowFrame* caller_frame = &shadow_frame;
       for (int i = 0; i < 2 && caller_frame != nullptr; ++i) {
         caller_frame = caller_frame->GetLink();
@@ -7010,8 +11619,8 @@ static inline bool DoCallCommon(ArtMethod* called_method,
 
     // TRACE: detect caller=String.lastIndexOf(I) calling ANY method
     bool trace_li = false;
-    if (caller_method && shadow_frame.NumberOfVRegs() <= 4) {
-      const char* cname = caller_method->GetName();
+    if (WestlakeTraceVerboseCalls() && caller_method && shadow_frame.NumberOfVRegs() <= 4) {
+      const char* cname = WlSafeName(caller_method);
       if (cname && strcmp(cname, "lastIndexOf") == 0) {
         int nr = shadow_frame.NumberOfVRegs();
         trace_li = true;
@@ -7028,19 +11637,42 @@ static inline bool DoCallCommon(ArtMethod* called_method,
     uint32_t invoke_size = new_shadow_frame->NumberOfVRegs() * sizeof(uint32_t);
     const char* invoke_shorty = called_method->GetInterfaceMethodIfProxy(
         kRuntimePointerSize)->GetShorty();
-    static constexpr uintptr_t kPFCutStaleNativeQuickEntry = 0xfffffffffffffb17ULL;
     const void* quick_entry = called_method->GetEntryPointFromQuickCompiledCode();
     const void* jni_entry = called_method->GetEntryPointFromJni();
+    if (wl_chromium_native_trace) {
+      const uint64_t native_peer =
+          new_shadow_frame->NumberOfVRegs() >= 2
+              ? static_cast<uint64_t>(new_shadow_frame->GetVRegLong(0))
+              : 0u;
+      fprintf(stderr,
+              "[WESTLAKE-WEBVIEW-NATIVE] BEFORE name=%s caller=%s peer=0x%llx "
+              "inputs=%u regs=%u quick=%p jni=%p\n",
+              wl_chromium_native_name,
+              caller_method != nullptr ? caller_method->PrettyMethod().c_str() : "<null>",
+              static_cast<unsigned long long>(native_peer),
+              number_of_inputs,
+              new_shadow_frame->NumberOfVRegs(),
+              quick_entry,
+              jni_entry);
+      fflush(stderr);
+    }
     const bool pfc_stale_native_entry =
         pfc_had_stale_native_quick_entry ||
-        reinterpret_cast<uintptr_t>(quick_entry) == kPFCutStaleNativeQuickEntry ||
-        reinterpret_cast<uintptr_t>(jni_entry) == kPFCutStaleNativeQuickEntry;
+        PFCutPf625EntryLooksInvalid(quick_entry) ||
+        PFCutPf625EntryLooksInvalid(jni_entry);
     bool pfc_force_interpreter_jni = false;
     const char* pfc_force_interpreter_reason = nullptr;
-    if (called_method->GetDeclaringClass() != nullptr) {
+    if (PFCutDeclaringClassPlausible(called_method)) {
       std::string native_desc_storage;
       const char* native_desc =
           called_method->GetDeclaringClass()->GetDescriptor(&native_desc_storage);
+      // §319b PROVEN NECESSARY (do NOT remove): Unsafe MUST be forced onto the interpreter-JNI path.
+      // Un-forcing (letting the @FastNative quick path run) mismarshalls the `jlong offset` arg — the
+      // CAS then hits offset=0 (object header) instead of the real field, always fails, and spins
+      // (observed `CAS int offset=0 expected=16 new=-1 success=0` flood, broke init before
+      // bindApplication). The slow-but-correct interpreter-JNI path is required. The BouncyCastle
+      // slowness (see [[setsurface-sigbus-fixed-launch-spin-2026-07-23]]) must be fixed elsewhere
+      // (defer BC in AppSpawnXInit), NOT by touching this.
       pfc_force_interpreter_jni =
           native_desc != nullptr &&
           (strcmp(native_desc, "Lsun/misc/Unsafe;") == 0 ||
@@ -7051,7 +11683,7 @@ static inline bool DoCallCommon(ArtMethod* called_method,
       if (!pfc_force_interpreter_jni &&
           native_desc != nullptr &&
           strcmp(native_desc, "Ljava/lang/Class;") == 0 &&
-          strcmp(called_method->GetName(), "classForName") == 0) {
+          strcmp(WlSafeName(called_method), "classForName") == 0) {
         pfc_force_interpreter_jni = true;
         pfc_force_interpreter_reason = "Class.classForName";
       }
@@ -7081,11 +11713,13 @@ static inline bool DoCallCommon(ArtMethod* called_method,
     const bool use_interpreter_jni =
         pfc_force_interpreter_jni || pfc_stale_native_entry;
     if (pfc_stale_native_entry) {
+      PFCutPf625LogUnsafeNativeEntry(
+          "docall-native", called_method, caller_method, quick_entry, jni_entry);
       called_method->SetEntryPointFromJniPtrSize(nullptr, kRuntimePointerSize);
     }
     if (use_interpreter_jni && pfc_force_interpreter_jni) {
       static thread_local int forced_jni_count = 0;
-      if (forced_jni_count < 120) {
+      if (forced_jni_count < 0 /*§650*/) {
         forced_jni_count++;
         fprintf(stderr,
                 "[PFCUT] forced interpreter JNI reason=%s method=%s quick=%p jni=%p\n",
@@ -7142,6 +11776,16 @@ static inline bool DoCallCommon(ArtMethod* called_method,
       }
     }
 
+    if (wl_chromium_native_trace) {
+      const bool returns_object = strcmp(wl_chromium_native_name, "MAqmDh4t") == 0;
+      fprintf(stderr,
+              "[WESTLAKE-WEBVIEW-NATIVE] AFTER name=%s pending=%d result=%p\n",
+              wl_chromium_native_name,
+              self->IsExceptionPending() ? 1 : 0,
+              returns_object && result != nullptr ? result->GetL() : nullptr);
+      fflush(stderr);
+    }
+
     if (trace_li) {
       fprintf(stderr, "[VREG-TRACE] AFTER: v0=%u v1=%u v2=%u\n",
               shadow_frame.GetVReg(0), shadow_frame.GetVReg(1), shadow_frame.GetVReg(2));
@@ -7156,17 +11800,20 @@ static inline bool DoCallCommon(ArtMethod* called_method,
               use_interpreter_entrypoint ? 1 : 0);
       fflush(stderr);
     }
-    // TRACE + backup/restore for non-native calls
+    // Trace non-native calls.  Do not save/restore raw vreg words here: ShadowFrame
+    // keeps reference metadata in a parallel array, and restoring only the words can
+    // turn a live moved reference into an untracked primitive.  The upstream ART path
+    // calls PerformCall() directly and leaves the caller frame under GC control.
     int nn_nregs = shadow_frame.NumberOfVRegs();
-    uint32_t nn_backup[8];
-    bool nn_do = (nn_nregs <= 8);
-    if (nn_do) memcpy(nn_backup, shadow_frame.GetVRegArgs(0), nn_nregs * 4);
 
     // Trace ALL calls from methods with <=4 vregs (catches lastIndexOf)
     static thread_local int pc_trace = 0;
     ArtMethod* _cm = shadow_frame.GetMethod();
-    const char* _cn = _cm ? _cm->GetName() : nullptr;
-    bool do_trace = (_cn && strcmp(_cn, "lastIndexOf") == 0);
+    const char* _cn = _cm ? WlSafeName(_cm) : nullptr;
+    bool do_trace = WestlakeTraceVerboseCalls() &&
+        (_cn && strcmp(_cn, "lastIndexOf") == 0) &&
+        nn_nregs <= 4 &&
+        pc_trace < 8;
     if (do_trace) {
       pc_trace++;
       ArtMethod* cm = shadow_frame.GetMethod();
@@ -7215,8 +11862,6 @@ static inline bool DoCallCommon(ArtMethod* called_method,
       for (int i = 0; i < nn_nregs; i++) fprintf(stderr, "v%d=0x%x ", i, shadow_frame.GetVReg(i));
       fprintf(stderr, "\n"); fflush(stderr);
     }
-
-    if (nn_do) memcpy(shadow_frame.GetVRegArgs(0), nn_backup, nn_nregs * 4);
   }
 
   if (string_init && !self->IsExceptionPending()) {
@@ -7225,6 +11870,29 @@ static inline bool DoCallCommon(ArtMethod* called_method,
 
   if (self->IsExceptionPending()) {
     ObjPtr<mirror::Object> exception = self->GetException();
+    // WESTLAKE §690: Toutiao's article template reaches KtX phase=2 with data ready, but the
+    // WebView URL remains empty.  KtR.h() contains no normal return before loadDataWithBaseURL
+    // (its sole Robust redirect is live-null), so identify the exact callee whose exception
+    // unwinds that method.  Diagnostic only: do not clear or replace the pending exception.
+    if (caller_method != nullptr && exception != nullptr && exception->GetClass() != nullptr) {
+      const std::string wl_caller = caller_method->PrettyMethod();
+      if (wl_caller.find(" X.KtR.h(") != std::string::npos) {
+        static thread_local int wl_kt_r_throw_count = 0;
+        if (wl_kt_r_throw_count < 40) {
+          ++wl_kt_r_throw_count;
+          std::string wl_message_storage;
+          const char* wl_message = PFCutThrowableMessage(exception, &wl_message_storage);
+          fprintf(stderr,
+                  "[WESTLAKE-KTR-THROW] caller=%s callee=%s dex_pc=%u exception=%s message=%s\n",
+                  wl_caller.c_str(),
+                  called_method != nullptr ? called_method->PrettyMethod().c_str() : "<null>",
+                  shadow_frame.GetDexPC(),
+                  exception->GetClass()->PrettyDescriptor().c_str(),
+                  wl_message != nullptr ? wl_message : "<null>");
+          fflush(stderr);
+        }
+      }
+    }
     if (exception != nullptr &&
         exception->GetClass() != nullptr &&
         exception->GetClass()->DescriptorEquals("Ljava/lang/UnsupportedOperationException;")) {
@@ -7270,6 +11938,8 @@ static inline bool DoCallCommon(ArtMethod* called_method,
   return !self->IsExceptionPending();
 }
 
+bool g_westlake_infl_gate = false;  // WESTLAKE §212d (read by Thread::SetException)
+
 template<bool is_range>
 NO_STACK_PROTECTOR
 bool DoCall(ArtMethod* called_method,
@@ -7280,6 +11950,259 @@ bool DoCall(ArtMethod* called_method,
             bool is_string_init,
             JValue* result) {
   ArtMethod* caller_method = shadow_frame.GetMethod();
+  // WESTLAKE 2026-07-22: the app SIGSEGVs in DoCall with an ArtMethod* whose value is ASCII
+  // ("on/icon", fault 0x006e6f63692f6e6f). The faultlog is 96 frames of interpreter internals and
+  // names no Java method, and a probe in DoCallCommon never fired (DoCall faults BEFORE reaching
+  // it). Validate the POINTER VALUE here -- never dereference a structurally invalid method.
+  // Printable address bytes are not evidence of corruption; see the matching DoCallCommon guard.
+  {
+    const uintptr_t m = reinterpret_cast<uintptr_t>(called_method);
+    const bool insane = (m & 0x3) != 0 || (m >> 48) != 0;
+    if (m == 0 || insane) {
+      char txt[9];
+      for (int i = 0; i < 8; ++i) {
+        const unsigned b = static_cast<unsigned>((m >> (i * 8)) & 0xff);
+        txt[i] = (b >= 0x20 && b <= 0x7e) ? static_cast<char>(b) : '.';
+      }
+      txt[8] = '\0';
+      fprintf(stderr,
+              "[WESTLAKE-BADCALL] corrupt called_method=%p ascii=\"%s\" caller=%s dex_pc=%u "
+              "inst_data=0x%04x string_init=%d\n",
+              called_method, txt,
+              caller_method != nullptr ? caller_method->PrettyMethod().c_str() : "<null>",
+              shadow_frame.GetDexPC(), inst_data, is_string_init ? 1 : 0);
+      fflush(stderr);
+    }
+  }
+  // WESTLAKE §669 (2026-08-16): ENSURE THE DECLARING CLASS IS INITIALISED before a static call.
+  // Measured (§668): `java.lang.invoke.VarHandle.<clinit>` NEVER runs — it appears neither on
+  // InitializeClass's success path nor its tolerate path, in the zygote or the child — yet
+  // `VarHandle.acquireFence()` executes and reads `VarHandle.UNSAFE` as NULL, so
+  // `sun.misc.Unsafe.loadFence()` is invoked on null. (`sun.misc.Unsafe.<clinit>` DOES run and sets
+  // THE_ONE=0x14025100, so the value it should have had was available.)
+  // In stock ART, resolving a static invoke initialises the declaring class; on this port the
+  // interpreter-cache / §440-§551 repair paths can hand back an ArtMethod without that ever
+  // happening. That breaks EVERY class whose statics are set up in <clinit>, which is why it
+  // surfaced in libcore (ConcurrentSkipListMap -> VarHandle fences), not in app code.
+  // Cheap: IsInitialized() is a field read, and the slow path runs at most once per class.
+  if (called_method != nullptr && called_method->IsStatic()) {
+    ObjPtr<mirror::Class> wl_decl = called_method->GetDeclaringClass();
+    // §669b: is this path even reached, and what does the class look like when it is?
+    if (UNLIKELY(wl_decl != nullptr) && access("/data/local/tmp/asx/CINIT", F_OK) == 0) {
+      std::string wl_t;
+      const char* wl_d = wl_decl->GetDescriptor(&wl_t);
+      if (wl_d != nullptr && strcmp(wl_d, "Ljava/lang/invoke/VarHandle;") == 0) {
+        static thread_local int wl_vh = 0;
+        if (wl_vh < 6) {
+          wl_vh++;
+          fprintf(stderr, "[WESTLAKE-669b] static invoke %s status=%d initialized=%d\n",
+                  WlSafeName(called_method), static_cast<int>(wl_decl->GetStatus()),
+                  wl_decl->IsInitialized() ? 1 : 0);
+          fflush(stderr);
+        }
+      }
+    }
+    if (UNLIKELY(wl_decl != nullptr && !wl_decl->IsInitialized())) {
+      StackHandleScope<1> wl_hs(self);
+      Handle<mirror::Class> wl_h(wl_hs.NewHandle(wl_decl));
+      ClassLinker* wl_cl = Runtime::Current()->GetClassLinker();
+      if (!wl_cl->EnsureInitialized(self, wl_h, true, true)) {
+        static thread_local int wl_ei = 0;
+        if (wl_ei < 20 && access("/data/local/tmp/asx/CINIT", F_OK) == 0) {
+          wl_ei++;
+          fprintf(stderr, "[WESTLAKE-669] EnsureInitialized FAILED for %s (static invoke)\n",
+                  called_method->PrettyMethod().c_str());
+          fflush(stderr);
+        }
+        if (self->IsExceptionPending()) {
+          return false;   // propagate, exactly as stock resolution would
+        }
+      }
+    }
+  }
+
+  // WESTLAKE §217b: the §211-§213 inflation probe lived here and has been REMOVED.
+  // It decoded the invoke's receiver vreg and called wl_o->GetClass()->PrettyDescriptor(); a vreg
+  // that is not a live reference made that fault -- SIGSEGV in DoCall at `ldr w0,[x8]` right before
+  // `bl mirror::Class::PrettyDescriptor` (tombstone cppcrash-1317, addr 0x0a6a2d59). It killed a
+  // thread that held a lock, wedging the main thread in futex_wait_queue_me, so runs stalled early.
+  // The probe found §216; do NOT reinstate it without validating the ObjPtr the way §206 does.
+  // WESTLAKE §218: trace the activity-resume / window-attach path. METHOD-ONLY -- logs only
+  // called_method (already validated below/above) and NEVER decodes a receiver vreg, which is what
+  // made the §211d probe crash the app (§217).
+  {
+    static pid_t wl_wpid = 0;
+    static int wl_wn = 0;
+    if (wl_wpid != getpid()) { wl_wpid = getpid(); wl_wn = 0; }
+    const uintptr_t wl_wm = reinterpret_cast<uintptr_t>(called_method);
+    // WESTLAKE §282b: the cap used to be 400 and the filter included isEnabled/getVisibility.
+    // AccessibilityManager.isEnabled ALONE burned 322 of the 400 slots, so the trace stopped
+    // long before the interesting calls and `draw` read as ZERO occurrences even when it ran.
+    // That measurement artifact is exactly the "prove the probe is reachable before trusting
+    // a 0" trap.  Drop the high-frequency no-signal names and raise the cap.
+    if (wl_wn < 4000 && wl_wm > 0x10000 && (wl_wm & 3u) == 0 && (wl_wm >> 48) == 0 &&
+        WlNameReadable(called_method)) {   // §635: this is where Toutiao SIGSEGVs (DoCall+0x38c)
+      const char* wl_wd = WlSafeDescriptor(called_method);
+      const char* wl_wnm = WlSafeName(called_method);
+      if (wl_wd != nullptr && wl_wnm != nullptr &&
+          (strstr(wl_wd, "SurfaceControl") != nullptr ||
+           strcmp(wl_wnm, "copyFrom") == 0 ||
+           strcmp(wl_wnm, "transferFrom") == 0 ||
+           strcmp(wl_wnm, "syncAndDrawFrame") == 0 ||
+           strcmp(wl_wnm, "nSyncAndDrawFrame") == 0 ||
+           strcmp(wl_wnm, "draw") == 0 ||
+           strcmp(wl_wnm, "drawSoftware") == 0 ||
+           strcmp(wl_wnm, "performDraw") == 0 ||
+           strcmp(wl_wnm, "performTraversals") == 0 ||
+           strcmp(wl_wnm, "relayoutWindow") == 0 ||
+           strcmp(wl_wnm, "updateDisplayState") == 0 ||
+           strcmp(wl_wnm, "getOrCreateBLASTSurface") == 0 ||
+           // WESTLAKE §282d: static analysis of framework.jar shows EXACTLY two writers of
+           // ViewRootImpl.mSurface -- relayoutWindow() -> Surface.copyFrom(SurfaceControl)
+           // and updateBlastSurfaceIfNeeded() -> Surface.transferFrom(Surface).  relayoutWindow
+           // runs 24x and mSurfaceControl.mNativeObject is a VALID 0x7f2b9fba30, yet neither
+           // writer ever runs and mSurface.mNativeObject stays 0x0.  Trace the BLAST path to
+           // find which guard swallows it.
+           // WESTLAKE §283l: name the hwui entry point that blocks the UI thread.  With a real
+           // session mSurface goes VALID and then the UI thread deadlocks on a futex while
+           // RenderThread sits idle in epoll_wait => a RenderProxy runSync() hand-off that is
+           // never delivered/signalled.  These are the Java-side doors into RenderProxy.
+           strcmp(wl_wnm, "setSurface") == 0 ||
+           strcmp(wl_wnm, "nSetSurface") == 0 ||
+           strcmp(wl_wnm, "initialize") == 0 ||
+           strcmp(wl_wnm, "nInitialize") == 0 ||
+           strcmp(wl_wnm, "nCreateProxy") == 0 ||
+           strcmp(wl_wnm, "nSetLightGeometry") == 0 ||
+           strcmp(wl_wnm, "nSetLightAlpha") == 0 ||
+           strcmp(wl_wnm, "nSetName") == 0 ||
+           strcmp(wl_wnm, "nSetSurfaceControl") == 0 ||
+           strcmp(wl_wnm, "updateBlastSurfaceIfNeeded") == 0 ||
+           strcmp(wl_wnm, "isSameSurfaceControl") == 0 ||
+           strcmp(wl_wnm, "useBLAST") == 0 ||
+           strcmp(wl_wnm, "createSurface") == 0 ||
+           strcmp(wl_wnm, "isValid") == 0 ||
+           strcmp(wl_wnm, "handleResumeActivity") == 0 ||
+           strcmp(wl_wnm, "performResume") == 0 ||
+           strcmp(wl_wnm, "makeVisible") == 0 ||
+           strcmp(wl_wnm, "setView") == 0)) {
+        wl_wn++;
+        // WESTLAKE §250: identity probe. §249 ruled out ordering, so we need to know whether the
+        // View made VISIBLE is the same object ViewRootImpl holds as mView.
+        // ★Validate the ObjPtr before dereferencing (§206/§217): a probe that dereferences a raw
+        // vreg crashed the very run it was measuring.
+        std::string wl_extra;
+        {
+          uint32_t wl_rv;
+          if (is_range) {
+            wl_rv = inst->VRegC_3rc();
+          } else {
+            uint32_t wl_a[Instruction::kMaxVarArgRegs];
+            inst->GetVarArgs(wl_a, inst_data);
+            wl_rv = wl_a[0];
+          }
+          ObjPtr<mirror::Object> wl_o = shadow_frame.GetVRegReference(wl_rv);
+          const uintptr_t wl_op = reinterpret_cast<uintptr_t>(wl_o.Ptr());
+          if (wl_op > 0x10000u && (wl_op & 3u) == 0u && (wl_op >> 48) == 0) {
+            char wl_buf[224];
+            if (strcmp(wl_wnm, "performTraversals") == 0) {
+              // receiver is the ViewRootImpl -- read its mView field
+              ObjPtr<mirror::Object> wl_mv = nullptr;
+              for (ObjPtr<mirror::Class> k = wl_o->GetClass(); k != nullptr; k = k->GetSuperClass()) {
+                for (ArtField& f : k->GetIFields()) {
+                  if (strcmp(f.GetName(), "mView") == 0) { wl_mv = f.GetObject(wl_o); break; }
+                }
+                if (wl_mv != nullptr) { break; }
+              }
+              snprintf(wl_buf, sizeof(wl_buf), " vri=%p mView=%p",
+                       reinterpret_cast<void*>(wl_o.Ptr()), reinterpret_cast<void*>(wl_mv.Ptr()));
+            } else if (strcmp(wl_wnm, "isValid") == 0) {
+              // WESTLAKE §282c: Surface.isValid()/SurfaceControl.isValid() are both just
+              // `mNativeObject != 0`.  ViewRootImpl.draw() runs (22x) but never reaches
+              // syncAndDrawFrame/drawSoftware, and Surface.copyFrom/transferFrom NEVER run,
+              // so the early return at `!mSurface.isValid()` is the prime suspect.  Logging
+              // the CALL tells us nothing -- log the FIELD the call reads.
+              int64_t wl_np = -1;
+              for (ObjPtr<mirror::Class> k = wl_o->GetClass(); k != nullptr; k = k->GetSuperClass()) {
+                bool wl_found = false;
+                for (ArtField& f : k->GetIFields()) {
+                  if (strcmp(f.GetName(), "mNativeObject") == 0) {
+                    wl_np = f.GetLong(wl_o);
+                    wl_found = true;
+                    break;
+                  }
+                }
+                if (wl_found) { break; }
+              }
+              snprintf(wl_buf, sizeof(wl_buf), " recv=%p cls=%s mNativeObject=0x%llx",
+                       reinterpret_cast<void*>(wl_o.Ptr()),
+                       wl_o->GetClass()->PrettyDescriptor().c_str(),
+                       static_cast<unsigned long long>(wl_np));
+            } else if (strcmp(wl_wnm, "setVisibility") == 0) {
+              // §251: the ARGUMENT decides everything (VISIBLE=0, INVISIBLE=4, GONE=8).
+              // arg[1] is an int vreg -- read it directly, no ObjPtr involved.
+              uint32_t wl_vis = 0xffffffffu;
+              if (!is_range) {
+                uint32_t wl_a2[Instruction::kMaxVarArgRegs];
+                inst->GetVarArgs(wl_a2, inst_data);
+                wl_vis = shadow_frame.GetVReg(wl_a2[1]);
+              } else {
+                wl_vis = shadow_frame.GetVReg(inst->VRegC_3rc() + 1);
+              }
+              snprintf(wl_buf, sizeof(wl_buf), " recv=%p vis=%d cls=%s",
+                       reinterpret_cast<void*>(wl_o.Ptr()), (int)wl_vis,
+                       wl_o->GetClass()->PrettyDescriptor().c_str());
+            } else {
+              snprintf(wl_buf, sizeof(wl_buf), " recv=%p cls=%s",
+                       reinterpret_cast<void*>(wl_o.Ptr()),
+                       wl_o->GetClass()->PrettyDescriptor().c_str());
+            }
+            wl_extra = wl_buf;
+          }
+        }
+        fprintf(stderr, "[WESTLAKE-WIN] %s.%s%s\n", wl_wd, wl_wnm, wl_extra.c_str());
+        fflush(stderr);
+      }
+    }
+  }
+  // WESTLAKE 2026-07-22 (§109): called_method proved VALID at both DoCall and DoCallCommon entry,
+  // so the ASCII "on/icon" pointer is an OBJECT REFERENCE, not the method. Scan this frame's
+  // reference vregs for a pointer whose bytes are printable ASCII -- that is the corrupt receiver
+  // /argument DoCall is about to dereference. Prints only on detection, so it is free otherwise.
+  // WESTLAKE §313: this §109 BADREF scan ran on EVERY interpreter DoCallCommon (a per-call vreg
+  // scan + fprintf) and fired 33,241 times/run, pinning the app main thread at ~100% CPU so it
+  // never finished app-init before the AMS 16s kill -> the RenderThread was starved and noice never
+  // rendered. It is a DIAGNOSTIC (the "corrupt receiver" bug it hunted was closed long ago), so gate
+  // it OFF by default behind WL_BADREF; the per-call cost is now a single cached bool check.
+  static const bool wl_badref_on = (getenv("WL_BADREF") != nullptr);
+  if (__builtin_expect(wl_badref_on, 0)) {
+    const uint32_t nvregs = shadow_frame.NumberOfVRegs();
+    for (uint32_t i = 0; i < nvregs; ++i) {
+      mirror::Object* o = shadow_frame.GetVRegReference(i);
+      const uintptr_t p = reinterpret_cast<uintptr_t>(o);
+      if (p == 0) continue;
+      bool ascii = true;
+      for (int k = 0; k < 8; ++k) {
+        const unsigned b = static_cast<unsigned>((p >> (k * 8)) & 0xff);
+        if (b != 0 && (b < 0x20 || b > 0x7e)) { ascii = false; break; }
+      }
+      if (ascii || (p & 0x3) != 0 || (p >> 48) != 0) {
+        char t2[9];
+        for (int k = 0; k < 8; ++k) {
+          const unsigned b = static_cast<unsigned>((p >> (k * 8)) & 0xff);
+          t2[k] = (b >= 0x20 && b <= 0x7e) ? static_cast<char>(b) : '.';
+        }
+        t2[8] = '\0';
+        fprintf(stderr,
+                "[WESTLAKE-BADREF] vreg%u=%p ascii=\"%s\" caller=%s dex_pc=%u callee=%s\n",
+                i, o, t2,
+                caller_method != nullptr ? caller_method->PrettyMethod().c_str() : "<null>",
+                shadow_frame.GetDexPC(),
+                called_method != nullptr ? called_method->PrettyMethod().c_str() : "<null>");
+        fflush(stderr);
+        break;   // one report per DoCall is enough
+      }
+    }
+  }
   const bool pfc_l3_trace = PFCutIsL3OnCreate(caller_method);
   const bool pfc_diag = false;
   UNUSED(pfc_l3_trace);
@@ -7299,7 +12222,7 @@ bool DoCall(ArtMethod* called_method,
     static thread_local int dc_trace = 0;
     ArtMethod* cm = shadow_frame.GetMethod();
     if (cm && dc_trace < 5) {
-      const char* cn = cm->GetName();
+      const char* cn = WlSafeName(cm);
       if (cn && strcmp(cn, "lastIndexOf") == 0) {
         dc_trace++;
         int nr = shadow_frame.NumberOfVRegs();
@@ -7318,13 +12241,15 @@ bool DoCall(ArtMethod* called_method,
     static thread_local int mcd_oncreate_trace = 0;
     static thread_local bool trace_real_mcd_path = false;
     ArtMethod* caller = shadow_frame.GetMethod();
-    if (caller != nullptr && called_method != nullptr && mcd_oncreate_trace < 80000) {
+    const bool trace_mcd_calls = WestlakeTraceMcdCalls();
+    const int mcd_trace_limit = trace_mcd_calls ? 80000 : 200;
+    if (caller != nullptr && called_method != nullptr && mcd_oncreate_trace < mcd_trace_limit) {
       std::string caller_desc_storage;
       std::string called_desc_storage;
-      const char* caller_desc = caller->GetDeclaringClass() != nullptr
+      const char* caller_desc = PFCutDeclaringClassPlausible(caller)
           ? caller->GetDeclaringClass()->GetDescriptor(&caller_desc_storage)
           : "";
-      const char* called_desc = called_method->GetDeclaringClass() != nullptr
+      const char* called_desc = PFCutDeclaringClassPlausible(called_method)
           ? called_method->GetDeclaringClass()->GetDescriptor(&called_desc_storage)
           : "";
       const bool is_mcd_frame =
@@ -7373,10 +12298,14 @@ bool DoCall(ArtMethod* called_method,
       if (is_mcd_frame || is_startup_library) {
         trace_real_mcd_path = true;
       }
-      if (is_mcd_frame ||
+      const bool boundary_signal =
           is_mcd_splash_lifecycle ||
+          (called_method->IsNative() && is_mcd_frame);
+      const bool broad_signal =
+          is_mcd_frame ||
           is_startup_library ||
-          (trace_real_mcd_path && called_method->IsNative())) {
+          (trace_real_mcd_path && called_method->IsNative());
+      if ((trace_mcd_calls && broad_signal) || (!trace_mcd_calls && boundary_signal)) {
         mcd_oncreate_trace++;
         fprintf(stderr,
                 "[MCD-CALL] %s -> %s inputs=%u quick=%p jni=%p native=%d code=%p splash=%d\n",
@@ -7406,7 +12335,7 @@ bool DoCall(ArtMethod* called_method,
 
   if (UNLIKELY(called_method != nullptr &&
                called_method->IsNative() &&
-               called_method->GetDeclaringClass() != nullptr &&
+               PFCutDeclaringClassPlausible(called_method) &&
                called_method->GetDeclaringClass()->DescriptorEquals("Ljava/lang/Character;"))) {
     auto get_arg = [&](uint32_t index) -> int32_t {
       const uint32_t source_vreg = is_range ? vregC + index : arg[index];
@@ -7475,6 +12404,64 @@ bool DoCall(ArtMethod* called_method,
     }
   }
 
+  // WESTLAKE §738 (2026-08-19): repair the one-instruction managed-result
+  // handoff only when its bytecode provenance proves the intended value.
+  //
+  // §737 measured getMainLooper() returning the live sMainLooper object, while
+  // the immediately following Handler(Looper) constructor still received
+  // null.  That narrows the corruption to move-result-object / caller-vreg
+  // transfer.  Do not turn every null Handler argument into the main Looper:
+  // Android deliberately throws for explicit null.  Require all of:
+  //   * this is precisely Handler(Looper),
+  //   * the argument vreg is null,
+  //   * the same thread just invoked getMainLooper from this same caller,
+  //   * this invoke is exactly four code units later (3-unit invoke-static,
+  //     then 1-unit move-result-object), and
+  //   * sMainLooper remains non-null.
+  // That is the stock bytecode dataflow Toutiao emitted, expressed generically
+  // for any app whose interpreter loses this particular managed result.
+  if (called_method != nullptr && !is_string_init && number_of_inputs == 2u &&
+      PFCutDeclaringClassPlausible(called_method) &&
+      called_method->GetDeclaringClass()->DescriptorEquals("Landroid/os/Handler;") &&
+      strcmp(WlSafeName(called_method), "<init>") == 0 &&
+      called_method->GetSignature().ToString() == "(Landroid/os/Looper;)V") {
+    const uint32_t looper_reg = is_range ? vregC + 1u : arg[1];
+    ObjPtr<mirror::Object> looper_arg = shadow_frame.GetVRegReference(looper_reg);
+    ObjPtr<mirror::Object> static_main = nullptr;
+    const uint32_t current_pc = shadow_frame.GetDexPC();
+    const bool exact_flow =
+        g_westlake_last_main_looper_non_null &&
+        g_westlake_last_main_looper_method != nullptr &&
+        g_westlake_last_main_looper_caller == caller_method &&
+        current_pc == g_westlake_last_main_looper_dex_pc + 4u;
+    if (looper_arg == nullptr && exact_flow) {
+      ObjPtr<mirror::Class> looper_class =
+          g_westlake_last_main_looper_method->GetDeclaringClass();
+      if (looper_class != nullptr &&
+          looper_class->DescriptorEquals("Landroid/os/Looper;")) {
+        for (ArtField& field : looper_class->GetSFields()) {
+          if (strcmp(field.GetName(), "sMainLooper") == 0) {
+            static_main = field.GetObject(looper_class);
+            break;
+          }
+        }
+      }
+      if (static_main != nullptr) {
+        shadow_frame.SetVRegReference(looper_reg, static_main);
+      }
+    }
+    const bool repaired = looper_arg == nullptr && exact_flow && static_main != nullptr;
+    fprintf(stderr,
+            "[WESTLAKE-MAINLOOPER-738] caller=%s arg=%p lastPc=%u currentPc=%u "
+            "exactFlow=%d static=%p repaired=%d\n",
+            caller_method != nullptr ? caller_method->PrettyMethod().c_str() : "<null>",
+            looper_arg.Ptr(), g_westlake_last_main_looper_dex_pc, current_pc,
+            exact_flow ? 1 : 0, static_main.Ptr(), repaired ? 1 : 0);
+    fflush(stderr);
+    // DoCallCommon consumes this provenance after it has inspected the copied
+    // callee argument (§739).  Clearing it here would hide the copy mismatch.
+  }
+
   if (pfc_diag) {
     fprintf(stderr,
             "[PFCUT] DoCall before DoCallCommon dexIdx=%u inputs=%u vregC=%u arg0=%u arg1=%u arg2=%u arg3=%u arg4=%u\n",
@@ -7523,17 +12510,81 @@ bool DoCall(ArtMethod* called_method,
       const dex::MethodId& method_id = dex_file->GetMethodId(method_idx);
       const std::string_view expected_name = dex_file->GetStringView(method_id.name_idx_);
       const Signature expected_signature = dex_file->GetMethodSignature(method_id);
-      if (invoke_type == kInterface && !called_method->IsProxyMethod()) {
+      // WESTLAKE 2026-07-22 (§140 TEST): FindVirtualMethodForInterface REQUIRES that the receiver
+      // class implements called_method's declaring interface; that precondition is only a DCHECK,
+      // compiled out under -DNDEBUG. If it does not hold, it indexes an IfTable method array with a
+      // foreign method index and returns garbage -> the SIGSEGV. Gate to A/B without a rebuild.
+      if ((getenv("WESTLAKE_NO_PROXYFIX") == nullptr) &&
+          invoke_type == kInterface && !called_method->IsProxyMethod()) {
         const uint32_t receiver_reg = is_range ? vregC : arg[0];
         ObjPtr<mirror::Object> receiver = shadow_frame.GetVRegReference(receiver_reg);
-        if (receiver != nullptr) {
-          ArtMethod* proxy_replacement = receiver->GetClass()->FindVirtualMethodForInterface(
-              called_method, kRuntimePointerSize);
-          if (proxy_replacement != nullptr && proxy_replacement->IsProxyMethod()) {
+        // WESTLAKE 2026-07-22 (§140 FIX): FindVirtualMethodForInterface REQUIRES that the receiver
+        // class implements called_method's declaring interface -- it indexes
+        // GetMethodArray(i)->Get(called_method->GetMethodIndex()) after matching the interface.
+        // That precondition is only a DCHECK and is compiled out under -DNDEBUG, so when it does
+        // not hold the walk returns unrelated heap bytes and the caller dereferences them (the
+        // long-standing SIGSEGV at the ASCII address "on/icon"). Verify it explicitly.
+        ObjPtr<mirror::Class> wl_iface =
+            (called_method != nullptr) ? called_method->GetDeclaringClass() : nullptr;
+        const bool wl_ok = (receiver != nullptr) && (wl_iface != nullptr) &&
+                           wl_iface->IsInterface() && receiver->GetClass()->Implements(wl_iface);
+        if (wl_ok) {
+          // §673: bounds-checked -- upstream's version returns adjacent heap bytes when
+          // called_method's method_index_ is past the end of the receiver's method array.
+          ArtMethod* proxy_replacement = WlFindVirtualMethodForInterfaceChecked(
+              receiver->GetClass(), called_method, kRuntimePointerSize);
+          // WESTLAKE §206: Implements() is NECESSARY BUT NOT SUFFICIENT. FindVirtualMethodForInterface
+          // indexes GetMethodArray(i)->Get(called_method->GetMethodIndex()); if that index is foreign
+          // to the receiver's iftable entry it returns unrelated heap bytes as a non-null ArtMethod*,
+          // and the next instruction (IsProxyMethod -> ldr w8,[x0]) faults. Confirmed by disassembly:
+          // the SIGSEGV is at `ldr w8,[x0]` immediately after the call, at the ASCII address
+          // 0x006e6f63692f6e6f ("on/icon") -- which is not even 4-byte aligned. Validate before use.
+          const uintptr_t wl_pr = reinterpret_cast<uintptr_t>(proxy_replacement);
+          const bool wl_sane_ptr = (wl_pr != 0) && ((wl_pr & 3u) == 0) &&
+                                   (wl_pr > 0x10000u) && (wl_pr < (1ull << 48));
+          if (!wl_sane_ptr) {
+            // WESTLAKE §209: skipping (as §206 did) stops the SIGSEGV but leaves the interface call
+            // dispatching through an unresolved method. Repair it properly instead: walk the
+            // RECEIVER's own class hierarchy for a virtual method matching the name+signature the
+            // caller's dex asked for. This needs no iftable indexing, so it is immune to whatever
+            // made FindVirtualMethodForInterface return garbage (interface identity mismatch
+            // between the caller's dex and the receiver's iftable -- plausible in this port, which
+            // injects classes into multiple BCP jars).
+            ArtMethod* wl_fix = nullptr;
+            for (ObjPtr<mirror::Class> k = receiver->GetClass();
+                 k != nullptr && wl_fix == nullptr; k = k->GetSuperClass()) {
+              for (ArtMethod& m : k->GetVirtualMethods(kRuntimePointerSize)) {
+                if (WlNameMatches(&m, expected_name) && m.GetSignature() == expected_signature) {
+                  wl_fix = &m;
+                  break;
+                }
+              }
+            }
+            static thread_local int wl_bad_pr = 0;
+            if (wl_bad_pr < 20) {
+              wl_bad_pr++;
+              fprintf(stderr, "[WESTLAKE-BADIFACE] bogus %p for %s on receiver %s -> %s\n",
+                      reinterpret_cast<void*>(proxy_replacement),
+                      called_method->PrettyMethod().c_str(),
+                      receiver->GetClass()->PrettyDescriptor().c_str(),
+                      wl_fix != nullptr ? wl_fix->PrettyMethod().c_str() : "NO MATCH (left as-is)");
+              fflush(stderr);
+            }
+            if (wl_fix != nullptr) {
+              called_method = wl_fix;
+            }
+          // WESTLAKE §633 (2026-08-15): apply the EXISTING §551 predicate here too.
+          // IsProxyMethod() dereferences declaring_class_ (ldr w8,[x23]; ldr w9,[x8,#64];
+          // tbz w9,#18). §551/§593 guarded that as a hand-written CODE CAVE in the shipped
+          // libart.so only, so every source rebuild silently lost it and §436 came back
+          // (measured on a rebuild: sig=11 code=1 addr=0x41/0x45, declaring_class_ == 4/5).
+          // The predicate already exists in this file — it just was not applied at this site.
+          } else if (PFCutDeclaringClassPlausible(proxy_replacement) &&
+                     proxy_replacement->IsProxyMethod()) {
             ArtMethod* proxy_target =
                 proxy_replacement->GetInterfaceMethodIfProxy(kRuntimePointerSize);
             if (proxy_target != nullptr &&
-                proxy_target->GetNameView() == expected_name &&
+                WlNameMatches(proxy_target, expected_name) &&
                 proxy_target->GetSignature() == expected_signature) {
               static thread_local int pfc_proxy_interface_repair_count = 0;
               if (pfc_proxy_interface_repair_count < 80) {
@@ -7550,13 +12601,13 @@ bool DoCall(ArtMethod* called_method,
         }
       }
 	      bool signature_mismatch =
-	          called_method->GetNameView() != expected_name ||
+	          !WlNameMatches(called_method, expected_name) ||
 	          called_method->GetSignature() != expected_signature;
 	      if (signature_mismatch && called_method->IsProxyMethod()) {
 	        ArtMethod* proxy_target =
 	            called_method->GetInterfaceMethodIfProxy(kRuntimePointerSize);
 	        if (proxy_target != nullptr &&
-	            proxy_target->GetNameView() == expected_name &&
+	            WlNameMatches(proxy_target, expected_name) &&
 	            proxy_target->GetSignature() == expected_signature) {
 	          signature_mismatch = false;
 	        }
@@ -7578,11 +12629,21 @@ bool DoCall(ArtMethod* called_method,
           ArtMethod* interface_method = referenced_class->FindInterfaceMethod(
               expected_name, expected_signature, kRuntimePointerSize);
           ObjPtr<mirror::Object> receiver = shadow_frame.GetVRegReference(vregC);
-          if (interface_method != nullptr && receiver != nullptr) {
-            replacement = receiver->GetClass()->FindVirtualMethodForInterface(
-                interface_method, kRuntimePointerSize);
+          // WESTLAKE 2026-07-22 (§140 FIX, 2nd call site): same unguarded precondition as above --
+          // FindVirtualMethodForInterface indexes the receiver's IfTable method array by
+          // interface_method->GetMethodIndex(), which is only valid if the receiver actually
+          // implements interface_method's declaring interface (DCHECK-only, compiled out).
+          ObjPtr<mirror::Class> wl_iface2 =
+              (interface_method != nullptr) ? interface_method->GetDeclaringClass() : nullptr;
+          const bool wl_ok2 = (receiver != nullptr) && (wl_iface2 != nullptr) &&
+                              wl_iface2->IsInterface() &&
+                              receiver->GetClass()->Implements(wl_iface2);
+          if (wl_ok2) {
+            // §673: bounds-checked, same reason as the first call site.
+            replacement = WlFindVirtualMethodForInterfaceChecked(
+                receiver->GetClass(), interface_method, kRuntimePointerSize);
             if (replacement != nullptr &&
-                (replacement->GetNameView() != expected_name ||
+                (!WlNameMatches(replacement, expected_name) ||
                  replacement->GetSignature() != expected_signature)) {
               replacement = receiver->GetClass()->FindClassMethod(
                   expected_name, expected_signature, kRuntimePointerSize);
@@ -7618,20 +12679,55 @@ bool DoCall(ArtMethod* called_method,
 	        bool replacement_matches = false;
 	        if (replacement != nullptr) {
 	          replacement_matches =
-	              replacement->GetNameView() == expected_name &&
+	              WlNameMatches(replacement, expected_name) &&
 	              replacement->GetSignature() == expected_signature;
 	          if (!replacement_matches && replacement->IsProxyMethod()) {
 	            ArtMethod* proxy_target =
 	                replacement->GetInterfaceMethodIfProxy(kRuntimePointerSize);
 	            replacement_matches =
 	                proxy_target != nullptr &&
-	                proxy_target->GetNameView() == expected_name &&
+	                WlNameMatches(proxy_target, expected_name) &&
 	                proxy_target->GetSignature() == expected_signature;
 	          }
 	        }
 	        if (replacement_matches) {
 	          called_method = replacement;
 	        } else {
+          // WESTLAKE §281d PROBE: statically verified that the dex DOES declare the method this
+          // throw claims is absent (IContentProvider.call(AttributionSource,...) is declared
+          // `public abstract` in framework.jar classes.dex, mid=29397).  Dump exactly what the
+          // lookup saw, instead of inferring why FindInterfaceMethod returned null.
+          {
+            static thread_local int wl_nsm_probe = 0;
+            if (wl_nsm_probe < 8) {
+              wl_nsm_probe++;
+              const std::string wl_want(expected_name);
+              fprintf(stderr,
+                      "[WESTLAKE-NSMPROBE] cls=%s iface=%d type=%d want='%s' sig='%s'\n",
+                      referenced_class->PrettyDescriptor().c_str(),
+                      referenced_class->IsInterface() ? 1 : 0,
+                      static_cast<int>(invoke_type),
+                      wl_want.c_str(),
+                      expected_signature.ToString().c_str());
+              int wl_n = 0, wl_same_name = 0;
+              for (ArtMethod& wl_m :
+                       referenced_class->GetDeclaredMethodsSlice(kRuntimePointerSize)) {
+                wl_n++;
+                if (WlNameMatches(&wl_m, expected_name)) {
+                  wl_same_name++;
+                  fprintf(stderr,
+                          "[WESTLAKE-NSMPROBE]   declared: %s sig='%s' sigeq=%d\n",
+                          wl_m.PrettyMethod().c_str(),
+                          wl_m.GetSignature().ToString().c_str(),
+                          (wl_m.GetSignature() == expected_signature) ? 1 : 0);
+                }
+              }
+              fprintf(stderr,
+                      "[WESTLAKE-NSMPROBE]   declared_total=%d same_name=%d\n",
+                      wl_n, wl_same_name);
+              fflush(stderr);
+            }
+          }
           ThrowNoSuchMethodError(invoke_type,
                                  referenced_class,
                                  dex_file->GetStringData(method_id.name_idx_),
@@ -7640,6 +12736,126 @@ bool DoCall(ArtMethod* called_method,
           return false;
         }
       }
+    }
+  }
+
+  // WESTLAKE §740 (2026-08-20): the terminal stock Handler constructor first
+  // calls Object.<init>() and then dereferences its p1 Looper. Preserve that
+  // caller vreg across the nested constructor only if the nested call changes a
+  // non-null reference to null. This is another strict interpreter invariant,
+  // not a substitute for an explicitly null Looper.
+  const bool wl_handler_terminal_object_call =
+      caller_method != nullptr && called_method != nullptr && !is_string_init &&
+      PFCutDeclaringClassPlausible(caller_method) &&
+      PFCutDeclaringClassPlausible(called_method) &&
+      caller_method->GetDeclaringClass()->DescriptorEquals("Landroid/os/Handler;") &&
+      strcmp(WlSafeName(caller_method), "<init>") == 0 &&
+      caller_method->GetSignature().ToString() ==
+          "(Landroid/os/Looper;Landroid/os/Handler$Callback;ZZ)V" &&
+      called_method->GetDeclaringClass()->DescriptorEquals("Ljava/lang/Object;") &&
+      strcmp(WlSafeName(called_method), "<init>") == 0 &&
+      shadow_frame.NumberOfVRegs() >= 5u;
+  const uint32_t wl_handler_terminal_looper_reg =
+      wl_handler_terminal_object_call ? shadow_frame.NumberOfVRegs() - 4u : 0u;
+  ObjPtr<mirror::Object> wl_handler_terminal_looper_before =
+      wl_handler_terminal_object_call
+          ? shadow_frame.GetVRegReference(wl_handler_terminal_looper_reg) : nullptr;
+
+  // WESTLAKE §741 (2026-08-20): explain why a no-quit HandlerThread becomes
+  // non-alive. Looper.loop() should return only after its MessageQueue quits;
+  // an app override that rejects both quit APIs should therefore stay here
+  // forever. Diagnostic only: report normal return versus a pending exception
+  // at the exact managed-call boundary.
+  const bool wl_looper_loop_call =
+      called_method != nullptr && called_method->IsStatic() && !is_string_init &&
+      PFCutDeclaringClassPlausible(called_method) &&
+      called_method->GetDeclaringClass()->DescriptorEquals("Landroid/os/Looper;") &&
+      strcmp(WlSafeName(called_method), "loop") == 0 &&
+      called_method->GetSignature().ToString() == "()V";
+
+  // WESTLAKE §752: trace the exact app-managed handoff around the short-video
+  // repository, response Handler, presenter, and response accessors.  The filter is
+  // intentionally narrow and the trace is capped per thread because Toutiao executes
+  // entirely in the interpreter on this port.
+  bool wl_toutiao_video_call = false;
+  std::string wl_toutiao_video_caller_desc_storage;
+  std::string wl_toutiao_video_callee_desc_storage;
+  const char* wl_toutiao_video_caller_desc = "";
+  const char* wl_toutiao_video_callee_desc = "";
+  const char* wl_toutiao_video_method_name = "";
+  char wl_toutiao_video_return_shorty = '?';
+  if (WestlakeTraceToutiaoVideoCalls() && caller_method != nullptr &&
+      called_method != nullptr && PFCutDeclaringClassPlausible(caller_method) &&
+      PFCutDeclaringClassPlausible(called_method)) {
+    wl_toutiao_video_caller_desc = caller_method->GetDeclaringClass()->GetDescriptor(
+        &wl_toutiao_video_caller_desc_storage);
+    wl_toutiao_video_callee_desc = called_method->GetDeclaringClass()->GetDescriptor(
+        &wl_toutiao_video_callee_desc_storage);
+    wl_toutiao_video_method_name = WlSafeName(called_method);
+    const auto exact_video_class = [](const char* descriptor) {
+      return descriptor != nullptr &&
+          (strcmp(descriptor, "LX/G2V;") == 0 ||
+           strcmp(descriptor, "LX/FmZ;") == 0 ||
+           strcmp(descriptor, "LX/FmR;") == 0 ||
+           strcmp(descriptor, "LX/G2W;") == 0 ||
+           strcmp(descriptor, "LX/G0P;") == 0 ||
+           strcmp(descriptor, "LX/G05;") == 0 ||
+           strcmp(descriptor, "LX/Flq;") == 0 ||
+           strcmp(descriptor, "LX/FlB;") == 0 ||
+           strcmp(descriptor, "LX/FlH;") == 0 ||
+           // WESTLAKE §763: include only the feed parser and its worker runnable.
+           // The video request reaches HTTP 200 and constructs protobuf cells, but
+           // C0305Flt.i() never delivers the final 10/11 Handler message.  These two
+           // classes expose JSONArray.length(), worker indices, parse completion,
+           // and the Object.wait()/notifyAll() boundary without tracing the very
+           // large CellManager/Wire implementation or changing app behaviour.
+           strcmp(descriptor, "LX/Flt;") == 0 ||
+           strcmp(descriptor, "LX/Flx;") == 0 ||
+           strcmp(descriptor, "LX/FzC;") == 0 ||
+           strcmp(descriptor, "LX/G06;") == 0 ||
+           strcmp(descriptor, "LX/Fm4;") == 0 ||
+           strcmp(descriptor, "LX/FlR;") == 0 ||
+           strcmp(descriptor, "LX/FlS;") == 0);
+    };
+    const bool video_package_caller =
+        wl_toutiao_video_caller_desc != nullptr &&
+        (strstr(wl_toutiao_video_caller_desc, "Lcom/bytedance/smallvideo/") != nullptr ||
+         strstr(wl_toutiao_video_caller_desc, "Lcom/ss/android/ugc/detail/") != nullptr ||
+         strstr(wl_toutiao_video_caller_desc, "Lcom/ss/ttvideoengine/") != nullptr);
+    const bool response_accessor = wl_toutiao_video_method_name != nullptr &&
+        (strcmp(wl_toutiao_video_method_name, "getData") == 0 ||
+         strcmp(wl_toutiao_video_method_name, "getErrorCode") == 0 ||
+         strcmp(wl_toutiao_video_method_name, "getRequestId") == 0 ||
+         strcmp(wl_toutiao_video_method_name, "getTopTime") == 0 ||
+         strcmp(wl_toutiao_video_method_name, "getBottomTime") == 0 ||
+         strcmp(wl_toutiao_video_method_name, "hasMore") == 0 ||
+         strcmp(wl_toutiao_video_method_name, "p0") == 0 ||
+         strcmp(wl_toutiao_video_method_name, "P1") == 0);
+    static thread_local int wl_toutiao_video_trace_count = 0;
+    wl_toutiao_video_call = wl_toutiao_video_trace_count < 5000 &&
+        (exact_video_class(wl_toutiao_video_caller_desc) ||
+         exact_video_class(wl_toutiao_video_callee_desc) ||
+         (video_package_caller && response_accessor));
+    if (wl_toutiao_video_call) {
+      wl_toutiao_video_trace_count++;
+      uint32_t shorty_len = 0;
+      const char* shorty = called_method->GetShorty(&shorty_len);
+      if (shorty != nullptr && shorty_len > 0u) {
+        wl_toutiao_video_return_shorty = shorty[0];
+      }
+      fprintf(stderr,
+              "[WESTLAKE-TTVIDEO-752] enter caller=%s callee=%s inputs=%u range=%d "
+              "args=",
+              caller_method->PrettyMethod().c_str(),
+              called_method->PrettyMethod().c_str(), number_of_inputs,
+              is_range ? 1 : 0);
+      for (uint32_t i = 0; i < number_of_inputs && i < 8u; ++i) {
+        const uint32_t source_vreg = is_range ? vregC + i : arg[i];
+        fprintf(stderr, "%s%u:0x%x", i == 0u ? "" : ",", i,
+                shadow_frame.GetVReg(source_vreg));
+      }
+      fprintf(stderr, "\n");
+      fflush(stderr);
     }
   }
 
@@ -7652,6 +12868,104 @@ bool DoCall(ArtMethod* called_method,
       arg,
       vregC,
       is_string_init);
+
+  if (wl_toutiao_video_call) {
+    ObjPtr<mirror::Object> object_result =
+        result != nullptr && wl_toutiao_video_return_shorty == 'L'
+            ? result->GetL() : nullptr;
+    fprintf(stderr,
+            "[WESTLAKE-TTVIDEO-752] leave callee=%s ok=%d pending=%d "
+            "shorty=%c result=0x%llx object=%p class=%s\n",
+            called_method != nullptr ? called_method->PrettyMethod().c_str() : "<null>",
+            ok ? 1 : 0, self->IsExceptionPending() ? 1 : 0,
+            wl_toutiao_video_return_shorty,
+            static_cast<unsigned long long>(result != nullptr ? result->GetJ() : 0),
+            object_result.Ptr(),
+            object_result != nullptr && object_result->GetClass() != nullptr
+                ? object_result->GetClass()->PrettyDescriptor().c_str() : "<none>");
+    fflush(stderr);
+  }
+
+  if (wl_handler_terminal_object_call) {
+    ObjPtr<mirror::Object> looper_after =
+        shadow_frame.GetVRegReference(wl_handler_terminal_looper_reg);
+    const bool repaired =
+        wl_handler_terminal_looper_before != nullptr && looper_after == nullptr;
+    if (repaired) {
+      shadow_frame.SetVRegReference(wl_handler_terminal_looper_reg,
+                                    wl_handler_terminal_looper_before);
+    }
+    fprintf(stderr,
+            "[WESTLAKE-MAINLOOPER-740] before=%p after=%p final=%p repaired=%d\n",
+            wl_handler_terminal_looper_before.Ptr(), looper_after.Ptr(),
+            shadow_frame.GetVRegReference(wl_handler_terminal_looper_reg),
+            repaired ? 1 : 0);
+    fflush(stderr);
+  }
+
+  if (wl_looper_loop_call) {
+    ObjPtr<mirror::Object> exception =
+        self->IsExceptionPending() ? self->GetException() : nullptr;
+    std::string message_storage;
+    const char* message =
+        exception != nullptr ? PFCutThrowableMessage(exception, &message_storage) : nullptr;
+    fprintf(stderr,
+            "[WESTLAKE-LOOPEREXIT-741] caller=%s ok=%d pending=%d exception=%s message=%s\n",
+            caller_method != nullptr ? caller_method->PrettyMethod().c_str() : "<null>",
+            ok ? 1 : 0, self->IsExceptionPending() ? 1 : 0,
+            exception != nullptr && exception->GetClass() != nullptr
+                ? exception->GetClass()->PrettyDescriptor().c_str() : "<none>",
+            message != nullptr ? message : "<none>");
+    fflush(stderr);
+  }
+
+  // WESTLAKE §737 (2026-08-19): preserve the managed-call return from
+  // android.os.Looper.getMainLooper().
+  //
+  // The direct-launch OH boundary measured, through JNI, that
+  // Looper.getMainLooper() and Looper.myLooper() are the same live object
+  // immediately before Toutiao's TikTokActivity transaction.  The fragment's
+  // next ordinary invoke-static of getMainLooper(), however, supplied null to
+  // Handler(Looper), which killed the Activity.  The framework method is stock
+  // and simply returns the synchronized sMainLooper field.  Check the managed
+  // invocation against that exact field here: a null method result while the
+  // field is non-null is an ART interpreter return-path violation, not an
+  // Android state transition.  Repair only that impossible mismatch; a
+  // legitimately unprepared process (both null) is left unchanged.
+  if (called_method != nullptr && called_method->IsStatic() && !is_string_init &&
+      PFCutDeclaringClassPlausible(called_method) &&
+      called_method->GetDeclaringClass()->DescriptorEquals("Landroid/os/Looper;") &&
+      strcmp(WlSafeName(called_method), "getMainLooper") == 0) {
+    ObjPtr<mirror::Object> static_main = nullptr;
+    for (ArtField& field : called_method->GetDeclaringClass()->GetSFields()) {
+      if (strcmp(field.GetName(), "sMainLooper") == 0) {
+        static_main = field.GetObject(called_method->GetDeclaringClass());
+        break;
+      }
+    }
+    ObjPtr<mirror::Object> managed_result = result != nullptr ? result->GetL() : nullptr;
+    const bool repaired = ok && !self->IsExceptionPending() && result != nullptr &&
+                          managed_result == nullptr && static_main != nullptr;
+    if (repaired) {
+      result->SetL(static_main);
+    }
+    g_westlake_last_main_looper_method = called_method;
+    g_westlake_last_main_looper_caller = caller_method;
+    g_westlake_last_main_looper_dex_pc = shadow_frame.GetDexPC();
+    g_westlake_last_main_looper_non_null =
+        result != nullptr && result->GetL() != nullptr && !self->IsExceptionPending();
+    const int wl_main_looper_return_count =
+        g_westlake_main_looper_return_logs.fetch_add(1, std::memory_order_relaxed);
+    if (wl_main_looper_return_count < 80) {
+      fprintf(stderr,
+              "[WESTLAKE-MAINLOOPER-737] caller=%s result=%p static=%p "
+              "ok=%d pending=%d repaired=%d\n",
+              caller_method != nullptr ? caller_method->PrettyMethod().c_str() : "<null>",
+              managed_result.Ptr(), static_main.Ptr(), ok ? 1 : 0,
+              self->IsExceptionPending() ? 1 : 0, repaired ? 1 : 0);
+      fflush(stderr);
+    }
+  }
   if (pfc_diag) {
     fprintf(stderr,
             "[PFCUT] DoCall after DoCallCommon dexIdx=%u ok=%d pending=%d top_shadow=%p top_quick=%p\n",

@@ -2208,7 +2208,15 @@ bool ImageSpace::BootImageLayout::LoadFromSystem(InstructionSet image_isa,
   auto filename_fn = [image_isa](const std::string& location,
                                  /*out*/ std::string* filename,
                                  [[maybe_unused]] /*out*/ std::string* err_msg) {
-    *filename = GetSystemImageFilename(location.c_str(), image_isa);
+    // WESTLAKE §316b — THE BOOT-IMAGE-LOAD FIX. GetSystemImageFilename() unconditionally inserts
+    // the ISA subdir (fw/boot.art -> fw/arm64/boot.art). Our boot image is deployed FLAT in
+    // <base>/fw/ (no arm64/ subdir), so the ISA form does not exist / is invalid, the image fails
+    // to load, and the runtime falls back to imageless/interpret-only (NO AOT) -> §315: the app
+    // main thread grinds ~11s in interpreted ZipFile.initCEN and never drives the draw. If the
+    // flat location exists, use it directly (no ISA insertion); else fall back to the ISA form.
+    std::string flat = location;
+    std::string isa_form = GetSystemImageFilename(location.c_str(), image_isa);
+    *filename = (access(flat.c_str(), R_OK) == 0) ? flat : isa_form;
     return true;
   };
   return Load(filename_fn, allow_in_memory_compilation, error_msg);
@@ -2403,7 +2411,15 @@ class ImageSpace::BootImageLoader {
       const void* interp_bridge = GetQuickToInterpreterBridge();
       const void* jni_stub = GetQuickGenericJniStub();
       const void* resolution = GetQuickResolutionStub();
-      fprintf(stderr, "[IMG] Bridges: interp=%p jni=%p res=%p\n", interp_bridge, jni_stub, resolution);
+      // PF-arch-012 (2026-05-11): JNI dlsym lookup stub for the JNI-entry
+      // field. Previously cleared to nullptr below; that caused a
+      // pc=0 SIGBUS when the quick generic JNI trampoline reads JNI entry
+      // and calls through it BEFORE RegisterNatives runs. Route to the
+      // lookup stub instead so calls go through a real resolver / fault
+      // gracefully into UnsatisfiedLinkError.
+      const void* jni_lookup = GetJniDlsymLookupStub();
+      fprintf(stderr, "[IMG] Bridges: interp=%p jni=%p res=%p jniLookup=%p\n",
+              interp_bridge, jni_stub, resolution, jni_lookup);
       fflush(stderr);
       int total_fixed = 0;
 
@@ -2425,19 +2441,20 @@ class ImageSpace::BootImageLoader {
         int native_cleared = 0;
         header.VisitPackedArtMethods([&](ArtMethod& method) REQUIRES_SHARED(Locks::mutator_lock_) {
           const void* old_entry = method.GetEntryPointFromQuickCompiledCode();
-          if (old_entry != nullptr) {
-            if (method.IsNative()) {
-              method.SetEntryPointFromQuickCompiledCode(jni_stub);
-              // Also clear the stale JNI native entry point — it points to native
-              // functions from the dex2oat process address space. If not cleared,
-              // the JNI trampoline will SIGBUS jumping to the stale address.
-              // RegisterNatives will set the correct address later.
-              method.SetEntryPointFromJniPtrSize(nullptr, kRuntimePointerSize);
-              native_cleared++;
-            } else {
-              method.SetEntryPointFromQuickCompiledCode(interp_bridge);
-            }
+          if (method.IsNative()) {
+            method.SetEntryPointFromQuickCompiledCode(jni_stub);
+            // PF-arch-012: route JNI-entry to the dlsym lookup stub
+            // instead of nullptr. nullptr causes the generic JNI quick
+            // trampoline to BLR to pc=0 on dispatch when a native is
+            // invoked before RegisterNatives. The lookup stub handles
+            // the case gracefully (resolves via dlsym; if it fails,
+            // throws UnsatisfiedLinkError instead of SIGBUS).
+            method.SetEntryPointFromJniPtrSize(const_cast<void*>(jni_lookup), kRuntimePointerSize);
+            native_cleared++;
             space_fixed++;
+          } else if (old_entry != nullptr) {
+              method.SetEntryPointFromQuickCompiledCode(interp_bridge);
+              space_fixed++;
           }
         }, space->Begin(), kRuntimePointerSize);
         if (native_cleared > 0) {

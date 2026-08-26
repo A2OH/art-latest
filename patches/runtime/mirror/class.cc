@@ -870,6 +870,19 @@ ArtMethod* Class::FindClassMethod(ObjPtr<DexCache> dex_cache,
   const Signature signature = dex_file.GetMethodSignature(method_id);
   std::string_view name;  // Do not touch the dex file string data until actually needed.
 
+  // Westlake loads app code and shim/framework code from different dex files
+  // but lets app bytecode call shim classes symbolically. The declared-method
+  // binary search below assumes method ordering compatible with ART's verifier
+  // invariants; that is not reliable for these cross-dex shim lookups and can
+  // resolve a correct app method reference to an unrelated shim method with a
+  // different signature. Prefer a direct linear name/signature walk when the
+  // caller dex cache differs from the target class dex cache.
+  if (this_dex_cache != dex_cache) {
+    name = dex_file.GetMethodNameView(method_id);
+    ArtMethod* method = FindClassMethodWithSignature(this, name, signature, pointer_size);
+    return method;
+  }
+
   // If we do not have a dex_cache match, try to find the declared method in this class now.
   if (this_dex_cache != dex_cache && !GetDeclaredMethodsSlice(pointer_size).empty()) {
     DCHECK(name.empty());

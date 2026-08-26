@@ -76,8 +76,8 @@ const char* PFCutVarHandleAccessModeName(mirror::VarHandle::AccessMode access_mo
   return "<unknown>";
 }
 
-bool PFCutIsZeroMaskFieldVarHandleModeSupported(Handle<mirror::VarHandle> var_handle,
-                                                mirror::VarHandle::AccessMode access_mode)
+bool PFCutIsZeroMaskVarHandleModeSupported(Handle<mirror::VarHandle> var_handle,
+                                           mirror::VarHandle::AccessMode access_mode)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   if (var_handle.IsNull() ||
       var_handle->GetField32(mirror::VarHandle::AccessModesBitMaskOffset()) != 0) {
@@ -85,18 +85,30 @@ bool PFCutIsZeroMaskFieldVarHandleModeSupported(Handle<mirror::VarHandle> var_ha
   }
 
   ObjPtr<mirror::Class> vh_class = var_handle->GetClass();
-  if (vh_class == nullptr ||
-      (!vh_class->DescriptorEquals("Ljava/lang/invoke/FieldVarHandle;") &&
-       !vh_class->DescriptorEquals("Ljava/lang/invoke/StaticFieldVarHandle;"))) {
+  if (vh_class == nullptr) {
     return false;
   }
 
-  ArtField* field = ObjPtr<mirror::FieldVarHandle>::DownCast(var_handle.Get())->GetArtField();
-  if (field == nullptr) {
+  // The managed VarHandle constructors normally populate accessModesBitMask. On this
+  // standalone boot-classpath port those final instance fields can remain zero even though
+  // the native mirror has all of the type and target metadata needed to execute the access.
+  // Recover only the aligned VarHandle kinds whose support rules can be derived exactly.
+  bool is_final = false;
+  if (vh_class->DescriptorEquals("Ljava/lang/invoke/FieldVarHandle;") ||
+      vh_class->DescriptorEquals("Ljava/lang/invoke/StaticFieldVarHandle;")) {
+    ArtField* field = ObjPtr<mirror::FieldVarHandle>::DownCast(var_handle.Get())->GetArtField();
+    if (field == nullptr) {
+      return false;
+    }
+    is_final = field->IsFinal();
+  } else if (vh_class->DescriptorEquals("Ljava/lang/invoke/ArrayElementVarHandle;")) {
+    // Java array elements are mutable and aligned. This deliberately excludes byte-array and
+    // byte-buffer view VarHandles, whose supported modes depend on alignment and byte order.
+    is_final = false;
+  } else {
     return false;
   }
 
-  const bool is_final = field->IsFinal();
   const Primitive::Type primitive_type = var_handle->GetVarType()->GetPrimitiveType();
   switch (access_mode) {
     case mirror::VarHandle::AccessMode::kGet:
@@ -234,7 +246,7 @@ bool VarHandleInvokeAccessorImpl(Thread* self,
   }
 
   if (!var_handle->IsAccessModeSupported(access_mode) &&
-      !PFCutIsZeroMaskFieldVarHandleModeSupported(var_handle, access_mode)) {
+      !PFCutIsZeroMaskVarHandleModeSupported(var_handle, access_mode)) {
     static thread_local int pfc_vh_uoe_count = 0;
     if (pfc_vh_uoe_count < 40) {
       pfc_vh_uoe_count++;

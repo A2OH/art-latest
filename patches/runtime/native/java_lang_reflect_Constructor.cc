@@ -18,6 +18,7 @@
 
 #include "nativehelper/jni_macros.h"
 
+#include "art_field-inl.h"
 #include "art_method-inl.h"
 #include "base/pointer_size.h"
 #include "class_linker.h"
@@ -114,6 +115,56 @@ static jobject Constructor_newInstance0(JNIEnv* env, jobject javaMethod, jobject
     return nullptr;
   }
   jobject javaReceiver = soa.AddLocalReference<jobject>(receiver);
+
+  if (c->IsProxyClass()) {
+    ObjPtr<mirror::ObjectArray<mirror::Object>> objects =
+        soa.Decode<mirror::ObjectArray<mirror::Object>>(javaArgs);
+    if (objects == nullptr || objects->GetLength() != 1) {
+      soa.Self()->ThrowNewException("Ljava/lang/IllegalArgumentException;",
+                                    "Proxy constructor expects one InvocationHandler");
+      return nullptr;
+    }
+    ObjPtr<mirror::Object> handler = objects->Get(0);
+    if (handler == nullptr) {
+      soa.Self()->ThrowNewException("Ljava/lang/NullPointerException;", "h == null");
+      return nullptr;
+    }
+    ArtField* handler_field =
+        c->FindInstanceField("h", "Ljava/lang/reflect/InvocationHandler;");
+    if (handler_field == nullptr) {
+      soa.Self()->ThrowNewException("Ljava/lang/InternalError;",
+                                    "Proxy.h field not found");
+      return nullptr;
+    }
+    static thread_local int proxy_ctor_count = 0;
+    if (proxy_ctor_count < 40) {
+      proxy_ctor_count++;
+      fprintf(stderr,
+              "[PFCUT-PROXY] direct proxy constructor %s handler=%p ctor=%s quick=%p virt=%u\n",
+              c->PrettyDescriptor().c_str(),
+              handler.Ptr(),
+              constructor_art_method->PrettyMethod().c_str(),
+              constructor_art_method->GetEntryPointFromQuickCompiledCode(),
+              c->NumVirtualMethods());
+      uint32_t printed = 0u;
+      for (ArtMethod& candidate : c->GetVirtualMethodsSlice(kRuntimePointerSize)) {
+        if (printed >= 12u) {
+          break;
+        }
+        ArtMethod* target = candidate.GetInterfaceMethodIfProxy(kRuntimePointerSize);
+        fprintf(stderr,
+                "[PFCUT-PROXY]   method=%s target=%s quick=%p flags=0x%x\n",
+                candidate.PrettyMethod().c_str(),
+                target != nullptr ? target->PrettyMethod().c_str() : "<null>",
+                candidate.GetEntryPointFromQuickCompiledCode(),
+                candidate.GetAccessFlags());
+        printed++;
+      }
+      fflush(stderr);
+    }
+    handler_field->SetObject<false>(receiver, handler);
+    return javaReceiver;
+  }
 
   InvokeConstructor(soa, constructor_art_method, receiver, javaArgs);
 

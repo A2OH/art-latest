@@ -2474,7 +2474,16 @@ void UnstartedRuntime::Jni(Thread* self, ArtMethod* method, mirror::Object* rece
   const char* method_name = method->GetName();
   const char* declaring_class = method->GetDeclaringClassDescriptor();
 
-    LOG(WARNING) << "[UNSAFE-JNI] method=" << method_name << " class=" << declaring_class;
+  // WESTLAKE (2026-07-22): GATED. This fired on EVERY JNI call made by the unstarted-runtime
+  // interpreter during boot-image clinit -- it produced a 25.8 GB stderr in a single dex2oat run
+  // and made image builds disk-I/O bound (~570s vs ~60s). Set WESTLAKE_UNSAFE_JNI_DIAG=1 to
+  // re-enable when actually debugging UnstartedRuntime::Jni.
+  {
+    static const bool wl_unsafe_diag = (getenv("WESTLAKE_UNSAFE_JNI_DIAG") != nullptr);
+    if (UNLIKELY(wl_unsafe_diag)) {
+      LOG(WARNING) << "[UNSAFE-JNI] method=" << method_name << " class=" << declaring_class;
+    }
+  }
 
   // FileDescriptor.getAppend(int fd) — returns false (stdin/stdout/stderr not append)
   if (strcmp(method_name, "getAppend") == 0 &&

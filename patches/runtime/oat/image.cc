@@ -35,6 +35,20 @@ namespace art HIDDEN {
 
 const uint8_t ImageHeader::kImageMagic[] = { 'a', 'r', 't', '\n' };
 // Last change: Add intrinsics for Unsafe/JdkUnsafe.arrayBaseOffset.
+// §319b: reverted to 118 (the §318 space image is IMT-incompatible + gives no AOT benefit, so we
+// stay imageless; v118 guarantees no v114 image ever loads). The §318 recipe to go back to 114 is
+// in [[aot-bootimage-loads-imt-wall-2026-07-23]].
+// WESTLAKE §602: the prebuilt x86->arm64 dex2oat available here stamps image v114 (OAT v247, which
+// already matches). Accept v114 so its boot images load. §318 did this by hand-editing + relinking;
+// it is kept in source now that the tree builds.
+//
+// WESTLAKE §603c: REVERTED to the stock 118. §603b established that the v114 stamp came from the
+// *stale April* host dex2oat being the active one (build/bin/dex2oat), while a tree-matched build
+// (build/bin/dex2oat.jul22-rebuilt-GATED.bak) stamps 118 like this source does. Downgrading the
+// runtime to 114 made a mismatched producer's image *load* without making it *correct* — it aborted
+// at ClassLinker::CreateProxyConstructor with java.lang.reflect.Proxy having 0 direct methods.
+// Building the image with the tree-matched compiler makes producer and consumer agree by
+// construction, which is the fix; accepting a foreign version number never was.
 const uint8_t ImageHeader::kImageVersion[] = { '1', '1', '8', '\0' };
 
 ImageHeader::ImageHeader(uint32_t image_reservation_size,

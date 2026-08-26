@@ -50,7 +50,9 @@ static jobjectArray Executable_getDeclaredAnnotationsNative(JNIEnv* env, jobject
         mirror::ObjectArray<mirror::Object>::Alloc(soa.Self(), annotation_array_class, 0);
     return soa.AddLocalReference<jobjectArray>(empty_array);
   }
-  return soa.AddLocalReference<jobjectArray>(annotations::GetAnnotationsForMethod(method));
+  ObjPtr<mirror::ObjectArray<mirror::Object>> declared_annotations =
+      annotations::GetAnnotationsForMethod(method);
+  return soa.AddLocalReference<jobjectArray>(declared_annotations);
 }
 
 static jobject Executable_getAnnotationNative(JNIEnv* env,
@@ -63,7 +65,8 @@ static jobject Executable_getAnnotationNative(JNIEnv* env,
     return nullptr;
   } else {
     Handle<mirror::Class> klass(hs.NewHandle(soa.Decode<mirror::Class>(annotationType)));
-    return soa.AddLocalReference<jobject>(annotations::GetAnnotationForMethod(method, klass));
+    ObjPtr<mirror::Object> annotation = annotations::GetAnnotationForMethod(method, klass);
+    return soa.AddLocalReference<jobject>(annotation);
   }
 }
 

@@ -733,3 +733,15 @@ extern "C" size_t artCriticalNativeOutArgsSize(void* method) {
 extern "C" bool _ZN3art9ArtMethod13IsProxyMethodEv() { return false; }
 // Stub for ArtMethod::GetShorty — returns empty string (never actually called in our path)
 extern "C" const char* _ZN3art9ArtMethod9GetShortyEv() { return ""; }
+
+// WESTLAKE §603d: the HOST dex2oat link needs this. patches/runtime/thread.cc references
+// art::interpreter::g_westlake_infl_gate (§212d), which is DEFINED in
+// patches/runtime/interpreter/interpreter_common.cc. The arm64 Makefile globs patches/**.cc so it
+// gets the definition; this host Makefile uses an explicit per-file patch list that includes the
+// patched thread.cc but NOT interpreter_common.cc, so the reference is unresolved. The host link
+// passes -Wl,--unresolved-symbols=ignore-all, so it only surfaced at RUN time as
+// "symbol lookup error: undefined symbol: _ZN3art11interpreter20g_westlake_infl_gateE".
+// Pulling in the full patched interpreter_common.cc here would drag the whole PFCUT layer into the
+// host compiler; the gate is only read by a diagnostic probe in Thread::SetException, so a false
+// definition is the correct host-side behaviour.
+namespace art { namespace interpreter { bool g_westlake_infl_gate = false; } }

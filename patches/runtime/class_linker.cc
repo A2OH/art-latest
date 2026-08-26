@@ -166,6 +166,158 @@ using android::base::StringPrintf;
 
 static constexpr bool kCheckImageObjects = kIsDebugBuild;
 static constexpr bool kVerifyArtMethodDeclaringClasses = kIsDebugBuild;
+static constexpr uintptr_t kPFCutStaleNativeEntry = 0xfffffffffffffb17ULL;
+
+extern "C" jobject Westlake_Linux_open(JNIEnv*, jobject, jstring, jint, jint);
+extern "C" void Westlake_Linux_close(JNIEnv*, jobject, jobject);
+extern "C" jint Westlake_Linux_readBytes(JNIEnv*, jobject, jobject, jobject, jint, jint);
+extern "C" jint Westlake_Linux_writeBytes(JNIEnv*, jobject, jobject, jobject, jint, jint);
+extern "C" jobject Westlake_Linux_fstat(JNIEnv*, jobject, jobject);
+extern "C" jobject Westlake_Linux_stat(JNIEnv*, jobject, jstring);
+extern "C" jobject Westlake_Linux_lstat(JNIEnv*, jobject, jstring);
+extern "C" jboolean Westlake_Linux_access(JNIEnv*, jobject, jstring, jint);
+extern "C" jobject Westlake_Linux_getsockoptLinger(JNIEnv*, jobject, jobject, jint, jint);
+extern "C" jobject Westlake_TimeZone_getDefault(JNIEnv*, jclass);
+extern "C" jlong Westlake_PatternNative_getNativeFinalizer(JNIEnv*, jclass);
+extern "C" jlong Westlake_PatternNative_compileImpl(JNIEnv*, jclass, jstring, jint);
+extern "C" jlong Westlake_PatternNative_openMatcherImpl(JNIEnv*, jclass, jlong);
+extern "C" jint Westlake_PatternNative_getMatchedGroupIndexImpl(JNIEnv*, jclass, jlong, jstring);
+extern "C" jlong Westlake_MatcherNative_getNativeFinalizer(JNIEnv*, jclass);
+extern "C" jboolean Westlake_MatcherNative_findImpl(JNIEnv*, jclass, jlong, jint, jintArray);
+extern "C" jboolean Westlake_MatcherNative_findNextImpl(JNIEnv*, jclass, jlong, jintArray);
+extern "C" jint Westlake_MatcherNative_groupCountImpl(JNIEnv*, jclass, jlong);
+extern "C" jboolean Westlake_MatcherNative_hitEndImpl(JNIEnv*, jclass, jlong);
+extern "C" jboolean Westlake_MatcherNative_lookingAtImpl(JNIEnv*, jclass, jlong, jintArray);
+extern "C" jboolean Westlake_MatcherNative_matchesImpl(JNIEnv*, jclass, jlong, jintArray);
+extern "C" jboolean Westlake_MatcherNative_requireEndImpl(JNIEnv*, jclass, jlong);
+extern "C" void Westlake_MatcherNative_setInputImpl(JNIEnv*, jclass, jlong, jstring, jint, jint);
+extern "C" void Westlake_MatcherNative_useAnchoringBoundsImpl(JNIEnv*, jclass, jlong, jboolean);
+extern "C" void Westlake_MatcherNative_useTransparentBoundsImpl(JNIEnv*, jclass, jlong, jboolean);
+
+static bool PFCutIsStaleNativeEntry(const void* entry) {
+  return reinterpret_cast<uintptr_t>(entry) == kPFCutStaleNativeEntry;
+}
+
+static const void* PFCutResolveStandaloneLinuxNative(ArtMethod* method)
+    NO_THREAD_SAFETY_ANALYSIS {
+  if (method == nullptr || method->GetDeclaringClassDescriptor() == nullptr ||
+      strcmp(method->GetDeclaringClassDescriptor(), "Llibcore/io/Linux;") != 0) {
+    return nullptr;
+  }
+  const char* name = method->GetName();
+  if (name == nullptr) {
+    return nullptr;
+  }
+  const std::string sig = method->GetSignature().ToString();
+  if (strcmp(name, "open") == 0 &&
+      sig == "(Ljava/lang/String;II)Ljava/io/FileDescriptor;") {
+    return reinterpret_cast<const void*>(&Westlake_Linux_open);
+  }
+  if (strcmp(name, "close") == 0 && sig == "(Ljava/io/FileDescriptor;)V") {
+    return reinterpret_cast<const void*>(&Westlake_Linux_close);
+  }
+  if (strcmp(name, "readBytes") == 0 &&
+      sig == "(Ljava/io/FileDescriptor;Ljava/lang/Object;II)I") {
+    return reinterpret_cast<const void*>(&Westlake_Linux_readBytes);
+  }
+  if (strcmp(name, "writeBytes") == 0 &&
+      sig == "(Ljava/io/FileDescriptor;Ljava/lang/Object;II)I") {
+    return reinterpret_cast<const void*>(&Westlake_Linux_writeBytes);
+  }
+  if (strcmp(name, "fstat") == 0 &&
+      sig == "(Ljava/io/FileDescriptor;)Landroid/system/StructStat;") {
+    return reinterpret_cast<const void*>(&Westlake_Linux_fstat);
+  }
+  if (strcmp(name, "stat") == 0 &&
+      sig == "(Ljava/lang/String;)Landroid/system/StructStat;") {
+    return reinterpret_cast<const void*>(&Westlake_Linux_stat);
+  }
+  if (strcmp(name, "lstat") == 0 &&
+      sig == "(Ljava/lang/String;)Landroid/system/StructStat;") {
+    return reinterpret_cast<const void*>(&Westlake_Linux_lstat);
+  }
+  if (strcmp(name, "access") == 0 && sig == "(Ljava/lang/String;I)Z") {
+    return reinterpret_cast<const void*>(&Westlake_Linux_access);
+  }
+  if (strcmp(name, "getsockoptLinger") == 0 &&
+      sig == "(Ljava/io/FileDescriptor;II)Landroid/system/StructLinger;") {
+    return reinterpret_cast<const void*>(&Westlake_Linux_getsockoptLinger);
+  }
+  return nullptr;
+}
+
+static const void* PFCutResolveStandaloneNative(ArtMethod* method)
+    NO_THREAD_SAFETY_ANALYSIS {
+  const void* linux_native = PFCutResolveStandaloneLinuxNative(method);
+  if (linux_native != nullptr) {
+    return linux_native;
+  }
+  if (method == nullptr || method->GetDeclaringClassDescriptor() == nullptr) {
+    return nullptr;
+  }
+  const char* descriptor = method->GetDeclaringClassDescriptor();
+  const char* name = method->GetName();
+  if (name == nullptr) {
+    return nullptr;
+  }
+  const std::string sig = method->GetSignature().ToString();
+  if (strcmp(descriptor, "Ljava/util/TimeZone;") == 0 &&
+      (strcmp(name, "getDefault") == 0 || strcmp(name, "getDefaultRef") == 0) &&
+      sig == "()Ljava/util/TimeZone;") {
+    return reinterpret_cast<const void*>(&Westlake_TimeZone_getDefault);
+  }
+  if (strcmp(descriptor, "Lcom/android/icu/util/regex/PatternNative;") == 0) {
+    if (strcmp(name, "compileImpl") == 0 && sig == "(Ljava/lang/String;I)J") {
+      return reinterpret_cast<const void*>(&Westlake_PatternNative_compileImpl);
+    }
+    if (strcmp(name, "getNativeFinalizer") == 0 && sig == "()J") {
+      return reinterpret_cast<const void*>(&Westlake_PatternNative_getNativeFinalizer);
+    }
+    if (strcmp(name, "openMatcherImpl") == 0 && sig == "(J)J") {
+      return reinterpret_cast<const void*>(&Westlake_PatternNative_openMatcherImpl);
+    }
+    if (strcmp(name, "getMatchedGroupIndexImpl") == 0 &&
+        sig == "(JLjava/lang/String;)I") {
+      return reinterpret_cast<const void*>(&Westlake_PatternNative_getMatchedGroupIndexImpl);
+    }
+  }
+  if (strcmp(descriptor, "Lcom/android/icu/util/regex/MatcherNative;") == 0) {
+    if (strcmp(name, "findImpl") == 0 && sig == "(JI[I)Z") {
+      return reinterpret_cast<const void*>(&Westlake_MatcherNative_findImpl);
+    }
+    if (strcmp(name, "findNextImpl") == 0 && sig == "(J[I)Z") {
+      return reinterpret_cast<const void*>(&Westlake_MatcherNative_findNextImpl);
+    }
+    if (strcmp(name, "getNativeFinalizer") == 0 && sig == "()J") {
+      return reinterpret_cast<const void*>(&Westlake_MatcherNative_getNativeFinalizer);
+    }
+    if (strcmp(name, "groupCountImpl") == 0 && sig == "(J)I") {
+      return reinterpret_cast<const void*>(&Westlake_MatcherNative_groupCountImpl);
+    }
+    if (strcmp(name, "hitEndImpl") == 0 && sig == "(J)Z") {
+      return reinterpret_cast<const void*>(&Westlake_MatcherNative_hitEndImpl);
+    }
+    if (strcmp(name, "lookingAtImpl") == 0 && sig == "(J[I)Z") {
+      return reinterpret_cast<const void*>(&Westlake_MatcherNative_lookingAtImpl);
+    }
+    if (strcmp(name, "matchesImpl") == 0 && sig == "(J[I)Z") {
+      return reinterpret_cast<const void*>(&Westlake_MatcherNative_matchesImpl);
+    }
+    if (strcmp(name, "requireEndImpl") == 0 && sig == "(J)Z") {
+      return reinterpret_cast<const void*>(&Westlake_MatcherNative_requireEndImpl);
+    }
+    if (strcmp(name, "setInputImpl") == 0 && sig == "(JLjava/lang/String;II)V") {
+      return reinterpret_cast<const void*>(&Westlake_MatcherNative_setInputImpl);
+    }
+    if (strcmp(name, "useAnchoringBoundsImpl") == 0 && sig == "(JZ)V") {
+      return reinterpret_cast<const void*>(&Westlake_MatcherNative_useAnchoringBoundsImpl);
+    }
+    if (strcmp(name, "useTransparentBoundsImpl") == 0 && sig == "(JZ)V") {
+      return reinterpret_cast<const void*>(&Westlake_MatcherNative_useTransparentBoundsImpl);
+    }
+  }
+  return nullptr;
+}
 
 static void ThrowNoClassDefFoundError(const char* fmt, ...)
     __attribute__((__format__(__printf__, 1, 2)))
@@ -466,6 +618,27 @@ const void* ClassLinker::RegisterNative(
   runtime->GetRuntimeCallbacks()->RegisterNativeMethod(method,
                                                        native_method,
                                                        /*out*/&new_native_method);
+  if (PFCutIsStaleNativeEntry(new_native_method)) {
+    const void* standalone = PFCutResolveStandaloneNative(method);
+    if (standalone != nullptr) {
+      new_native_method = const_cast<void*>(standalone);
+      method->SetEntryPointFromQuickCompiledCode(GetQuickGenericJniStub());
+      fprintf(stderr,
+              "[PFCUT] RegisterNative repaired stale standalone native %s -> %p\n",
+              method->PrettyMethod().c_str(),
+              standalone);
+      fflush(stderr);
+    } else {
+      new_native_method = const_cast<void*>(method->IsCriticalNative()
+          ? GetJniDlsymLookupCriticalStub()
+          : GetJniDlsymLookupStub());
+      method->SetEntryPointFromQuickCompiledCode(GetQuickGenericJniStub());
+      fprintf(stderr,
+              "[PFCUT] RegisterNative rejected stale native %s; restored lookup stub\n",
+              method->PrettyMethod().c_str());
+      fflush(stderr);
+    }
+  }
   if (method->IsCriticalNative()) {
     MutexLock lock(self, critical_native_code_with_clinit_check_lock_);
     // Remove old registered method if any.
@@ -475,9 +648,17 @@ const void* ClassLinker::RegisterNative(
     }
     // To ensure correct memory visibility, we need the class to be visibly
     // initialized before we can set the JNI entrypoint.
-    if (method->GetDeclaringClass()->IsVisiblyInitialized()) {
-      method->SetEntryPointFromJni(new_native_method);
-    } else {
+    // WESTLAKE (2026-07-22): set the entrypoint EAGERLY as well as deferring it.
+    // Upstream parks the pointer in `critical_native_code_with_clinit_check_` and installs it only
+    // when the class becomes *visibly initialized*. On this standalone/OHOS runtime that drain does
+    // not reliably run for boot-classpath classes, so an @CriticalNative registered before first
+    // use NEVER got an entrypoint. Symptom: android.content.res.XmlBlock.nativeNext
+    // (@CriticalNative) registered cleanly yet was never entered, while nativeCreateParseState /
+    // nativeDestroyParseState (plain natives -- the unconditional `else` branch) worked; so
+    // XmlBlock$Parser.next() fell through and every compiled-XML drawable died with
+    // "No start tag found". Still recorded in the map so the normal drain stays correct.
+    method->SetEntryPointFromJni(new_native_method);
+    if (!method->GetDeclaringClass()->IsVisiblyInitialized()) {
       critical_native_code_with_clinit_check_.emplace(method, new_native_method);
     }
   } else {
@@ -506,12 +687,59 @@ const void* ClassLinker::GetRegisteredNative(Thread* self, ArtMethod* method) {
     MutexLock lock(self, critical_native_code_with_clinit_check_lock_);
     auto it = critical_native_code_with_clinit_check_.find(method);
     if (it != critical_native_code_with_clinit_check_.end()) {
-      return it->second;
+      const void* native_code = it->second;
+      if (PFCutIsStaleNativeEntry(native_code)) {
+        const void* standalone = PFCutResolveStandaloneNative(method);
+        if (standalone != nullptr) {
+          it->second = const_cast<void*>(standalone);
+          method->SetEntryPointFromQuickCompiledCode(GetQuickGenericJniStub());
+          return standalone;
+        }
+        it->second = const_cast<void*>(GetJniDlsymLookupCriticalStub());
+        return nullptr;
+      }
+      return IsJniDlsymLookupCriticalStub(native_code) ? nullptr : native_code;
     }
     const void* native_code = method->GetEntryPointFromJni();
+    if (PFCutIsStaleNativeEntry(native_code)) {
+      const void* standalone = PFCutResolveStandaloneNative(method);
+      if (standalone != nullptr) {
+        method->SetEntryPointFromQuickCompiledCode(GetQuickGenericJniStub());
+        method->SetEntryPointFromJni(standalone);
+        return standalone;
+      }
+      method->SetEntryPointFromJni(GetJniDlsymLookupCriticalStub());
+      return nullptr;
+    }
     return IsJniDlsymLookupCriticalStub(native_code) ? nullptr : native_code;
   } else {
     const void* native_code = method->GetEntryPointFromJni();
+    const bool needs_repair =
+        IsJniDlsymLookupStub(native_code) ||
+        PFCutIsStaleNativeEntry(native_code);
+    if (needs_repair) {
+      const void* standalone = PFCutResolveStandaloneNative(method);
+      if (standalone != nullptr) {
+        method->SetEntryPointFromQuickCompiledCode(GetQuickGenericJniStub());
+        method->SetEntryPointFromJni(standalone);
+        fprintf(stderr,
+                "[PFCUT] GetRegisteredNative repaired standalone native %s old=%p new=%p\n",
+                method->PrettyMethod().c_str(),
+                native_code,
+                standalone);
+        fflush(stderr);
+        return standalone;
+      }
+      if (PFCutIsStaleNativeEntry(native_code)) {
+        method->SetEntryPointFromQuickCompiledCode(GetQuickGenericJniStub());
+        method->SetEntryPointFromJni(GetJniDlsymLookupStub());
+        fprintf(stderr,
+                "[PFCUT] GetRegisteredNative rejected stale native %s; restored lookup stub\n",
+                method->PrettyMethod().c_str());
+        fflush(stderr);
+        return nullptr;
+      }
+    }
     return IsJniDlsymLookupStub(native_code) ? nullptr : native_code;
   }
 }
@@ -592,6 +820,20 @@ static void WrapExceptionInInitializer(Handle<mirror::Class> klass)
                                             << self->GetException()->Dump();
   }
 
+  // WESTLAKE 2026-07-22 (§184): <clinit> failures are the leading hypothesis for the app's null
+  // static AtomicReferenceFieldUpdater, and every path that would normally surface them is
+  // swallowed in this port (4 known stubs). Log every failing class + its cause, rate-limited.
+  {
+    static int wl_clinit_fail = 0;
+    if (wl_clinit_fail < 40) {
+      wl_clinit_fail++;
+      std::string wl_tmp;
+      fprintf(stderr, "[WESTLAKE-CLINITFAIL] #%d class=%s cause=%s\n",
+              wl_clinit_fail, klass->GetDescriptor(&wl_tmp),
+              cause != nullptr ? cause->GetClass()->PrettyDescriptor().c_str() : "<null>");
+      fflush(stderr);
+    }
+  }
   // We only wrap non-Error exceptions; an Error can just be used as-is.
   if (!cause->IsError()) {
     self->ThrowNewWrappedException("Ljava/lang/ExceptionInInitializerError;", nullptr);
@@ -673,11 +915,45 @@ void ClassLinker::CheckSystemClass(Thread* self, Handle<mirror::Class> c1, const
                  << " numMethods=" << c2->NumMethods()
                  << " numSFields=" << c2->NumStaticFields()
                  << " numIFields=" << c2->NumInstanceFields();
-    // For String mismatch: replace class root with DEX-loaded version (c2)
+    // For String mismatch: replace class root with DEX-loaded version (c2).
+    // java.lang.Class is different: all mirror::Class objects allocated during
+    // early boot already use the preallocated Class root as their metaclass.
+    // Replacing that root creates two Class mirrors with the same descriptor and
+    // breaks verifier assignability checks.
     if (strcmp(descriptor, "Ljava/lang/String;") == 0) {
       SetClassRoot(ClassRoot::kJavaLangString, c2);
       LOG(WARNING) << "  String root = c2 (" << static_cast<void*>(c2.Ptr())
                    << ", " << c2->NumMethods() << " methods)";
+      // WESTLAKE §603h: repointing the class root is NOT enough -- the core array classes were bound
+      // to c1 back in InitWithoutImage (`object_array_string->SetComponentType(java_lang_String)`),
+      // and nothing else ever updates an array class's component_type_: LinkClass's retire path only
+      // calls FixupTemporaryDeclaringClass (fields'/methods' declaring class) and
+      // ClassTable::UpdateClass (the class table). c1 is left kRetired while String[] still points at
+      // it, so String.class != String[].getComponentType() and EVERY element-checked store into a
+      // String[] throws "java.lang.String cannot be stored in an array of type java.lang.String[]".
+      //
+      // That stayed invisible for as long as everything was interpreted, because the PFCUT
+      // System.arraycopy intrinsic skips the element check. A JIT-compiled caller reaches ART's real
+      // System.arraycopy, which performs it -- which is why enabling the JIT "broke rendering":
+      // androidsvg died in KXmlParser.parseStartTag and the sound-library row artwork vanished
+      // (§603e-§603g).
+      static const ClassRoot kArrayRootsToFix[] = {
+        ClassRoot::kJavaLangStringArrayClass,
+        ClassRoot::kObjectArrayClass,
+        ClassRoot::kClassArrayClass,
+      };
+      for (ClassRoot array_root : kArrayRootsToFix) {
+        ObjPtr<mirror::Class> arr = GetClassRoot(array_root, this);
+        if (arr != nullptr && arr->GetComponentType() == c1.Get()) {
+          arr->SetComponentType(c2);
+          LOG(WARNING) << "  [§603h] " << GetClassRootDescriptor(array_root)
+                       << " component retargeted " << static_cast<void*>(c1.Get())
+                       << " (retired) -> " << static_cast<void*>(c2.Ptr());
+        }
+      }
+    } else if (strcmp(descriptor, "Ljava/lang/Class;") == 0) {
+      LOG(WARNING) << "  Class root remains preallocated c1 ("
+                   << static_cast<void*>(c1.Get()) << ")";
     }
   }
 }
@@ -694,6 +970,7 @@ ObjPtr<mirror::IfTable> AllocIfTable(Thread* self,
 
 bool ClassLinker::InitWithoutImage(std::vector<std::unique_ptr<const DexFile>> boot_class_path,
                                    std::string* error_msg) {
+  fprintf(stderr, "[WESTLAKE-TOPO] InitWithoutImage entered\n"); fflush(stderr);
   VLOG(startup) << "ClassLinker::Init";
 
   Thread* const self = Thread::Current();
@@ -993,56 +1270,42 @@ bool ClassLinker::InitWithoutImage(std::vector<std::unique_ptr<const DexFile>> b
   CHECK(class_root != nullptr);
   SetClassRoot(ClassRoot::kJavaLangReflectMethodArrayClass, class_root);
 
-  // Create java.lang.invoke.CallSite.class root
-  class_root = FindSystemClass(self, "Ljava/lang/invoke/CallSite;");
-  CHECK(class_root != nullptr);
-  SetClassRoot(ClassRoot::kJavaLangInvokeCallSite, class_root);
+  auto set_optional_system_root = [&](ClassRoot root, const char* descriptor) {
+    ObjPtr<mirror::Class> klass = FindSystemClass(self, descriptor);
+    if (klass == nullptr) {
+      LOG(WARNING) << "Skipping optional system root " << descriptor
+                   << " on standalone guest path";
+      return klass;
+    }
+    SetClassRoot(root, klass);
+    return klass;
+  };
 
-  // Create java.lang.invoke.MethodType.class root
-  class_root = FindSystemClass(self, "Ljava/lang/invoke/MethodType;");
-  CHECK(class_root != nullptr);
-  SetClassRoot(ClassRoot::kJavaLangInvokeMethodType, class_root);
-
-  // Create java.lang.invoke.MethodHandleImpl.class root
-  class_root = FindSystemClass(self, "Ljava/lang/invoke/MethodHandleImpl;");
-  CHECK(class_root != nullptr);
-  SetClassRoot(ClassRoot::kJavaLangInvokeMethodHandleImpl, class_root);
-  SetClassRoot(ClassRoot::kJavaLangInvokeMethodHandle, class_root->GetSuperClass());
-
-  // Create java.lang.invoke.MethodHandles.Lookup.class root
-  class_root = FindSystemClass(self, "Ljava/lang/invoke/MethodHandles$Lookup;");
-  CHECK(class_root != nullptr);
-  SetClassRoot(ClassRoot::kJavaLangInvokeMethodHandlesLookup, class_root);
-
-  // Create java.lang.invoke.VarHandle.class root
-  class_root = FindSystemClass(self, "Ljava/lang/invoke/VarHandle;");
-  CHECK(class_root != nullptr);
-  SetClassRoot(ClassRoot::kJavaLangInvokeVarHandle, class_root);
-
-  // Create java.lang.invoke.FieldVarHandle.class root
-  class_root = FindSystemClass(self, "Ljava/lang/invoke/FieldVarHandle;");
-  CHECK(class_root != nullptr);
-  SetClassRoot(ClassRoot::kJavaLangInvokeFieldVarHandle, class_root);
-
-  // Create java.lang.invoke.StaticFieldVarHandle.class root
-  class_root = FindSystemClass(self, "Ljava/lang/invoke/StaticFieldVarHandle;");
-  CHECK(class_root != nullptr);
-  SetClassRoot(ClassRoot::kJavaLangInvokeStaticFieldVarHandle, class_root);
-
-  // Create java.lang.invoke.ArrayElementVarHandle.class root
-  class_root = FindSystemClass(self, "Ljava/lang/invoke/ArrayElementVarHandle;");
-  CHECK(class_root != nullptr);
-  SetClassRoot(ClassRoot::kJavaLangInvokeArrayElementVarHandle, class_root);
-
-  // Create java.lang.invoke.ByteArrayViewVarHandle.class root
-  class_root = FindSystemClass(self, "Ljava/lang/invoke/ByteArrayViewVarHandle;");
-  CHECK(class_root != nullptr);
-  SetClassRoot(ClassRoot::kJavaLangInvokeByteArrayViewVarHandle, class_root);
-
-  // Create java.lang.invoke.ByteBufferViewVarHandle.class root
-  class_root = FindSystemClass(self, "Ljava/lang/invoke/ByteBufferViewVarHandle;");
-  CHECK(class_root != nullptr);
-  SetClassRoot(ClassRoot::kJavaLangInvokeByteBufferViewVarHandle, class_root);
+  // java.lang.invoke roots are optional on the standalone guest path. Modern core jars
+  // can omit some of these classes while the rest of the VM still boots correctly.
+  class_root = set_optional_system_root(ClassRoot::kJavaLangInvokeCallSite,
+                                        "Ljava/lang/invoke/CallSite;");
+  class_root = set_optional_system_root(ClassRoot::kJavaLangInvokeMethodType,
+                                        "Ljava/lang/invoke/MethodType;");
+  class_root = set_optional_system_root(ClassRoot::kJavaLangInvokeMethodHandleImpl,
+                                        "Ljava/lang/invoke/MethodHandleImpl;");
+  if (class_root != nullptr && class_root->GetSuperClass() != nullptr) {
+    SetClassRoot(ClassRoot::kJavaLangInvokeMethodHandle, class_root->GetSuperClass());
+  }
+  class_root = set_optional_system_root(ClassRoot::kJavaLangInvokeMethodHandlesLookup,
+                                        "Ljava/lang/invoke/MethodHandles$Lookup;");
+  class_root = set_optional_system_root(ClassRoot::kJavaLangInvokeVarHandle,
+                                        "Ljava/lang/invoke/VarHandle;");
+  class_root = set_optional_system_root(ClassRoot::kJavaLangInvokeFieldVarHandle,
+                                        "Ljava/lang/invoke/FieldVarHandle;");
+  class_root = set_optional_system_root(ClassRoot::kJavaLangInvokeStaticFieldVarHandle,
+                                        "Ljava/lang/invoke/StaticFieldVarHandle;");
+  class_root = set_optional_system_root(ClassRoot::kJavaLangInvokeArrayElementVarHandle,
+                                        "Ljava/lang/invoke/ArrayElementVarHandle;");
+  class_root = set_optional_system_root(ClassRoot::kJavaLangInvokeByteArrayViewVarHandle,
+                                        "Ljava/lang/invoke/ByteArrayViewVarHandle;");
+  class_root = set_optional_system_root(ClassRoot::kJavaLangInvokeByteBufferViewVarHandle,
+                                        "Ljava/lang/invoke/ByteBufferViewVarHandle;");
 
   class_root = FindSystemClass(self, "Ldalvik/system/EmulatedStackFrame;");
   CHECK(class_root != nullptr);
@@ -1091,23 +1354,29 @@ bool ClassLinker::InitWithoutImage(std::vector<std::unique_ptr<const DexFile>> b
 
   FinishInit(self);
 
-  // Fix DexCache String entries: ensure all caches point to the root String class
+  // Fix DexCache String/Class entries: ensure all caches point to the chosen roots.
   {
     ObjPtr<mirror::Class> string_root = GetClassRoot<mirror::String>();
-    const char* desc = "Ljava/lang/String;";
-    for (const auto& dex_file : GetBootClassPath()) {
-      const dex::TypeId* type_id = dex_file->FindTypeId(desc);
-      if (type_id != nullptr) {
+    ObjPtr<mirror::Class> class_root = GetClassRoot<mirror::Class>(this);
+    auto fix_resolved_type = [&](const char* desc, ObjPtr<mirror::Class> root) {
+      for (const auto& dex_file : GetBootClassPath()) {
+        const dex::TypeId* type_id = dex_file->FindTypeId(desc);
+        if (type_id == nullptr) {
+          continue;
+        }
         dex::TypeIndex idx = dex_file->GetIndexForTypeId(*type_id);
         ObjPtr<mirror::DexCache> dc = FindDexCache(self, *dex_file);
-        if (dc != nullptr) {
-          ObjPtr<mirror::Class> resolved = dc->GetResolvedType(idx);
-          if (resolved != nullptr && resolved != string_root) {
-            dc->SetResolvedType(idx, string_root);
-          }
+        if (dc == nullptr) {
+          continue;
+        }
+        ObjPtr<mirror::Class> resolved = dc->GetResolvedType(idx);
+        if (resolved != nullptr && resolved != root) {
+          dc->SetResolvedType(idx, root);
         }
       }
-    }
+    };
+    fix_resolved_type("Ljava/lang/String;", string_root);
+    fix_resolved_type("Ljava/lang/Class;", class_root);
   }
 
   VLOG(startup) << "ClassLinker::InitFromCompiler exiting";
@@ -1166,6 +1435,13 @@ void ClassLinker::FinishInit(Thread* self) {
   for (size_t i = 0; i < static_cast<size_t>(ClassRoot::kMax); i++) {
     ClassRoot class_root = static_cast<ClassRoot>(i);
     ObjPtr<mirror::Class> klass = GetClassRoot(class_root);
+    if (klass == nullptr && !Runtime::Current()->GetHeap()->HasBootImageSpace()) {
+      const char* desc = GetClassRootDescriptor(class_root);
+      LOG(WARNING) << "Missing class root " << i
+                   << " desc=" << (desc != nullptr ? desc : "<null>")
+                   << " on standalone guest path; continuing";
+      continue;
+    }
     CHECK(klass != nullptr);
     DCHECK(klass->IsArrayClass() || klass->IsPrimitive() || klass->GetDexCache() != nullptr);
     // note SetClassRoot does additional validation.
@@ -1235,6 +1511,18 @@ void ClassLinker::RunEarlyRootClinits(Thread* self) {
   for (int32_t i = 0; i < class_roots->GetLength(); i++) {
     ObjPtr<mirror::Class> root = class_roots->Get(i);
     if (root != nullptr && !root->IsVisiblyInitialized()) {
+      std::string descriptor_storage;
+      const char* descriptor = root->GetDescriptor(&descriptor_storage);
+      if (descriptor != nullptr &&
+          (strcmp(descriptor, "Ljava/lang/reflect/Proxy;") == 0 ||
+           strcmp(descriptor, "Ljava/lang/reflect/Method;") == 0)) {
+        // Proxy.<clinit> populates proxyClassCache. Method.<clinit> populates
+        // ORDER_BY_SIGNATURE, which Proxy uses while creating annotation proxies.
+        fprintf(stderr, "[CL] RunEarlyRootClinits: leave %s root for real <clinit>\n",
+                descriptor);
+        fflush(stderr);
+        continue;
+      }
       root->SetStatusForPrimitiveOrArray(ClassStatus::kVisiblyInitialized);
     }
   }
@@ -1382,6 +1670,14 @@ void ClassLinker::RunRootClinits(Thread* self) {
       "Ljava/util/TreeMap;",
       "Ljava/util/TreeSet;",
       "Ljava/util/HashSet;",
+      "Ljava/util/HashMap;",
+      // [ARM64-OHOS 2026-07-08] Pre-init Charset so its <clinit> (cache2 =
+      // new HashMap<>(), gate = new ThreadLocal<>()) runs in dependency order
+      // (HashMap + ThreadLocal above are already pre-inited). Without this, the
+      // general init path leaves Charset "initialized" with cache2 == null →
+      // synchronized(cache2) NPE in lookup2 → System.out.println fails. Charset
+      // itself needs NO ICU (that's only touched later in forName/NativeConverter).
+      "Ljava/nio/charset/Charset;",
       // "Ljava/util/concurrent/ConcurrentHashMap;", // needs OsConstants
       // "Ljava/io/OutputStreamWriter;", // needs Charset
       // "Ljava/io/BufferedWriter;",    // needs System.lineSeparator → ThreadLocal
@@ -1593,7 +1889,34 @@ struct TrampolineCheckData {
   bool error;
 };
 
+// WESTLAKE 2026-07-22 (§194): the boot image is built --compiler-filter=verify, which never runs
+// <clinit>, yet image classes arrive marked Initialized, so ART elides the init check and every
+// `static final` stays null (proved for java.io.BufferedInputStream.bufUpdater, §191/§193).
+// Demote a narrow allow-list back to kVerified after the image is loaded so first use performs a
+// REAL <clinit>. Gated by WESTLAKE_REINIT so it can be A/B'd; start narrow, widen only if it works.
+static void WestlakeDemoteImageClasses(ClassLinker* cl, Thread* self)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  // WESTLAKE: NO env gate -- the spawned child resets `environ`, so getenv() always returns null
+  // there (same lesson already recorded on the NPE-DIAG hook in common_throws.cc). Always run;
+  // the allow-list is narrow and each demotion logs once.
+  static const char* kNames[] = { "Ljava/io/BufferedInputStream;" };
+  StackHandleScope<1> hs(self);
+  for (const char* d : kNames) {
+    ObjPtr<mirror::Class> k = cl->LookupClass(self, d, nullptr);
+    if (k == nullptr) {
+      fprintf(stderr, "[WESTLAKE-REINIT] %s not loaded yet\n", d); fflush(stderr); continue;
+    }
+    Handle<mirror::Class> h(hs.NewHandle(k));
+    fprintf(stderr, "[WESTLAKE-REINIT] %s status=%d -> demoting to kVerified\n",
+            d, static_cast<int>(h->GetStatus()));
+    fflush(stderr);
+    ObjectLock<mirror::Class> lock(self, h);
+    mirror::Class::SetStatus(h, ClassStatus::kVerified, self);
+  }
+}
+
 bool ClassLinker::InitFromBootImage(std::string* error_msg) {
+  fprintf(stderr, "[WESTLAKE-TOPO] InitFromBootImage entered\n"); fflush(stderr);
   VLOG(startup) << __FUNCTION__ << " entering";
   CHECK(!init_done_);
 
@@ -1764,6 +2087,8 @@ bool ClassLinker::InitFromBootImage(std::string* error_msg) {
                                       image_pointer_size_,
                                       ArrayRef<uint32_t>(object_virtual_method_hashes_));
   FinishInit(self);
+
+  WestlakeDemoteImageClasses(this, self);   // WESTLAKE §194
 
   VLOG(startup) << __FUNCTION__ << " exiting";
   return true;
@@ -2397,6 +2722,7 @@ bool ClassLinker::AddImageSpace(gc::space::ImageSpace* space,
                                 ClassLoaderContext* context,
                                 const std::vector<std::unique_ptr<const DexFile>>& dex_files,
                                 std::string* error_msg) {
+  fprintf(stderr, "[WESTLAKE-TOPO] AddImageSpace entered\n"); fflush(stderr);
   DCHECK(error_msg != nullptr);
   const uint64_t start_time = NanoTime();
   const bool app_image = class_loader != nullptr;
@@ -2702,6 +3028,7 @@ bool ClassLinker::AddImageSpaces(ArrayRef<gc::space::ImageSpace*> spaces,
                                  ClassLoaderContext* context,
                                  /*out*/ std::vector<std::unique_ptr<const DexFile>>* dex_files,
                                  /*out*/ std::string* error_msg) {
+  fprintf(stderr, "[WESTLAKE-TOPO] AddImageSpaces entered\n"); fflush(stderr);
   std::vector<std::vector<std::unique_ptr<const DexFile>>> dex_files_by_space_index;
   for (const gc::space::ImageSpace* space : spaces) {
     std::vector<std::unique_ptr<const DexFile>> space_dex_files;
@@ -2720,6 +3047,9 @@ bool ClassLinker::AddImageSpaces(ArrayRef<gc::space::ImageSpace*> spaces,
     // Append opened dex files at the end.
     std::move(space_dex_files.begin(), space_dex_files.end(), std::back_inserter(*dex_files));
   }
+  // WESTLAKE 2026-07-22 (§195): InitFromBootImage is never executed in this configuration, so the
+  // class-status demotion is driven from here — the real image-registration path.
+  WestlakeDemoteImageClasses(this, Thread::Current());
   return true;
 }
 
@@ -3340,8 +3670,7 @@ bool ClassLinker::FindClassInBaseDexClassLoader(Thread* self,
              android::base::StartsWith(desc, "Landroidx/savedstate/")) ||
             android::base::StartsWith(desc, "Lkotlin/") ||
             android::base::StartsWith(desc, "Lkotlinx/") ||
-            android::base::StartsWith(desc, "Ldagger/") ||
-            android::base::StartsWith(desc, "Lcom/google/android/material/"));
+            android::base::StartsWith(desc, "Ldagger/"));
   };
   // Termination case: boot class loader.
   if (IsBootClassLoader(class_loader.Get())) {
@@ -3510,8 +3839,27 @@ bool ClassLinker::FindClassInBaseDexClassLoaderClassPath(
   const DexFile* dex_file = nullptr;
   const dex::ClassDef* class_def = nullptr;
   ObjPtr<mirror::Class> ret;
+  const bool westlake_webview_find_diag =
+      descriptor != nullptr &&
+      strcmp(descriptor, "Lorg/chromium/net/NetworkActiveNotifier;") == 0;
+  if (UNLIKELY(westlake_webview_find_diag)) {
+    fprintf(stderr,
+            "[WESTLAKE-WEBVIEW-DEXPATH] enter loader=%p descriptor=%s\n",
+            class_loader.Get(),
+            descriptor);
+    fflush(stderr);
+  }
   auto find_class_def = [&](const DexFile* cp_dex_file) REQUIRES_SHARED(Locks::mutator_lock_) {
     const dex::ClassDef* cp_class_def = OatDexFile::FindClassDef(*cp_dex_file, descriptor, hash);
+    if (UNLIKELY(westlake_webview_find_diag)) {
+      fprintf(stderr,
+              "[WESTLAKE-WEBVIEW-DEXPATH] loader=%p dex=%p location=%s class_def=%p\n",
+              class_loader.Get(),
+              cp_dex_file,
+              cp_dex_file->GetLocation().c_str(),
+              cp_class_def);
+      fflush(stderr);
+    }
     if (cp_class_def != nullptr) {
       dex_file = cp_dex_file;
       class_def = cp_class_def;
@@ -3525,6 +3873,19 @@ bool ClassLinker::FindClassInBaseDexClassLoaderClassPath(
     *result = DefineClass(self, descriptor, hash, class_loader, *dex_file, *class_def);
     if (UNLIKELY(*result == nullptr)) {
       CHECK(self->IsExceptionPending()) << descriptor;
+      if (UNLIKELY(westlake_webview_find_diag)) {
+        ObjPtr<mirror::Throwable> exception = self->GetException();
+        const std::string exception_dump =
+            exception != nullptr ? exception->Dump() : std::string("<null exception>");
+        fprintf(stderr,
+                "[WESTLAKE-WEBVIEW-DEFINE] failed descriptor=%s loader=%p dex=%s "
+                "exception=%s\n",
+                descriptor,
+                class_loader.Get(),
+                dex_file->GetLocation().c_str(),
+                exception_dump.c_str());
+        fflush(stderr);
+      }
       FilterDexFileCaughtExceptions(self, this);
     } else {
       DCHECK(!self->IsExceptionPending());
@@ -3537,33 +3898,113 @@ bool ClassLinker::FindClassInBaseDexClassLoaderClassPath(
 ObjPtr<mirror::Class> ClassLinker::FindClass(Thread* self,
                                              const char* descriptor,
                                              Handle<mirror::ClassLoader> class_loader) {
+  const bool pfc_find_trace = false;
+  if (UNLIKELY(pfc_find_trace)) {
+    fprintf(stderr,
+            "[PFCUT-TYPE] FindClass enter descriptor=%s class_loader=%p pending=%d\n",
+            descriptor,
+            class_loader.Get(),
+            self != nullptr ? self->IsExceptionPending() : -1);
+    fflush(stderr);
+  }
   DCHECK_NE(*descriptor, '\0') << "descriptor is empty string";
   DCHECK(self != nullptr);
   self->AssertNoPendingException();
   self->PoisonObjectPointers();  // For DefineClass, CreateArrayClass, etc...
+  if (UNLIKELY(pfc_find_trace)) {
+    fprintf(stderr,
+            "[PFCUT-TYPE] FindClass after poison descriptor=%s\n",
+            descriptor);
+    fflush(stderr);
+  }
   if (descriptor[1] == '\0') {
     // only the descriptors of primitive types should be 1 character long, also avoid class lookup
     // for primitive classes that aren't backed by dex files.
     return FindPrimitiveClass(descriptor[0]);
   }
   const size_t hash = ComputeModifiedUtf8Hash(descriptor);
+  if (UNLIKELY(pfc_find_trace)) {
+    fprintf(stderr,
+            "[PFCUT-TYPE] FindClass hash descriptor=%s hash=%zu\n",
+            descriptor,
+            hash);
+    fflush(stderr);
+  }
   // Find the class in the loaded classes table.
   ObjPtr<mirror::Class> klass = LookupClass(self, descriptor, hash, class_loader.Get());
+  if (UNLIKELY(pfc_find_trace)) {
+    fprintf(stderr,
+            "[PFCUT-TYPE] FindClass after LookupClass descriptor=%s klass=%p pending=%d\n",
+            descriptor,
+            klass.Ptr(),
+            self->IsExceptionPending());
+    fflush(stderr);
+  }
   if (klass != nullptr) {
+    if (UNLIKELY(pfc_find_trace)) {
+      fprintf(stderr,
+              "[PFCUT-TYPE] FindClass before EnsureResolved descriptor=%s klass=%p\n",
+              descriptor,
+              klass.Ptr());
+      fflush(stderr);
+    }
     return EnsureResolved(self, descriptor, klass);
   }
   // Class is not yet loaded.
   if (descriptor[0] != '[' && class_loader == nullptr) {
     // Non-array class and the boot class loader, search the boot class path.
+    if (UNLIKELY(pfc_find_trace)) {
+      fprintf(stderr,
+              "[PFCUT-TYPE] FindClass before FindInClassPath descriptor=%s boot_cp_size=%zu\n",
+              descriptor,
+              boot_class_path_.size());
+      fflush(stderr);
+    }
     ClassPathEntry pair = FindInClassPath(descriptor, hash, boot_class_path_);
+    if (UNLIKELY(pfc_find_trace)) {
+      fprintf(stderr,
+              "[PFCUT-TYPE] FindClass after FindInClassPath descriptor=%s dex_file=%p "
+              "class_def=%p pending=%d\n",
+              descriptor,
+              pair.first,
+              pair.second,
+              self->IsExceptionPending());
+      fflush(stderr);
+    }
     if (pair.second != nullptr) {
-      return DefineClass(self,
-                         descriptor,
-                         hash,
-                         ScopedNullHandle<mirror::ClassLoader>(),
-                         *pair.first,
-                         *pair.second);
+      if (UNLIKELY(pfc_find_trace)) {
+        fprintf(stderr,
+                "[PFCUT-TYPE] FindClass before DefineClass descriptor=%s dex_file=%p\n",
+                descriptor,
+                pair.first);
+        fflush(stderr);
+      }
+      ObjPtr<mirror::Class> defined = DefineClass(self,
+                                                  descriptor,
+                                                  hash,
+                                                  ScopedNullHandle<mirror::ClassLoader>(),
+                                                  *pair.first,
+                                                  *pair.second);
+      if (UNLIKELY(pfc_find_trace)) {
+        fprintf(stderr,
+                "[PFCUT-TYPE] FindClass after DefineClass descriptor=%s klass=%p pending=%d\n",
+                descriptor,
+                defined.Ptr(),
+                self->IsExceptionPending());
+        fflush(stderr);
+      }
+      return defined;
     } else {
+      const bool pfc_boot_ncdfe_trace = false;
+      static int pfc_boot_ncdfe_log_count = 0;
+      if (UNLIKELY(pfc_boot_ncdfe_trace && pfc_boot_ncdfe_log_count < 200)) {
+        ++pfc_boot_ncdfe_log_count;
+        fprintf(stderr,
+                "[PFCUT-NCDFE] boot class path miss descriptor=%s count=%d\n",
+                descriptor,
+                pfc_boot_ncdfe_log_count);
+        fflush(stderr);
+      }
       // The boot class loader is searched ahead of the application class loader, failures are
       // expected and will be wrapped in a ClassNotFoundException. Use the pre-allocated error to
       // trigger the chaining with a proper stack trace.
@@ -3765,11 +4206,40 @@ ObjPtr<mirror::Class> ClassLinker::DefineClass(Thread* self,
                                                Handle<mirror::ClassLoader> class_loader,
                                                const DexFile& dex_file,
                                                const dex::ClassDef& dex_class_def) {
+  const bool pfc_define_trace = false;
+  if (UNLIKELY(pfc_define_trace)) {
+    fprintf(stderr,
+            "[PFCUT-TYPE] DefineClass enter descriptor=%s hash=%zu class_loader=%p "
+            "dex_file=%p class_def=%p pending=%d\n",
+            descriptor,
+            hash,
+            class_loader.Get(),
+            &dex_file,
+            &dex_class_def,
+            self != nullptr ? self->IsExceptionPending() : -1);
+    fflush(stderr);
+  }
   ScopedDefiningClass sdc(self);
+  if (UNLIKELY(pfc_define_trace)) {
+    fprintf(stderr, "[PFCUT-TYPE] DefineClass after ScopedDefiningClass\n");
+    fflush(stderr);
+  }
   StackHandleScope<3> hs(self);
+  if (UNLIKELY(pfc_define_trace)) {
+    fprintf(stderr, "[PFCUT-TYPE] DefineClass after StackHandleScope\n");
+    fflush(stderr);
+  }
   metrics::AutoTimer timer{GetMetrics()->ClassLoadingTotalTime()};
   metrics::AutoTimer timeDelta{GetMetrics()->ClassLoadingTotalTimeDelta()};
+  if (UNLIKELY(pfc_define_trace)) {
+    fprintf(stderr, "[PFCUT-TYPE] DefineClass after metrics timers\n");
+    fflush(stderr);
+  }
   auto klass = hs.NewHandle<mirror::Class>(nullptr);
+  if (UNLIKELY(pfc_define_trace)) {
+    fprintf(stderr, "[PFCUT-TYPE] DefineClass after klass handle\n");
+    fflush(stderr);
+  }
 
   // Load the class from the dex file.
   if (UNLIKELY(!init_done_)) {
@@ -3816,13 +4286,28 @@ ObjPtr<mirror::Class> ClassLinker::DefineClass(Thread* self,
   }
 
   ScopedTrace trace(descriptor);
+  if (UNLIKELY(pfc_define_trace)) {
+    fprintf(stderr, "[PFCUT-TYPE] DefineClass after ScopedTrace\n");
+    fflush(stderr);
+  }
   if (klass == nullptr) {
     // Allocate a class with the status of not ready.
     // Interface object should get the right size here. Regular class will
     // figure out the right size later and be replaced with one of the right
     // size when the class becomes resolved.
     if (CanAllocClass()) {
+      if (UNLIKELY(pfc_define_trace)) {
+        fprintf(stderr, "[PFCUT-TYPE] DefineClass before AllocClass\n");
+        fflush(stderr);
+      }
       klass.Assign(AllocClass(self, SizeOfClassWithoutEmbeddedTables(dex_file, dex_class_def)));
+      if (UNLIKELY(pfc_define_trace)) {
+        fprintf(stderr,
+                "[PFCUT-TYPE] DefineClass after AllocClass klass=%p pending=%d\n",
+                klass.Get(),
+                self->IsExceptionPending());
+        fflush(stderr);
+      }
     } else {
       return sdc.Finish(nullptr);
     }
@@ -3844,17 +4329,44 @@ ObjPtr<mirror::Class> ClassLinker::DefineClass(Thread* self,
                                                             dex_class_def,
                                                             &new_dex_file,
                                                             &new_class_def);
+  if (UNLIKELY(pfc_define_trace)) {
+    fprintf(stderr,
+            "[PFCUT-TYPE] DefineClass after ClassPreDefine new_dex_file=%p new_class_def=%p "
+            "pending=%d\n",
+            new_dex_file,
+            new_class_def,
+            self->IsExceptionPending());
+    fflush(stderr);
+  }
   // Check to see if an exception happened during runtime callbacks. Return if so.
   if (self->IsExceptionPending()) {
     return sdc.Finish(nullptr);
   }
+  if (UNLIKELY(pfc_define_trace)) {
+    fprintf(stderr, "[PFCUT-TYPE] DefineClass before RegisterDexFile\n");
+    fflush(stderr);
+  }
   ObjPtr<mirror::DexCache> dex_cache = RegisterDexFile(*new_dex_file, class_loader.Get());
+  if (UNLIKELY(pfc_define_trace)) {
+    fprintf(stderr,
+            "[PFCUT-TYPE] DefineClass after RegisterDexFile dex_cache=%p pending=%d\n",
+            dex_cache.Ptr(),
+            self->IsExceptionPending());
+    fflush(stderr);
+  }
   if (dex_cache == nullptr) {
     self->AssertPendingException();
     return sdc.Finish(nullptr);
   }
   klass->SetDexCache(dex_cache);
   SetupClass(*new_dex_file, *new_class_def, klass, class_loader.Get());
+  if (UNLIKELY(pfc_define_trace)) {
+    fprintf(stderr,
+            "[PFCUT-TYPE] DefineClass after SetupClass klass=%p status=%d\n",
+            klass.Get(),
+            static_cast<int>(klass->GetStatus()));
+    fflush(stderr);
+  }
 
   // Mark the string class by setting its access flag.
   if (UNLIKELY(!init_done_)) {
@@ -3870,6 +4382,14 @@ ObjPtr<mirror::Class> ClassLinker::DefineClass(Thread* self,
 
   // Add the newly loaded class to the loaded classes table.
   ObjPtr<mirror::Class> existing = InsertClass(descriptor, klass.Get(), hash);
+  if (UNLIKELY(pfc_define_trace)) {
+    fprintf(stderr,
+            "[PFCUT-TYPE] DefineClass after InsertClass existing=%p klass=%p pending=%d\n",
+            existing.Ptr(),
+            klass.Get(),
+            self->IsExceptionPending());
+    fflush(stderr);
+  }
   if (existing != nullptr) {
     // We failed to insert because we raced with another thread. Calling EnsureResolved may cause
     // this thread to block.
@@ -3881,6 +4401,13 @@ ObjPtr<mirror::Class> ClassLinker::DefineClass(Thread* self,
   // other reason is that the field roots are only visited from the class table. So we need to be
   // inserted before we allocate / fill in these fields.
   LoadClass(self, *new_dex_file, *new_class_def, klass);
+  if (UNLIKELY(pfc_define_trace)) {
+    fprintf(stderr,
+            "[PFCUT-TYPE] DefineClass after LoadClass pending=%d status=%d\n",
+            self->IsExceptionPending(),
+            static_cast<int>(klass->GetStatus()));
+    fflush(stderr);
+  }
   if (self->IsExceptionPending()) {
     VLOG(class_linker) << self->GetException()->Dump();
     // An exception occured during load, set status to erroneous while holding klass' lock in case
@@ -3893,6 +4420,10 @@ ObjPtr<mirror::Class> ClassLinker::DefineClass(Thread* self,
 
   // Finish loading (if necessary) by finding parents
   CHECK(!klass->IsLoaded());
+  if (UNLIKELY(pfc_define_trace)) {
+    fprintf(stderr, "[PFCUT-TYPE] DefineClass before LoadSuperAndInterfaces\n");
+    fflush(stderr);
+  }
   if (!LoadSuperAndInterfaces(klass, *new_dex_file)) {
     // Loading failed.
     if (!klass->IsErroneous()) {
@@ -3901,10 +4432,24 @@ ObjPtr<mirror::Class> ClassLinker::DefineClass(Thread* self,
     return sdc.Finish(nullptr);
   }
   CHECK(klass->IsLoaded());
+  if (UNLIKELY(pfc_define_trace)) {
+    fprintf(stderr,
+            "[PFCUT-TYPE] DefineClass after LoadSuperAndInterfaces status=%d\n",
+            static_cast<int>(klass->GetStatus()));
+    fflush(stderr);
+  }
 
   // At this point the class is loaded. Publish a ClassLoad event.
   // Note: this may be a temporary class. It is a listener's responsibility to handle this.
+  if (UNLIKELY(pfc_define_trace)) {
+    fprintf(stderr, "[PFCUT-TYPE] DefineClass before ClassLoad callback\n");
+    fflush(stderr);
+  }
   Runtime::Current()->GetRuntimeCallbacks()->ClassLoad(klass);
+  if (UNLIKELY(pfc_define_trace)) {
+    fprintf(stderr, "[PFCUT-TYPE] DefineClass after ClassLoad callback\n");
+    fflush(stderr);
+  }
 
   // Link the class (if necessary)
   CHECK(!klass->IsResolved());
@@ -3912,12 +4457,23 @@ ObjPtr<mirror::Class> ClassLinker::DefineClass(Thread* self,
   auto interfaces = hs.NewHandle<mirror::ObjectArray<mirror::Class>>(nullptr);
 
   MutableHandle<mirror::Class> h_new_class = hs.NewHandle<mirror::Class>(nullptr);
+  if (UNLIKELY(pfc_define_trace)) {
+    fprintf(stderr, "[PFCUT-TYPE] DefineClass before LinkClass\n");
+    fflush(stderr);
+  }
   if (!LinkClass(self, descriptor, klass, interfaces, &h_new_class)) {
     // Linking failed.
     if (!klass->IsErroneous()) {
       mirror::Class::SetStatus(klass, ClassStatus::kErrorUnresolved, self);
     }
     return sdc.Finish(nullptr);
+  }
+  if (UNLIKELY(pfc_define_trace)) {
+    fprintf(stderr,
+            "[PFCUT-TYPE] DefineClass after LinkClass h_new_class=%p pending=%d\n",
+            h_new_class.Get(),
+            self->IsExceptionPending());
+    fflush(stderr);
   }
   self->AssertNoPendingException();
   CHECK(h_new_class != nullptr) << descriptor;
@@ -4167,10 +4723,47 @@ inline void ClassLinker::LinkCode(ArtMethod* method,
   runtime->GetInstrumentation()->InitializeMethodsCode(method, quick_code);
 
   if (method->IsNative()) {
-    // Set up the dlsym lookup stub. Do not go through `UnregisterNative()`
-    // as the extra processing for @CriticalNative is not needed yet.
-    method->SetEntryPointFromJni(
-        method->IsCriticalNative() ? GetJniDlsymLookupCriticalStub() : GetJniDlsymLookupStub());
+    /* PF-arch-019 (2026-05-05): preserve already-registered JNI bindings.
+     * If a previous JNI_OnLoad/RegisterNatives call already bound this method
+     * to a valid native (non-stub, non-stale), don't clobber it. Otherwise,
+     * install the appropriate dlsym lookup stub. */
+    const void* existing_jni = method->GetEntryPointFromJni();
+    bool preserve_existing =
+        existing_jni != nullptr &&
+        !IsJniDlsymLookupStub(existing_jni) &&
+        !IsJniDlsymLookupCriticalStub(existing_jni) &&
+        !PFCutIsStaleNativeEntry(existing_jni);
+    if (!preserve_existing) {
+      // Set up the dlsym lookup stub. Do not go through `UnregisterNative()`
+      // as the extra processing for @CriticalNative is not needed yet.
+      method->SetEntryPointFromJni(
+          method->IsCriticalNative() ? GetJniDlsymLookupCriticalStub() : GetJniDlsymLookupStub());
+    }
+
+    // PF-arch-011 (2026-05-11): close the stale-native-entry SIGBUS gap.
+    // RegisterNative (line 621) and GetRegisteredNative (lines 683+) repair
+    // sentinels only when ART explicitly queries them. JIT/AOT/Nterp glue
+    // and art_quick_invoke_stub jump to EntryPointFromQuickCompiledCode
+    // directly, bypassing ArtMethod::Invoke's PFCut gates. Result: SIGBUS
+    // at pc=0 / x16=ArtMethod-with-sentinel-entry during class-load
+    // callbacks that touch freshly-linked native methods.
+    //
+    // Mirror the repair pattern from RegisterNative on both freshly-set
+    // entry points right here at the only chokepoint where LinkCode writes
+    // them. Catches every native method ever linked.
+    const void* quick_entry = method->GetEntryPointFromQuickCompiledCode();
+    const void* jni_entry = method->GetEntryPointFromJni();
+    if (PFCutIsStaleNativeEntry(quick_entry) || PFCutIsStaleNativeEntry(jni_entry)) {
+      const void* standalone = PFCutResolveStandaloneNative(method);
+      if (standalone != nullptr) {
+        method->SetEntryPointFromJni(standalone);
+        method->SetEntryPointFromQuickCompiledCode(GetQuickGenericJniStub());
+      } else {
+        method->SetEntryPointFromJni(method->IsCriticalNative()
+            ? GetJniDlsymLookupCriticalStub() : GetJniDlsymLookupStub());
+        method->SetEntryPointFromQuickCompiledCode(GetQuickGenericJniStub());
+      }
+    }
   }
 }
 
@@ -6230,7 +6823,22 @@ bool ClassLinker::InitializeClass(Thread* self,
     if (clinit != nullptr) {
       CHECK(can_init_statics);
       JValue result;
+      {  // WESTLAKE §200: does <clinit> actually execute for the suspect class?
+        std::string wl_d;
+        const char* wl_p = klass->GetDescriptor(&wl_d);
+        if (wl_p != nullptr && strstr(wl_p, "BufferedInputStream") != nullptr) {
+          fprintf(stderr, "[WESTLAKE-RUNCLINIT] enter %s\n", wl_p); fflush(stderr);
+        }
+      }
       clinit->Invoke(self, nullptr, 0, &result, "V");
+      {
+        std::string wl_d2;
+        const char* wl_p2 = klass->GetDescriptor(&wl_d2);
+        if (wl_p2 != nullptr && strstr(wl_p2, "BufferedInputStream") != nullptr) {
+          fprintf(stderr, "[WESTLAKE-RUNCLINIT] exit %s exc=%d\n", wl_p2,
+                  self->IsExceptionPending() ? 1 : 0); fflush(stderr);
+        }
+      }
     }
   }
   self->AllowThreadSuspension();
@@ -6255,6 +6863,18 @@ bool ClassLinker::InitializeClass(Thread* self,
         LOG(WARNING) << "Tolerating clinit failure for " << desc
                      << ": " << self->GetException()->Dump();
         self->ClearException();
+        // §668b: the tolerate path `goto clinit_done` JUMPS OVER the probe below, so a tolerated
+        // class never printed. Log the same fields here.
+        {
+          static int wl_t_state = -1;
+          if (wl_t_state < 0) {
+            wl_t_state = (access("/data/local/tmp/asx/CINIT", F_OK) == 0) ? 1 : 0;
+          }
+          if (wl_t_state == 1) {
+            fprintf(stderr, "[WESTLAKE-668] TOLERATED %s tid=%d\n", desc, self->GetTid());
+            fflush(stderr);
+          }
+        }
         callback = MarkClassInitialized(self, klass);
         success = true;
         goto clinit_done;
@@ -6286,6 +6906,40 @@ bool ClassLinker::InitializeClass(Thread* self,
         std::string temp;
         LOG(INFO) << "Initialized class " << klass->GetDescriptor(&temp) << " from " <<
             klass->GetLocation();
+      }
+    }
+  }
+  // WESTLAKE §668 (2026-08-16): why is a static of a SUCCESSFULLY-initialised class null?
+  // Toutiao now dies at `VarHandle.acquireFence()` -> `sun.misc.Unsafe.loadFence()` on a NULL
+  // receiver. `VarHandle.<clinit>` is just
+  //     getUnsafe() -> SPUT VarHandle.UNSAFE
+  // and `sun.misc.Unsafe.<clinit>` is `new Unsafe()` -> SPUT THE_ONE -> SPUT theUnsafe,
+  // so UNSAFE can only be null if THE_ONE was still null when getUnsafe() ran — i.e. a
+  // CIRCULAR INITIALISATION (the tolerate-comment above literally names "VarHandle <-> AccessType
+  // enums, AtomicInteger -> VarHandle"). Neither class appears in the tolerated list, so nothing
+  // logs today. Print the ORDER and the resulting static values for the classes on this path.
+  // File-gated (env vars never reach appspawn-x children); costs one strcmp per class init.
+  {
+    static int wl_cinit_state = -1;
+    if (wl_cinit_state < 0) {
+      wl_cinit_state = (access("/data/local/tmp/asx/CINIT", F_OK) == 0) ? 1 : 0;
+    }
+    if (wl_cinit_state == 1 && klass != nullptr) {
+      std::string wl_tmp;
+      const char* wl_d = klass->GetDescriptor(&wl_tmp);
+      if (wl_d != nullptr &&
+          (strcmp(wl_d, "Ljava/lang/invoke/VarHandle;") == 0 ||
+           strcmp(wl_d, "Lsun/misc/Unsafe;") == 0 ||
+           strcmp(wl_d, "Ljdk/internal/misc/Unsafe;") == 0)) {
+        const char* wl_f = (strcmp(wl_d, "Ljava/lang/invoke/VarHandle;") == 0) ? "UNSAFE" : "THE_ONE";
+        ArtField* wl_sf = klass->FindDeclaredStaticField(
+            wl_f, (strcmp(wl_f, "UNSAFE") == 0) ? "Lsun/misc/Unsafe;" : "Lsun/misc/Unsafe;");
+        fprintf(stderr,
+                "[WESTLAKE-668] clinit_done %s success=%d status=%d %s=%p tid=%d\n",
+                wl_d, success ? 1 : 0, static_cast<int>(klass->GetStatus()), wl_f,
+                wl_sf != nullptr ? wl_sf->GetObject(klass.Get()).Ptr() : nullptr,
+                self->GetTid());
+        fflush(stderr);
       }
     }
   }
@@ -6629,6 +7283,93 @@ bool ClassLinker::EnsureInitialized(Thread* self,
                                     bool can_init_parents) {
   DCHECK(c != nullptr);
 
+  // WESTLAKE §202: some boot-image classes arrive already kVisiblyInitialized even though their
+  // <clinit> was never invoked in ANY process (proved in §200: the invoke site never fires in the
+  // zygote or the child; §201: SetStatusInternal is never called for them at all -- the status
+  // comes baked into the image).  Their `static final` reference fields therefore stay null
+  // forever and ART never reports an initialization failure.  On first touch, demote such a class
+  // back to kVerified so the normal path below re-runs <clinit> for real.
+  //
+  // Deliberately allow-listed, NOT a general heuristic: a null static reference field is perfectly
+  // legal in general, so "initialized but has a null static ref" cannot be used as a global test.
+  {
+    static pid_t wl_rpid = 0;
+    static bool wl_done = false;
+    if (wl_rpid != getpid()) { wl_rpid = getpid(); wl_done = false; }
+    if (!wl_done && c->IsInitialized() && c->NumStaticFields() > 0) {
+      std::string wl_rd;
+      const char* wl_rdesc = c->GetDescriptor(&wl_rd);
+      if (wl_rdesc != nullptr && strcmp(wl_rdesc, "Ljava/io/BufferedInputStream;") == 0) {
+        bool needs_repair = false;
+        for (ArtField& f : c->GetSFields()) {
+          if (strcmp(f.GetName(), "bufUpdater") == 0 && f.GetObject(c.Get()) == nullptr) {
+            needs_repair = true;
+          }
+        }
+        wl_done = true;
+        ArtMethod* wl_clinit = c->FindClassInitializer(image_pointer_size_);
+        fprintf(stderr, "[WESTLAKE-REPAIR] %s needs_repair=%d clinit=%p nsfields=%u\n",
+                wl_rdesc, needs_repair ? 1 : 0, reinterpret_cast<void*>(wl_clinit),
+                c->NumStaticFields());
+        fflush(stderr);
+        if (needs_repair && wl_clinit != nullptr) {
+          // ART forbids moving a class status backwards ("Unexpected change back of class status",
+          // class.cc:170 -> abort), so we cannot demote to kVerified and let the normal path re-run
+          // <clinit>.  Instead invoke <clinit> directly, exactly as InitializeClass does.  This is
+          // safe precisely because it never ran in this process (proved in §200).
+          fprintf(stderr, "[WESTLAKE-REPAIR] %s initialized but bufUpdater==null;"
+                          " invoking <clinit> directly\n", wl_rdesc);
+          fflush(stderr);
+          JValue wl_result;
+          wl_clinit->Invoke(self, nullptr, 0, &wl_result, "V");
+          if (self->IsExceptionPending()) {
+            fprintf(stderr, "[WESTLAKE-REPAIR] <clinit> threw; clearing\n");
+            self->ClearException();
+          }
+          for (ArtField& f2 : c->GetSFields()) {
+            if (strcmp(f2.GetName(), "bufUpdater") == 0) {
+              fprintf(stderr, "[WESTLAKE-REPAIR] after <clinit> bufUpdater=%p\n",
+                      reinterpret_cast<void*>(f2.GetObject(c.Get()).Ptr()));
+            }
+          }
+          fflush(stderr);
+        }
+      }
+    }
+  }
+
+  // WESTLAKE 2026-07-22 (§192): the boot image is built --compiler-filter=verify, which never runs
+  // <clinit>. If image classes nonetheless arrive already-Initialized, we skip <clinit> forever and
+  // every `static final` stays null (e.g. BufferedInputStream.bufUpdater, §191) with NO clinit
+  // failure reported. Log the status of the classes we care about on first touch.
+  {
+    // WESTLAKE §198: reset the budget per-process — the zygote spends it before the fork.
+    static pid_t wl_pid = 0;
+    static int wl_ei = 0;
+    if (wl_pid != getpid()) { wl_pid = getpid(); wl_ei = 0; }
+    if (wl_ei < 25) {
+      std::string wl_d;
+      const char* wl_desc = c->GetDescriptor(&wl_d);
+      if (wl_desc != nullptr && strstr(wl_desc, "BufferedInputStream") != nullptr) {
+        wl_ei++;
+        fprintf(stderr,
+                "[WESTLAKE-EINIT] %s klass=%p loader=%p IsInitialized=%d status=%d\n",
+                wl_desc, reinterpret_cast<void*>(c.Get()), reinterpret_cast<void*>(c->GetClassLoader().Ptr()),
+                c->IsInitialized() ? 1 : 0, static_cast<int>(c->GetStatus()));
+        bool wl_null = false;
+        for (ArtField& f : c->GetSFields()) {
+          if (strcmp(f.GetName(), "bufUpdater") == 0) {
+            ObjPtr<mirror::Object> v = f.GetObject(c.Get());
+            wl_null = (v == nullptr);
+            fprintf(stderr, "[WESTLAKE-FIELD] bufUpdater offset=%u value=%p\n",
+                    f.GetOffset().Uint32Value(), reinterpret_cast<void*>(v.Ptr()));
+            fflush(stderr);
+          }
+        }
+        fflush(stderr);
+      }
+    }
+  }
   if (c->IsInitialized()) {
     // If we've seen an initialized but not visibly initialized class
     // many times, request visible initialization.
@@ -6739,31 +7480,101 @@ bool ClassLinker::LinkClass(Thread* self,
                             Handle<mirror::Class> klass,
                             Handle<mirror::ObjectArray<mirror::Class>> interfaces,
                             MutableHandle<mirror::Class>* h_new_class_out) {
+  const bool pfc_link_trace = false;
+  if (UNLIKELY(pfc_link_trace)) {
+    fprintf(stderr,
+            "[PFCUT-LINK] LinkClass enter descriptor=%s klass=%p status=%d flags=0x%x\n",
+            descriptor,
+            klass.Get(),
+            static_cast<int>(klass->GetStatus()),
+            klass->GetAccessFlags());
+    fflush(stderr);
+  }
   CHECK_EQ(ClassStatus::kLoaded, klass->GetStatus());
 
+  if (UNLIKELY(pfc_link_trace)) {
+    fprintf(stderr, "[PFCUT-LINK] LinkClass before LinkSuperClass\n");
+    fflush(stderr);
+  }
   if (!LinkSuperClass(klass)) {
     return false;
+  }
+  if (UNLIKELY(pfc_link_trace)) {
+    fprintf(stderr,
+            "[PFCUT-LINK] LinkClass after LinkSuperClass super=%p\n",
+            klass->GetSuperClass().Ptr());
+    fflush(stderr);
   }
   ArtMethod* imt_data[ImTable::kSize];
   // If there are any new conflicts compared to super class.
   bool new_conflict = false;
   std::fill_n(imt_data, arraysize(imt_data), Runtime::Current()->GetImtUnimplementedMethod());
+  if (UNLIKELY(pfc_link_trace)) {
+    fprintf(stderr,
+            "[PFCUT-LINK] LinkClass before LinkMethods direct=%u virtual=%u\n",
+            klass->NumDirectMethods(),
+            klass->NumVirtualMethods());
+    fflush(stderr);
+  }
   if (!LinkMethods(self, klass, interfaces, &new_conflict, imt_data)) {
     return false;
+  }
+  if (UNLIKELY(pfc_link_trace)) {
+    fprintf(stderr,
+            "[PFCUT-LINK] LinkClass after LinkMethods new_conflict=%d vtable=%p\n",
+            new_conflict,
+            klass->GetVTable().Ptr());
+    fflush(stderr);
+  }
+  if (UNLIKELY(pfc_link_trace)) {
+    fprintf(stderr, "[PFCUT-LINK] LinkClass before LinkInstanceFields\n");
+    fflush(stderr);
   }
   if (!LinkInstanceFields(self, klass)) {
     return false;
   }
+  if (UNLIKELY(pfc_link_trace)) {
+    fprintf(stderr, "[PFCUT-LINK] LinkClass after LinkInstanceFields\n");
+    fflush(stderr);
+  }
   size_t class_size;
+  if (UNLIKELY(pfc_link_trace)) {
+    fprintf(stderr, "[PFCUT-LINK] LinkClass before LinkStaticFields\n");
+    fflush(stderr);
+  }
   if (!LinkStaticFields(self, klass, &class_size)) {
     return false;
   }
+  if (UNLIKELY(pfc_link_trace)) {
+    fprintf(stderr,
+            "[PFCUT-LINK] LinkClass after LinkStaticFields class_size=%zu\n",
+            class_size);
+    fflush(stderr);
+  }
   class_size =
       mirror::Class::AdjustClassSizeForReferenceOffsetBitmapDuringLinking(klass.Get(), class_size);
+  if (UNLIKELY(pfc_link_trace)) {
+    fprintf(stderr,
+            "[PFCUT-LINK] LinkClass after AdjustClassSize class_size=%zu temp=%d\n",
+            class_size,
+            klass->IsTemp());
+    fflush(stderr);
+  }
+  if (!init_done_ && descriptor != nullptr && strcmp(descriptor, "Ljava/lang/Class;") == 0 &&
+      klass->GetClassSize() > class_size) {
+    LOG(WARNING) << "Keeping preallocated java.lang.Class native class size "
+                 << klass->GetClassSize() << " over DEX-linked size " << class_size
+                 << " on standalone guest path";
+    class_size = klass->GetClassSize();
+  }
   CHECK_EQ(ClassStatus::kLoaded, klass->GetStatus());
 
   ImTable* imt = nullptr;
   if (klass->ShouldHaveImt()) {
+    if (UNLIKELY(pfc_link_trace)) {
+      fprintf(stderr, "[PFCUT-LINK] LinkClass before IMT setup\n");
+      fflush(stderr);
+    }
     // If there are any new conflicts compared to the super class we can not make a copy. There
     // can be cases where both will have a conflict method at the same slot without having the same
     // set of conflicts. In this case, we can not share the IMT since the conflict table slow path
@@ -6793,8 +7604,16 @@ bool ClassLinker::LinkClass(Thread* self,
       imt->Populate(imt_data, image_pointer_size_);
     }
   }
+  if (UNLIKELY(pfc_link_trace)) {
+    fprintf(stderr, "[PFCUT-LINK] LinkClass after IMT setup imt=%p\n", imt);
+    fflush(stderr);
+  }
 
   if (!klass->IsTemp() || (!init_done_ && klass->GetClassSize() == class_size)) {
+    if (UNLIKELY(pfc_link_trace)) {
+      fprintf(stderr, "[PFCUT-LINK] LinkClass reuse class path\n");
+      fflush(stderr);
+    }
     // We don't need to retire this class as it has no embedded tables or it was created the
     // correct size during class linker initialization.
     CHECK_EQ(klass->GetClassSize(), class_size) << klass->PrettyDescriptor();
@@ -6819,6 +7638,13 @@ bool ClassLinker::LinkClass(Thread* self,
     mirror::Class::SetStatus(klass, ClassStatus::kResolved, self);
     h_new_class_out->Assign(klass.Get());
   } else {
+    if (UNLIKELY(pfc_link_trace)) {
+      fprintf(stderr,
+              "[PFCUT-LINK] LinkClass copy temp path old_size=%u new_size=%zu\n",
+              klass->GetClassSize(),
+              class_size);
+      fflush(stderr);
+    }
     CHECK(!klass->IsResolved());
     // Retire the temporary class and create the correctly sized resolved class.
     StackHandleScope<1> hs(self);
@@ -6868,6 +7694,13 @@ bool ClassLinker::LinkClass(Thread* self,
     mirror::Class::SetStatus(h_new_class, ClassStatus::kResolved, self);
     // Return the new class.
     h_new_class_out->Assign(h_new_class.Get());
+  }
+  if (UNLIKELY(pfc_link_trace)) {
+    fprintf(stderr,
+            "[PFCUT-LINK] LinkClass exit h_new=%p pending=%d\n",
+            h_new_class_out->Get(),
+            self->IsExceptionPending());
+    fflush(stderr);
   }
   return true;
 }
@@ -7168,6 +8001,37 @@ void ClassLinker::SetIMTRef(ArtMethod* unimplemented_method,
 }
 
 void ClassLinker::FillIMTAndConflictTables(ObjPtr<mirror::Class> klass) {
+  // WESTLAKE 2026-07-22 (§134/§137): the app SIGSEGVs reading a corrupt ArtMethod* element out of
+  // an IfTable interface METHOD ARRAY at dispatch time. Linking completes normally, so scan each
+  // freshly-linked class's method arrays here and report the FIRST element that is not a plausible
+  // pointer. Gated by WESTLAKE_IFT_SCAN so it costs nothing when off.
+  if (UNLIKELY(getenv("WESTLAKE_IFT_SCAN") != nullptr) && klass->GetIfTable() != nullptr) {
+    ObjPtr<mirror::IfTable> ift = klass->GetIfTable();
+    const PointerSize ps = image_pointer_size_;
+    for (int32_t i = 0, cnt = ift->Count(); i < cnt; ++i) {
+      ObjPtr<mirror::PointerArray> ma = ift->GetMethodArrayOrNull(i);
+      if (ma == nullptr) continue;
+      for (int32_t j = 0, n = ma->GetLength(); j < n; ++j) {
+        ArtMethod* m = ma->GetElementPtrSize<ArtMethod*>(j, ps);
+        const uintptr_t v = reinterpret_cast<uintptr_t>(m);
+        if (v == 0) continue;
+        bool ascii = true;
+        for (int k = 0; k < 8; ++k) {
+          const unsigned b = static_cast<unsigned>((v >> (k * 8)) & 0xff);
+          if (b != 0 && (b < 0x20 || b > 0x7e)) { ascii = false; break; }
+        }
+        if (ascii || (v & 0x3) != 0 || (v >> 48) != 0) {
+          fprintf(stderr,
+                  "[WESTLAKE-IFTBAD] klass=%s iface_idx=%d elem=%d/%d val=%p iface=%s\n",
+                  klass->PrettyClass().c_str(), i, j, n, m,
+                  ift->GetInterface(i) != nullptr
+                      ? ift->GetInterface(i)->PrettyClass().c_str() : "<null>");
+          fflush(stderr);
+          break;
+        }
+      }
+    }
+  }
   DCHECK(klass->ShouldHaveImt()) << klass->PrettyClass();
   DCHECK(!klass->IsTemp()) << klass->PrettyClass();
   ArtMethod* imt_data[ImTable::kSize];
@@ -8858,6 +9722,19 @@ size_t ClassLinker::LinkMethodsHelper<kPointerSize>::AssignVTableIndexes(
     bool is_super_abstract,
     size_t num_virtual_methods,
     ObjPtr<mirror::IfTable> iftable) {
+  const bool pfc_trace_fragment_manager =
+      false;
+  if (UNLIKELY(pfc_trace_fragment_manager)) {
+    fprintf(stderr,
+            "[PFCUT-LINK] AssignVTable enter klass=%p super=%p num_virtual=%zu "
+            "super_abstract=%d iftable=%p\n",
+            klass.Ptr(),
+            super_class.Ptr(),
+            num_virtual_methods,
+            is_super_abstract,
+            iftable.Ptr());
+    fflush(stderr);
+  }
   DCHECK(!klass->IsInterface());
   DCHECK(klass->HasSuperClass());
   DCHECK(klass->GetSuperClass() == super_class);
@@ -8865,6 +9742,10 @@ size_t ClassLinker::LinkMethodsHelper<kPointerSize>::AssignVTableIndexes(
   // There should be no thread suspension unless we want to throw an exception.
   // (We are using `ObjPtr<>` and raw vtable pointers that are invalidated by thread suspension.)
   std::optional<ScopedAssertNoThreadSuspension> sants(__FUNCTION__);
+  if (UNLIKELY(pfc_trace_fragment_manager)) {
+    fprintf(stderr, "[PFCUT-LINK] AssignVTable after no-suspend guard\n");
+    fflush(stderr);
+  }
 
   // Prepare a hash table with virtual methods from the superclass.
   // For the unlikely cases that there are multiple methods with the same signature
@@ -8885,6 +9766,14 @@ size_t ClassLinker::LinkMethodsHelper<kPointerSize>::AssignVTableIndexes(
                        mirror::Class::EmbeddedVTableOffset(kPointerSize).Uint32Value();
     super_vtable_length = super_class->GetEmbeddedVTableLength();
   }
+  if (UNLIKELY(pfc_trace_fragment_manager)) {
+    fprintf(stderr,
+            "[PFCUT-LINK] AssignVTable super table raw=%p length=%zu embedded=%d\n",
+            raw_super_vtable,
+            super_vtable_length,
+            !is_super_abstract);
+    fflush(stderr);
+  }
   VTableAccessor super_vtable_accessor(raw_super_vtable, super_vtable_length);
   static constexpr double kMinLoadFactor = 0.3;
   static constexpr double kMaxLoadFactor = 0.5;
@@ -8899,6 +9788,17 @@ size_t ClassLinker::LinkMethodsHelper<kPointerSize>::AssignVTableIndexes(
       ? reinterpret_cast<uint32_t*>(alloca(total_size * sizeof(uint32_t)))
       : allocator_.AllocArray<uint32_t>(total_size);
   uint32_t* bit_vector_buffer_ptr = declared_virtuals_buffer_ptr + declared_virtuals_buffer_size;
+  if (UNLIKELY(pfc_trace_fragment_manager)) {
+    fprintf(stderr,
+            "[PFCUT-LINK] AssignVTable buffers total=%zu declared=%zu super=%zu bit_words=%zu "
+            "buffer=%p\n",
+            total_size,
+            declared_virtuals_buffer_size,
+            super_vtable_buffer_size,
+            bit_vector_size,
+            declared_virtuals_buffer_ptr);
+    fflush(stderr);
+  }
 
   DeclaredVirtualSignatureSet declared_virtual_signatures(
       kMinLoadFactor,
@@ -8908,16 +9808,54 @@ size_t ClassLinker::LinkMethodsHelper<kPointerSize>::AssignVTableIndexes(
       declared_virtuals_buffer_ptr,
       declared_virtuals_buffer_size,
       allocator_.Adapter());
+  if (UNLIKELY(pfc_trace_fragment_manager)) {
+    fprintf(stderr, "[PFCUT-LINK] AssignVTable after declared signature set\n");
+    fflush(stderr);
+  }
 
   ArrayRef<uint32_t> same_signature_vtable_lists;
+  if (UNLIKELY(pfc_trace_fragment_manager)) {
+    fprintf(stderr, "[PFCUT-LINK] AssignVTable before IsProxyClass\n");
+    fflush(stderr);
+  }
   const bool is_proxy_class = klass->IsProxyClass();
+  if (UNLIKELY(pfc_trace_fragment_manager)) {
+    fprintf(stderr,
+            "[PFCUT-LINK] AssignVTable after IsProxyClass is_proxy=%d\n",
+            is_proxy_class);
+    fflush(stderr);
+  }
   size_t vtable_length = super_vtable_length;
+  if (UNLIKELY(pfc_trace_fragment_manager)) {
+    fprintf(stderr,
+            "[PFCUT-LINK] AssignVTable before BitVector bit_words=%zu bit_buffer=%p\n",
+            bit_vector_size,
+            bit_vector_buffer_ptr);
+    fflush(stderr);
+  }
 
   // Record which declared methods are overriding a super method.
   BitVector initialized_methods(/* expandable= */ false,
                                 Allocator::GetNoopAllocator(),
                                 bit_vector_size,
                                 bit_vector_buffer_ptr);
+  if (UNLIKELY(pfc_trace_fragment_manager)) {
+    fprintf(stderr, "[PFCUT-LINK] AssignVTable after BitVector constructor\n");
+    fflush(stderr);
+  }
+  if (UNLIKELY(pfc_trace_fragment_manager)) {
+    fprintf(stderr, "[PFCUT-LINK] AssignVTable before ClearAllBits\n");
+    fflush(stderr);
+  }
+  initialized_methods.ClearAllBits();
+  if (UNLIKELY(pfc_trace_fragment_manager)) {
+    fprintf(stderr, "[PFCUT-LINK] AssignVTable after ClearAllBits\n");
+    fflush(stderr);
+  }
+  if (UNLIKELY(pfc_trace_fragment_manager)) {
+    fprintf(stderr, "[PFCUT-LINK] AssignVTable before local virtual signature loop\n");
+    fflush(stderr);
+  }
 
   // Note: our sets hash on the method name, and therefore we pay a high
   // performance price when a class has many overloads.
@@ -8928,12 +9866,43 @@ size_t ClassLinker::LinkMethodsHelper<kPointerSize>::AssignVTableIndexes(
   // class, and not on its subclasses (except in the case of interface overriding, see below).
   for (size_t i = 0; i != num_virtual_methods; ++i) {
     ArtMethod* virtual_method = klass->GetVirtualMethodDuringLinking(i, kPointerSize);
+    if (UNLIKELY(pfc_trace_fragment_manager)) {
+      fprintf(stderr,
+              "[PFCUT-LINK] AssignVTable local[%zu] method=%p dex_idx=%u flags=0x%x\n",
+              i,
+              virtual_method,
+              virtual_method->GetDexMethodIndex(),
+              virtual_method->GetAccessFlags());
+      fflush(stderr);
+    }
     DCHECK(!virtual_method->IsStatic()) << virtual_method->PrettyMethod();
     ArtMethod* signature_method = UNLIKELY(is_proxy_class)
         ? virtual_method->GetInterfaceMethodForProxyUnchecked(kPointerSize)
         : virtual_method;
+    if (UNLIKELY(pfc_trace_fragment_manager)) {
+      fprintf(stderr,
+              "[PFCUT-LINK] AssignVTable local[%zu] before hash signature_method=%p\n",
+              i,
+              signature_method);
+      fflush(stderr);
+    }
     size_t hash = ComputeMethodHash(signature_method);
+    if (UNLIKELY(pfc_trace_fragment_manager)) {
+      fprintf(stderr,
+              "[PFCUT-LINK] AssignVTable local[%zu] hash=%zu before PutWithHash\n",
+              i,
+              hash);
+      fflush(stderr);
+    }
     declared_virtual_signatures.PutWithHash(i, hash);
+    if (UNLIKELY(pfc_trace_fragment_manager)) {
+      fprintf(stderr, "[PFCUT-LINK] AssignVTable local[%zu] after PutWithHash\n", i);
+      fflush(stderr);
+    }
+  }
+  if (UNLIKELY(pfc_trace_fragment_manager)) {
+    fprintf(stderr, "[PFCUT-LINK] AssignVTable before super vtable loop\n");
+    fflush(stderr);
   }
 
   // Loop through each super vtable method and see if they are overridden by a method we added to
@@ -8941,6 +9910,15 @@ size_t ClassLinker::LinkMethodsHelper<kPointerSize>::AssignVTableIndexes(
   for (size_t j = 0; j < super_vtable_length; ++j) {
     // Search the hash table to see if we are overridden by any method.
     ArtMethod* super_method = super_vtable_accessor.GetVTableEntry(j);
+    if (UNLIKELY(pfc_trace_fragment_manager)) {
+      fprintf(stderr,
+              "[PFCUT-LINK] AssignVTable super[%zu] method=%p dex_idx=%u flags=0x%x\n",
+              j,
+              super_method,
+              super_method->GetDexMethodIndex(),
+              super_method->GetAccessFlags());
+      fflush(stderr);
+    }
     if (!klass->CanAccessMember(super_method->GetDeclaringClass(),
                                 super_method->GetAccessFlags())) {
       // Continue on to the next method since this one is package private and cannot be overridden.
@@ -8951,7 +9929,21 @@ size_t ClassLinker::LinkMethodsHelper<kPointerSize>::AssignVTableIndexes(
     size_t hash = (j < mirror::Object::kVTableLength)
         ? class_linker_->object_virtual_method_hashes_[j]
         : ComputeMethodHash(super_method);
+    if (UNLIKELY(pfc_trace_fragment_manager)) {
+      fprintf(stderr,
+              "[PFCUT-LINK] AssignVTable super[%zu] hash=%zu before FindWithHash\n",
+              j,
+              hash);
+      fflush(stderr);
+    }
     auto it = declared_virtual_signatures.FindWithHash(super_method, hash);
+    if (UNLIKELY(pfc_trace_fragment_manager)) {
+      fprintf(stderr,
+              "[PFCUT-LINK] AssignVTable super[%zu] after FindWithHash found=%d\n",
+              j,
+              it != declared_virtual_signatures.end());
+      fflush(stderr);
+    }
     if (it == declared_virtual_signatures.end()) {
       continue;
     }
@@ -9228,6 +10220,23 @@ bool ClassLinker::LinkMethodsHelper<kPointerSize>::LinkMethods(
     bool* out_new_conflict,
     ArtMethod** out_imt) {
   const size_t num_virtual_methods = klass->NumVirtualMethods();
+  // WESTLAKE 2026-07-22 (§135): enabled to trace IfTable method-array construction — the §134
+  // fault is a corrupt ArtMethod* element inside an IfTable interface method array.
+  const bool pfc_trace_fragment_manager =
+      (getenv("WESTLAKE_LINK_TRACE") != nullptr);
+  if (UNLIKELY(pfc_trace_fragment_manager)) {
+    fprintf(stderr,
+            "[PFCUT-LINK] LinkMethods enter klass=%p ptr_size=%zu virtual=%zu direct=%u "
+            "interface=%d has_super=%d abstract=%d\n",
+            klass.Get(),
+            static_cast<size_t>(kPointerSize),
+            num_virtual_methods,
+            klass->NumDirectMethods(),
+            klass->IsInterface(),
+            klass->HasSuperClass(),
+            klass->IsAbstract());
+    fflush(stderr);
+  }
   if (klass->IsInterface()) {
     // No vtable.
     if (!IsUint<16>(num_virtual_methods)) {
@@ -9314,11 +10323,26 @@ bool ClassLinker::LinkMethodsHelper<kPointerSize>::LinkMethods(
   } else if (LIKELY(klass->HasSuperClass())) {
     // We set up the interface lookup table now because we need it to determine if we need
     // to update any vtable entries with new default method implementations.
+    if (UNLIKELY(pfc_trace_fragment_manager)) {
+      fprintf(stderr, "[PFCUT-LINK] LinkMethods before StackHandleScope\n");
+      fflush(stderr);
+    }
     StackHandleScope<3> hs(self);
+    if (UNLIKELY(pfc_trace_fragment_manager)) {
+      fprintf(stderr, "[PFCUT-LINK] LinkMethods before SetupInterfaceLookupTable\n");
+      fflush(stderr);
+    }
     MutableHandle<mirror::IfTable> iftable = hs.NewHandle(UNLIKELY(klass->IsProxyClass())
         ? SetupInterfaceLookupTable(self, klass, &allocator_, ProxyInterfacesAccessor(interfaces))
         : SetupInterfaceLookupTable(
               self, klass, &allocator_, NonProxyInterfacesAccessor(class_linker_, klass)));
+    if (UNLIKELY(pfc_trace_fragment_manager)) {
+      fprintf(stderr,
+              "[PFCUT-LINK] LinkMethods after SetupInterfaceLookupTable iftable=%p pending=%d\n",
+              iftable.Get(),
+              self->IsExceptionPending());
+      fflush(stderr);
+    }
     if (UNLIKELY(iftable == nullptr)) {
       self->AssertPendingException();
       return false;
@@ -9328,18 +10352,47 @@ bool ClassLinker::LinkMethodsHelper<kPointerSize>::LinkMethods(
     Handle<mirror::Class> super_class = hs.NewHandle(klass->GetSuperClass());
     bool is_klass_abstract = klass->IsAbstract();
     bool is_super_abstract = super_class->IsAbstract();
+    if (UNLIKELY(pfc_trace_fragment_manager)) {
+      fprintf(stderr,
+              "[PFCUT-LINK] LinkMethods super=%p status=%d abstract=%d should_imt=%d "
+              "klass_should_imt=%d ifcount=%u\n",
+              super_class.Get(),
+              static_cast<int>(super_class->GetStatus()),
+              is_super_abstract,
+              super_class->ShouldHaveImt(),
+              klass->ShouldHaveImt(),
+              iftable->Count());
+      fflush(stderr);
+    }
     DCHECK_EQ(klass->ShouldHaveImt(), !is_klass_abstract);
     DCHECK_EQ(super_class->ShouldHaveImt(), !is_super_abstract);
     if (!is_klass_abstract && !is_super_abstract) {
       ImTable* super_imt = super_class->GetImt(kPointerSize);
+      if (UNLIKELY(pfc_trace_fragment_manager)) {
+        fprintf(stderr,
+                "[PFCUT-LINK] LinkMethods before super IMT copy super_imt=%p\n",
+                super_imt);
+        fflush(stderr);
+      }
       for (size_t i = 0; i < ImTable::kSize; ++i) {
         out_imt[i] = super_imt->Get(i, kPointerSize);
+      }
+      if (UNLIKELY(pfc_trace_fragment_manager)) {
+        fprintf(stderr, "[PFCUT-LINK] LinkMethods after super IMT copy\n");
+        fflush(stderr);
       }
     }
 
     // If there are no new virtual methods and no new interfaces, we can simply reuse
     // the vtable from superclass. We may need to make a copy if it's embedded.
     const size_t super_vtable_length = super_class->GetVTableLength();
+    if (UNLIKELY(pfc_trace_fragment_manager)) {
+      fprintf(stderr,
+              "[PFCUT-LINK] LinkMethods super_vtable_length=%zu same_iftable=%d\n",
+              super_vtable_length,
+              iftable.Get() == super_class->GetIfTable());
+      fflush(stderr);
+    }
     if (num_virtual_methods == 0 && iftable.Get() == super_class->GetIfTable()) {
       DCHECK_EQ(is_super_abstract, !super_class->ShouldHaveEmbeddedVTable());
       if (is_super_abstract) {
@@ -9380,18 +10433,56 @@ bool ClassLinker::LinkMethodsHelper<kPointerSize>::LinkMethods(
     // TODO: Do not allocate copied methods during linking, store only records about what
     // we need to allocate and allocate it at the end. Start with superclass iftable and
     // perform copy-on-write when needed to facilitate maximum memory sharing.
+    if (UNLIKELY(pfc_trace_fragment_manager)) {
+      fprintf(stderr, "[PFCUT-LINK] LinkMethods before AllocateIfTableMethodArrays\n");
+      fflush(stderr);
+    }
     if (!AllocateIfTableMethodArrays(self, klass, iftable)) {
       self->AssertPendingOOMException();
       return false;
     }
+    if (UNLIKELY(pfc_trace_fragment_manager)) {
+      fprintf(stderr, "[PFCUT-LINK] LinkMethods after AllocateIfTableMethodArrays\n");
+      fflush(stderr);
+    }
 
+    if (UNLIKELY(pfc_trace_fragment_manager)) {
+      fprintf(stderr, "[PFCUT-LINK] LinkMethods before AssignVTableIndexes\n");
+      fflush(stderr);
+    }
     size_t final_vtable_size = AssignVTableIndexes(
         klass.Get(), super_class.Get(), is_super_abstract, num_virtual_methods, iftable.Get());
+    if (UNLIKELY(pfc_trace_fragment_manager)) {
+      fprintf(stderr,
+              "[PFCUT-LINK] LinkMethods after AssignVTableIndexes final_vtable_size=%zu "
+              "pending=%d\n",
+              final_vtable_size,
+              self->IsExceptionPending());
+      fflush(stderr);
+    }
     if (final_vtable_size == 0u) {
       self->AssertPendingException();
       return false;
     }
     DCHECK(IsUint<16>(final_vtable_size));
+    if (UNLIKELY(pfc_trace_fragment_manager)) {
+      fprintf(stderr,
+              "[PFCUT-LINK] class=%s num_virtual=%zu super_vtable=%zu final_vtable=%zu "
+              "abstract=%d super_abstract=%d\n",
+              klass->PrettyDescriptor().c_str(),
+              num_virtual_methods,
+              super_vtable_length,
+              final_vtable_size,
+              is_klass_abstract ? 1 : 0,
+              is_super_abstract ? 1 : 0);
+      for (ArtMethod& virtual_method : klass->GetVirtualMethodsSliceUnchecked(kPointerSize)) {
+        fprintf(stderr,
+                "[PFCUT-LINK] virtual=%s method_index=%u\n",
+                virtual_method.PrettyMethod().c_str(),
+                virtual_method.GetMethodIndexDuringLinking());
+      }
+      fflush(stderr);
+    }
 
     // Allocate the new vtable.
     Handle<mirror::PointerArray> vtable = hs.NewHandle(AllocPointerArray(self, final_vtable_size));
@@ -9435,6 +10526,17 @@ bool ClassLinker::LinkMethodsHelper<kPointerSize>::LinkMethods(
         ArtMethod* super_method = super_class->GetVTableEntry(j, kPointerSize);
         vtable->SetElementPtrSize(j, super_method, kPointerSize);
       }
+    }
+    if (UNLIKELY(pfc_trace_fragment_manager)) {
+      for (size_t j = 0; j != final_vtable_size; ++j) {
+        ArtMethod* entry = vtable->GetElementPtrSize<ArtMethod*, kPointerSize>(j);
+        fprintf(stderr,
+                "[PFCUT-LINK] vtable[%zu]=%s entry_method_index=%u\n",
+                j,
+                entry != nullptr ? entry->PrettyMethod().c_str() : "<null>",
+                entry != nullptr ? entry->GetMethodIndexDuringLinking() : 0u);
+      }
+      fflush(stderr);
     }
 
     // Update the `iftable` (and IMT) with finalized virtual methods.
@@ -10356,6 +11458,12 @@ ObjPtr<mirror::Class> ClassLinker::DoLookupResolvedType(dex::TypeIndex type_idx,
   const DexFile& dex_file = *dex_cache->GetDexFile();
   const char* descriptor = dex_file.GetTypeDescriptor(type_idx);
   ObjPtr<mirror::Class> type = LookupResolvedType(descriptor, class_loader);
+  if (type != nullptr && strcmp(descriptor, "Ljava/lang/Class;") == 0) {
+    ObjPtr<mirror::Class> root = GetClassRoot<mirror::Class>(this);
+    if (root != nullptr && root->IsResolved()) {
+      type = root;
+    }
+  }
   if (type != nullptr) {
     DCHECK(type->IsResolved());
     dex_cache->SetResolvedType(type_idx, type);
@@ -10377,6 +11485,12 @@ ObjPtr<mirror::Class> ClassLinker::LookupResolvedType(const char* descriptor,
     const size_t hash = ComputeModifiedUtf8Hash(descriptor);
     // Find the class in the loaded classes table.
     type = LookupClass(self, descriptor, hash, class_loader);
+  }
+  if (type != nullptr && strcmp(descriptor, "Ljava/lang/Class;") == 0) {
+    ObjPtr<mirror::Class> root = GetClassRoot<mirror::Class>(this);
+    if (root != nullptr && root->IsResolved()) {
+      type = root;
+    }
   }
   return (type != nullptr && type->IsResolved()) ? type : nullptr;
 }
@@ -10403,16 +11517,62 @@ ObjPtr<mirror::Class> ClassLinker::DoResolveType(dex::TypeIndex type_idx,
   DCHECK(dex_cache->GetClassLoader() == class_loader.Get());
   Thread* self = Thread::Current();
   const char* descriptor = dex_cache->GetDexFile()->GetTypeDescriptor(type_idx);
+  const bool pfc_type_trace = false;
+  if (UNLIKELY(pfc_type_trace)) {
+    fprintf(stderr,
+            "[PFCUT-TYPE] DoResolveType enter type_idx=%u descriptor=%s dex_cache=%p "
+            "class_loader=%p dex_file=%p pending=%d\n",
+            type_idx.index_,
+            descriptor,
+            dex_cache.Get(),
+            class_loader.Get(),
+            dex_cache->GetDexFile(),
+            self->IsExceptionPending());
+    fflush(stderr);
+  }
+  if (UNLIKELY(pfc_type_trace)) {
+    fprintf(stderr,
+            "[PFCUT-TYPE] DoResolveType before FindClass descriptor=%s\n",
+            descriptor);
+    fflush(stderr);
+  }
   ObjPtr<mirror::Class> resolved = FindClass(self, descriptor, class_loader);
+  if (UNLIKELY(pfc_type_trace)) {
+    fprintf(stderr,
+            "[PFCUT-TYPE] DoResolveType after FindClass descriptor=%s resolved=%p pending=%d\n",
+            descriptor,
+            resolved.Ptr(),
+            self->IsExceptionPending());
+    fflush(stderr);
+  }
   if (resolved != nullptr) {
-    // For String: always use the pre-allocated root class to avoid identity mismatch
+    // For String/Class: always use the chosen root class to avoid identity mismatch
     if (strcmp(descriptor, "Ljava/lang/String;") == 0) {
       ObjPtr<mirror::Class> root = GetClassRoot<mirror::String>();
       if (root != nullptr && resolved != root) {
         resolved = root;
       }
+    } else if (strcmp(descriptor, "Ljava/lang/Class;") == 0) {
+      ObjPtr<mirror::Class> root = GetClassRoot<mirror::Class>(this);
+      if (root != nullptr && root->IsResolved() && resolved != root) {
+        resolved = root;
+      }
+    }
+    if (UNLIKELY(pfc_type_trace)) {
+      fprintf(stderr,
+              "[PFCUT-TYPE] DoResolveType before cache set type_idx=%u resolved=%p\n",
+              type_idx.index_,
+              resolved.Ptr());
+      fflush(stderr);
     }
     dex_cache->SetResolvedType(type_idx, resolved);
+    if (UNLIKELY(pfc_type_trace)) {
+      fprintf(stderr,
+              "[PFCUT-TYPE] DoResolveType after cache set type_idx=%u resolved=%p\n",
+              type_idx.index_,
+              resolved.Ptr());
+      fflush(stderr);
+    }
   } else {
     CHECK(self->IsExceptionPending())
         << "Expected pending exception for failed resolution of: " << descriptor;
@@ -10473,6 +11633,24 @@ ArtMethod* ClassLinker::FindResolvedMethod(ObjPtr<mirror::Class> klass,
   if (resolved != nullptr) {
     // In case of jmvti, the dex file gets verified before being registered, so first
     // check if it's registered before checking class tables.
+    const DexFile& dex_file = *dex_cache->GetDexFile();
+    if (UNLIKELY(!WestlakeResolvedMethodMatchesDexMethod(resolved, dex_file, method_idx))) {
+      const dex::MethodId& method_id = dex_file.GetMethodId(method_idx);
+      const std::string_view expected_name = dex_file.GetMethodNameView(method_id);
+      const Signature expected_signature = dex_file.GetMethodSignature(method_id);
+      ArtMethod* replacement = klass->IsInterface()
+          ? klass->FindInterfaceMethod(expected_name, expected_signature, image_pointer_size_)
+          : klass->FindClassMethod(expected_name, expected_signature, image_pointer_size_);
+      if (replacement != nullptr &&
+          replacement->GetNameView() == expected_name &&
+          replacement->GetSignature() == expected_signature) {
+        resolved = replacement;
+      } else {
+        resolved = nullptr;
+      }
+    }
+  }
+  if (resolved != nullptr) {
     const DexFile& dex_file = *dex_cache->GetDexFile();
     DCHECK_IMPLIES(
         IsDexFileRegistered(Thread::Current(), dex_file),
@@ -11199,6 +12377,9 @@ ObjPtr<mirror::ClassLoader> ClassLinker::CreateWellKnownClassLoader(
     Handle<mirror::ClassLoader> parent_loader,
     Handle<mirror::ObjectArray<mirror::ClassLoader>> shared_libraries,
     Handle<mirror::ObjectArray<mirror::ClassLoader>> shared_libraries_after) {
+  fprintf(stderr, "[CL] CreateWellKnownClassLoader enter loader=%p dex_files=%zu\n",
+          loader_class.Get(), dex_files.size());
+  fflush(stderr);
   CHECK(loader_class.Get() == WellKnownClasses::dalvik_system_PathClassLoader ||
         loader_class.Get() == WellKnownClasses::dalvik_system_DelegateLastClassLoader ||
         loader_class.Get() == WellKnownClasses::dalvik_system_InMemoryDexClassLoader);
@@ -11214,6 +12395,9 @@ ObjPtr<mirror::ClassLoader> ClassLinker::CreateWellKnownClassLoader(
       mirror::ObjectArray<mirror::Object>::Alloc(self,
                                                  dex_elements_class.Get(),
                                                  dex_files.size())));
+  fprintf(stderr, "[CL] h_dex_elements=%p dex_elements_class=%p\n",
+          h_dex_elements.Get(), dex_elements_class.Get());
+  fflush(stderr);
   Handle<mirror::Class> h_dex_element_class =
       hs.NewHandle(dex_elements_class->GetComponentType());
 
@@ -11258,11 +12442,13 @@ ObjPtr<mirror::ClassLoader> ClassLinker::CreateWellKnownClassLoader(
     h_dex_elements->Set(index, h_element.Get());
     index++;
   }
+  fprintf(stderr, "[CL] Filled dex elements count=%d\n", index); fflush(stderr);
   DCHECK_EQ(index, h_dex_elements->GetLength());
 
   // Create DexPathList.
   Handle<mirror::Object> h_dex_path_list = hs.NewHandle(
       dex_elements_field->GetDeclaringClass()->AllocObject(self));
+  fprintf(stderr, "[CL] h_dex_path_list=%p\n", h_dex_path_list.Get()); fflush(stderr);
   DCHECK(h_dex_path_list != nullptr);
   // Set elements.
   dex_elements_field->SetObject<false>(h_dex_path_list.Get(), h_dex_elements.Get());
@@ -11288,11 +12474,13 @@ ObjPtr<mirror::ClassLoader> ClassLinker::CreateWellKnownClassLoader(
     //       normally never null), as long as one does not try to add elements, this will still
     //       work.
     native_lib_dirs->SetObject<false>(h_dex_path_list.Get(), list_object);
+    fprintf(stderr, "[CL] nativeLibraryDirectories list=%p\n", list_object.Ptr()); fflush(stderr);
   }
 
   // Create the class loader..
   Handle<mirror::ClassLoader> h_class_loader = hs.NewHandle<mirror::ClassLoader>(
       ObjPtr<mirror::ClassLoader>::DownCast(loader_class->AllocObject(self)));
+  fprintf(stderr, "[CL] h_class_loader=%p\n", h_class_loader.Get()); fflush(stderr);
   DCHECK(h_class_loader != nullptr);
   // Set DexPathList.
   ArtField* path_list_field = WellKnownClasses::dalvik_system_BaseDexClassLoader_pathList;
@@ -11307,32 +12495,52 @@ ObjPtr<mirror::ClassLoader> ClassLinker::CreateWellKnownClassLoader(
     ObjPtr<mirror::Object> boot_loader(
         WellKnownClasses::java_lang_BootClassLoader->AllocObject(self));
     parent_field->SetObject<false>(h_class_loader.Get(), boot_loader);
+    fprintf(stderr, "[CL] installed synthetic boot parent=%p\n", boot_loader.Ptr()); fflush(stderr);
   } else {
     parent_field->SetObject<false>(h_class_loader.Get(), parent_loader.Get());
   }
 
   ArtField* shared_libraries_field =
       WellKnownClasses::dalvik_system_BaseDexClassLoader_sharedLibraryLoaders;
-  DCHECK(shared_libraries_field != nullptr);
-  shared_libraries_field->SetObject<false>(h_class_loader.Get(), shared_libraries.Get());
+  if (shared_libraries_field != nullptr) {
+    shared_libraries_field->SetObject<false>(h_class_loader.Get(), shared_libraries.Get());
+    fprintf(stderr, "[CL] installed sharedLibraryLoaders field=%p\n", shared_libraries_field);
+    fflush(stderr);
+  } else {
+    fprintf(stderr, "[CL] sharedLibraryLoaders field missing, skipping\n");
+    fflush(stderr);
+  }
 
   ArtField* shared_libraries_after_field =
         WellKnownClasses::dalvik_system_BaseDexClassLoader_sharedLibraryLoadersAfter;
-  DCHECK(shared_libraries_after_field != nullptr);
-  shared_libraries_after_field->SetObject<false>(h_class_loader.Get(),
-                                                 shared_libraries_after.Get());
+  if (shared_libraries_after_field != nullptr) {
+    shared_libraries_after_field->SetObject<false>(h_class_loader.Get(),
+                                                   shared_libraries_after.Get());
+    fprintf(stderr, "[CL] installed sharedLibraryLoadersAfter field=%p\n",
+            shared_libraries_after_field);
+    fflush(stderr);
+  } else {
+    fprintf(stderr, "[CL] sharedLibraryLoadersAfter field missing, skipping\n");
+    fflush(stderr);
+  }
+  fprintf(stderr, "[CL] CreateWellKnownClassLoader exit loader=%p\n", h_class_loader.Get());
+  fflush(stderr);
   return h_class_loader.Get();
 }
 
 jobject ClassLinker::CreatePathClassLoader(Thread* self,
                                            const std::vector<const DexFile*>& dex_files) {
+  fprintf(stderr, "[CL] CreatePathClassLoader enter dex_files=%zu\n", dex_files.size()); fflush(stderr);
   StackHandleScope<3u> hs(self);
   Handle<mirror::Class> d_s_pcl =
       hs.NewHandle(WellKnownClasses::dalvik_system_PathClassLoader.Get());
+  fprintf(stderr, "[CL] PathClassLoader root=%p\n", d_s_pcl.Get()); fflush(stderr);
   auto null_parent = hs.NewHandle<mirror::ClassLoader>(nullptr);
   auto null_libs = hs.NewHandle<mirror::ObjectArray<mirror::ClassLoader>>(nullptr);
   ObjPtr<mirror::ClassLoader> class_loader =
       CreateWellKnownClassLoader(self, dex_files, d_s_pcl, null_parent, null_libs, null_libs);
+  fprintf(stderr, "[CL] CreateWellKnownClassLoader returned %p exception=%d\n",
+          class_loader.Ptr(), self->IsExceptionPending()); fflush(stderr);
   return Runtime::Current()->GetJavaVM()->AddGlobalRef(self, class_loader);
 }
 

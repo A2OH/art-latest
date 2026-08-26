@@ -361,6 +361,7 @@ class QuickArgumentVisitor {
     return *reinterpret_cast<uintptr_t*>(GetCallingPcAddr(sp));
   }
 
+
   QuickArgumentVisitor(ArtMethod** sp, bool is_static, std::string_view shorty)
       REQUIRES_SHARED(Locks::mutator_lock_)
       : is_static_(is_static),
@@ -2044,6 +2045,10 @@ void BuildGenericJniFrameVisitor::Visit() {
  * NO_THREAD_SAFETY_ANALYSIS: Depending on the use case, the trampoline may
  * or may not lock a synchronization object and transition out of Runnable.
  */
+// WESTLAKE §644: declared so the probe above can compare entry points by address.
+extern "C" jlong Westlake_UnixFileSystem_getLastModifiedTime(JNIEnv*, jobject, jobject);
+extern "C" int Westlake_UnixFileSystem_getBooleanAttributes(JNIEnv*, jobject, jobject);
+
 extern "C" const void* artQuickGenericJniTrampoline(Thread* self,
                                                     ArtMethod** managed_sp,
                                                     uintptr_t* reserved_area)
@@ -2055,7 +2060,96 @@ extern "C" const void* artQuickGenericJniTrampoline(Thread* self,
   std::string_view shorty = called->GetShortyView();
   bool critical_native = called->IsCriticalNative();
   bool fast_native = called->IsFastNative();
+
+  // WESTLAKE §646 (2026-08-15): reject a BOGUS @CriticalNative claim.
+  // kAccCriticalNative (0x00100000) is THE SAME BIT as kAccNterpEntryPointFastPathFlag; ART tells
+  // them apart only by context. Methods this port patches to native register with flags
+  // 0x48200101 and arrive here as 0x48300101 — the bit is set by the nterp entry-point setup, and
+  // IsCriticalNative() then reads it as an annotation that was never there. The trampoline
+  // consequently builds a frame with NO JNIEnv* and NO `this`, so a standard
+  // (JNIEnv*, jobject, ...) shim gets its arguments shifted one slot left (measured:
+  // env == &hs[0], thiz == env+4, *env == args[1]<<32 | args[0]).
+  //
+  // The invariants that settle it: a genuine @CriticalNative method must be static and may NOT
+  // have reference parameters or a reference return.  ClassLinker rejects those shapes outright.
+  // Therefore an instance method, or a shorty containing 'L'/'[', proves that this overloaded bit
+  // is the nterp fast-path flag rather than a CriticalNative annotation.  The instance check is
+  // essential for zero-argument methods such as Throwable.printStackTrace(): its shorty is just
+  // "V", so the reference-only test cannot see the implicit receiver and would omit both JNIEnv*
+  // and `this` when calling a normal JNI-signature shim.
+  // ⛔Do NOT "fix" this by clearing the bit at registration: §640 and §645 both tried, and both
+  // regressed startup to ~360 KB, because early nterp genuinely needs that flag.
+  if (UNLIKELY(critical_native) &&
+      (!called->IsStatic() ||
+       shorty.find('L') != std::string_view::npos ||
+       shorty.find('[') != std::string_view::npos)) {
+    static int wl_bogus = 0;
+    if (wl_bogus < 40) {
+      wl_bogus++;
+      fprintf(stderr,
+              "[WESTLAKE-646] bogus critical_native (instance/reference shape): %s shorty=%.*s "
+              "flags=0x%x -> treating as normal native\n",
+              called->PrettyMethod().c_str(),
+              static_cast<int>(shorty.size()), shorty.data(),
+              called->GetAccessFlags());
+      fflush(stderr);
+    }
+    critical_native = false;
+  }
+
   bool normal_native = !critical_native && !fast_native;
+
+  // WESTLAKE §643 (2026-08-15): a @CriticalNative frame OMITS both JNIEnv* and jclass/this
+  // ("First 2 parameters are always excluded for CriticalNative methods" below), so a shim
+  // written with the standard (JNIEnv*, jobject, ...) signature receives the handle-scope slots
+  // shifted one place left — measured in our UnixFileSystem shims as env == &hs[0] and
+  // thiz == env + 4, with *env reading back as `args[1]<<32 | args[0]`.
+  // Registration logs `critical=0` for these methods, so if this fires the flag is being set
+  // LATER than registration and that is the bug. Capped; costs nothing when it never fires.
+  if (UNLIKELY(critical_native)) {
+    // §645 NOTE: this counter is GLOBAL across all critical natives. At 30 it was exhausted by
+    // CRC32.update etc. long before the method I was hunting ran, so the probe silently said
+    // "never fires for getLastModifiedTime" when in fact critical_native was TRUE for it.
+    // A capped log on a hot path hides exactly the rare event you are looking for.
+    static int wl_crit = 0;
+    if (wl_crit < 400) {
+      wl_crit++;
+      fprintf(stderr, "[WESTLAKE-643] critical_native at trampoline: %s flags=0x%x shorty=%.*s\n",
+              called->PrettyMethod().c_str(),
+              called->GetAccessFlags(),
+              static_cast<int>(shorty.size()), shorty.data());
+      fflush(stderr);
+    }
+  }
+
+  // WESTLAKE §644 (2026-08-15): THE decisive measurement for the UnixFileSystem shim fault.
+  // BuildGenericJniFrameVisitor's ctor passes `self->GetJniEnv()` as argument 0. Print it here,
+  // next to `self`, so it can be compared directly with the `env=` that the §641 probe prints
+  // from inside the shim:
+  //   SAME      => ART handed over a real JNIEnvExt and its function-table field was OVERWRITTEN
+  //                (note *env reads back as the two vreg words, args[1]<<32|args[0]).
+  //   DIFFERENT => the frame builder or the arm64 asm reload is off by one slot for this shape.
+  // Gated on the exact JNI entry point, so it costs one compare per generic-JNI call and cannot
+  // spam: no PrettyMethod(), no descriptor read.
+  {
+    static int wl_ufs = 0;
+    const void* jni_ep = called->GetEntryPointFromJni();
+    if (UNLIKELY(jni_ep == reinterpret_cast<const void*>(&Westlake_UnixFileSystem_getLastModifiedTime) ||
+                 jni_ep == reinterpret_cast<const void*>(&Westlake_UnixFileSystem_getBooleanAttributes)) &&
+        wl_ufs < 20) {
+      wl_ufs++;
+      fprintf(stderr,
+              "[WESTLAKE-644] UnixFS trampoline: self=%p jniEnv=%p jni_ep=%p "
+              "critical=%d fast=%d normal=%d shorty=%.*s flags=0x%x\n",
+              reinterpret_cast<void*>(self),
+              reinterpret_cast<void*>(self->GetJniEnv()),
+              jni_ep,
+              critical_native ? 1 : 0, fast_native ? 1 : 0, normal_native ? 1 : 0,
+              static_cast<int>(shorty.size()), shorty.data(),
+              called->GetAccessFlags());
+      fflush(stderr);
+    }
+  }
 
   // Run the visitor and update sp.
   BuildGenericJniFrameVisitor visitor(self,

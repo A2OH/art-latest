@@ -7,10 +7,12 @@
 #include <limits.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <pthread.h>
 
 /* Register native methods one at a time, skipping failures */
 static int registerNativesOrSkip(JNIEnv* env, jclass clazz,
@@ -29,68 +31,16 @@ static int registerNativesOrSkip(JNIEnv* env, jclass clazz,
 /* ==================== java.lang.System natives ==================== */
 
 static jobjectArray System_specialProperties(JNIEnv* env, jclass ignored) {
-    jclass stringClass = (*env)->FindClass(env, "java/lang/String");
-    if (!stringClass) return NULL;
-    /* Properties needed by System.<clinit>:
-     * - user.dir (CWD)
-     * - user.language, user.region (locale)
-     * - java.library.path (native libs)
-     * - file.separator, path.separator, line.separator (I/O)
-     * - android.icu.* (ICU version info)
-     */
-    const char* props[] = {
-        NULL, /* [0] user.dir=<CWD> - filled below */
-        "android.zlib.version=1.2.11",
-        "android.openssl.version=OpenSSL 1.1.1k stub",
-        NULL, /* [3] java.library.path=<LD_LIBRARY_PATH> - filled below */
-        "user.language=en",
-        "user.region=US",
-        "file.separator=/",
-        "path.separator=:",
-        "line.separator=\n",
-        "file.encoding=UTF-8",
-        "user.home=/",
-        "java.io.tmpdir=/tmp",
-        "os.arch=x86_64",
-        "os.name=Linux",
-        "android.icu.impl.ICUBinary.dataPath=/dev/null",
-        /* Don't set user.locale — Locale.forLanguageTag has NPE on standalone build.
-         * Let System.addLegacyLocaleSystemProperties fall through to the else branch
-         * which sets user.language=en and user.region=US directly. */
-    };
-    int nprops = sizeof(props) / sizeof(props[0]);
-    jobjectArray result = (*env)->NewObjectArray(env, nprops, stringClass, NULL);
-    if (!result) return NULL;
-    (*env)->DeleteLocalRef(env, stringClass);
-
-    /* Fill user.dir */
-    char path[PATH_MAX];
-    char* cwd = getcwd(path, sizeof(path));
-    if (!cwd) cwd = "/";
-    char user_dir[PATH_MAX + 16];
-    snprintf(user_dir, sizeof(user_dir), "user.dir=%s", cwd);
-    (*env)->SetObjectArrayElement(env, result, 0, (*env)->NewStringUTF(env, user_dir));
-
-    /* Fill java.library.path */
-    const char* lib_path = getenv("LD_LIBRARY_PATH");
-    if (!lib_path) lib_path = "";
-    char* java_path = (char*)malloc(strlen("java.library.path=") + strlen(lib_path) + 1);
-    strcpy(java_path, "java.library.path=");
-    strcat(java_path, lib_path);
-    (*env)->SetObjectArrayElement(env, result, 3, (*env)->NewStringUTF(env, java_path));
-    free(java_path);
-
-    /* Fill remaining static properties */
-    for (int i = 0; i < nprops; i++) {
-        if (props[i] != NULL && i != 0 && i != 3) {
-            (*env)->SetObjectArrayElement(env, result, i, (*env)->NewStringUTF(env, props[i]));
-        }
-    }
-    /* Fill [1] and [2] which are in props[] */
-    (*env)->SetObjectArrayElement(env, result, 1, (*env)->NewStringUTF(env, props[1]));
-    (*env)->SetObjectArrayElement(env, result, 2, (*env)->NewStringUTF(env, props[2]));
-
-    return result;
+    /* On the standalone guest path, constructing a String[] in native code can
+     * cross class-loader boundaries badly enough to trip ArrayStoreException at
+     * the JNI return boundary. Reuse the boot-owned EmptyArray.STRING object
+     * instead of materializing a new array here. */
+    jclass empty_array_class = (*env)->FindClass(env, "libcore/util/EmptyArray");
+    if (!empty_array_class || (*env)->ExceptionCheck(env)) return NULL;
+    jfieldID string_field =
+        (*env)->GetStaticFieldID(env, empty_array_class, "STRING", "[Ljava/lang/String;");
+    if (!string_field || (*env)->ExceptionCheck(env)) return NULL;
+    return (jobjectArray)(*env)->GetStaticObjectField(env, empty_array_class, string_field);
 }
 
 static jlong System_nanoTime(JNIEnv* env, jclass ignored) {
@@ -154,11 +104,11 @@ static jboolean FileDescriptor_isSocket(JNIEnv* env, jclass clazz, jint fd) {
     return JNI_FALSE;
 }
 
+static int getChannelFd(JNIEnv* env, jobject fdObj);
+static void setChannelFd(JNIEnv* env, jobject fdObj, jint fd);
+
 static void FileDescriptor_sync(JNIEnv* env, jobject thiz) {
-    jclass cls = (*env)->GetObjectClass(env, thiz);
-    jfieldID descField = (*env)->GetFieldID(env, cls, "descriptor", "I");
-    if (!descField) return;
-    int fd = (*env)->GetIntField(env, thiz, descField);
+    int fd = getChannelFd(env, thiz);
     if (fd >= 0) {
         if (fsync(fd) < 0) {
             jclass ioExCls = (*env)->FindClass(env, "java/io/SyncFailedException");
@@ -175,8 +125,25 @@ static int getChannelFd(JNIEnv* env, jobject fdObj) {
     if (!fdObj) return -1;
     jclass fdCls = (*env)->GetObjectClass(env, fdObj);
     jfieldID descField = (*env)->GetFieldID(env, fdCls, "descriptor", "I");
+    if (!descField) {
+        (*env)->ExceptionClear(env);
+        descField = (*env)->GetFieldID(env, fdCls, "fd", "I");
+    }
     if (!descField) return -1;
     return (*env)->GetIntField(env, fdObj, descField);
+}
+
+static void setChannelFd(JNIEnv* env, jobject fdObj, jint fd) {
+    if (!fdObj) return;
+    jclass fdCls = (*env)->GetObjectClass(env, fdObj);
+    jfieldID descField = (*env)->GetFieldID(env, fdCls, "descriptor", "I");
+    if (!descField) {
+        (*env)->ExceptionClear(env);
+        descField = (*env)->GetFieldID(env, fdCls, "fd", "I");
+    }
+    if (descField) {
+        (*env)->SetIntField(env, fdObj, descField, fd);
+    }
 }
 
 static void FileDispatcherImpl_init(JNIEnv* env, jclass clazz) {
@@ -271,6 +238,566 @@ static jint FileDispatcherImpl_truncate0(JNIEnv* env, jobject thiz, jobject fdOb
     return 0;
 }
 
+static jlong FileDispatcherImpl_seek0(JNIEnv* env, jobject thiz, jobject fdObj, jlong offset) {
+    int fd = getChannelFd(env, fdObj);
+    if (fd < 0) return -1;
+    off_t result = lseek(fd, (off_t)offset, SEEK_SET);
+    if (result == (off_t)-1) {
+        jclass ioExCls = (*env)->FindClass(env, "java/io/IOException");
+        if (ioExCls) (*env)->ThrowNew(env, ioExCls, strerror(errno));
+        return -1;
+    }
+    return (jlong)result;
+}
+
+static jint FileDispatcherImpl_lock0(JNIEnv* env,
+                                     jobject thiz,
+                                     jobject fdObj,
+                                     jboolean blocking,
+                                     jlong pos,
+                                     jlong size,
+                                     jboolean shared) {
+    int fd = getChannelFd(env, fdObj);
+    if (fd < 0) return -1; /* NO_LOCK */
+
+    struct flock lock;
+    memset(&lock, 0, sizeof(lock));
+    lock.l_type = shared ? F_RDLCK : F_WRLCK;
+    lock.l_whence = SEEK_SET;
+    lock.l_start = (off_t)pos;
+    lock.l_len = (off_t)size;
+    int cmd = blocking ? F_SETLKW : F_SETLK;
+    if (fcntl(fd, cmd, &lock) == 0) {
+        return 0; /* LOCKED */
+    }
+    if (errno == EINTR) {
+        return 2; /* INTERRUPTED */
+    }
+    if (errno == EACCES || errno == EAGAIN) {
+        return -1; /* NO_LOCK */
+    }
+    jclass ioExCls = (*env)->FindClass(env, "java/io/IOException");
+    if (ioExCls) (*env)->ThrowNew(env, ioExCls, strerror(errno));
+    return -1;
+}
+
+static void FileDispatcherImpl_release0(JNIEnv* env,
+                                        jobject thiz,
+                                        jobject fdObj,
+                                        jlong pos,
+                                        jlong size) {
+    int fd = getChannelFd(env, fdObj);
+    if (fd < 0) return;
+    struct flock lock;
+    memset(&lock, 0, sizeof(lock));
+    lock.l_type = F_UNLCK;
+    lock.l_whence = SEEK_SET;
+    lock.l_start = (off_t)pos;
+    lock.l_len = (off_t)size;
+    if (fcntl(fd, F_SETLK, &lock) < 0) {
+        jclass ioExCls = (*env)->FindClass(env, "java/io/IOException");
+        if (ioExCls) (*env)->ThrowNew(env, ioExCls, strerror(errno));
+    }
+}
+
+static void FileDispatcherImpl_closeIntFD(JNIEnv* env, jclass clazz, jint fd) {
+    if (fd >= 0) close(fd);
+}
+
+static jlong FileDispatcherImpl_allocationGranularity0(JNIEnv* env, jclass clazz) {
+    long page_size = sysconf(_SC_PAGESIZE);
+    return (jlong)(page_size > 0 ? page_size : 4096);
+}
+
+static jlong FileDispatcherImpl_map0(JNIEnv* env,
+                                     jobject thiz,
+                                     jobject fdObj,
+                                     jint prot,
+                                     jlong position,
+                                     jlong length,
+                                     jboolean sync) {
+    (void)sync;
+    int fd = getChannelFd(env, fdObj);
+    if (fd < 0 || length <= 0 || position < 0) {
+        jclass ioExCls = (*env)->FindClass(env, "java/io/IOException");
+        if (ioExCls) (*env)->ThrowNew(env, ioExCls, "invalid map request");
+        return (jlong)-1;
+    }
+    int mmap_prot = PROT_READ;
+    int mmap_flags = MAP_SHARED;
+    if (prot == 1) {
+        mmap_prot = PROT_READ | PROT_WRITE;
+        mmap_flags = MAP_SHARED;
+    } else if (prot == 2) {
+        mmap_prot = PROT_READ | PROT_WRITE;
+        mmap_flags = MAP_PRIVATE;
+    }
+    void* addr = mmap(NULL, (size_t)length, mmap_prot, mmap_flags, fd, (off_t)position);
+    if (addr == MAP_FAILED) {
+        jclass ioExCls = (*env)->FindClass(env, "java/io/IOException");
+        if (ioExCls) (*env)->ThrowNew(env, ioExCls, strerror(errno));
+        return (jlong)-1;
+    }
+    return (jlong)(uintptr_t)addr;
+}
+
+static jint FileDispatcherImpl_setDirect0(JNIEnv* env, jobject thiz, jobject fdObj) {
+    (void)env;
+    (void)thiz;
+    (void)fdObj;
+    return 0;
+}
+
+/* ==================== sun.nio.ch.FileChannelImpl natives ==================== */
+
+static jlong FileChannelImpl_initIDs(JNIEnv* env, jclass clazz) {
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) page_size = 4096;
+    fprintf(stderr, "[PFCUT] FileChannelImpl.initIDs -> %ld\n", page_size);
+    return (jlong)page_size;
+}
+
+static jlong FileChannelImpl_map0(JNIEnv* env, jobject thiz,
+                                  jint prot, jlong position, jlong length) {
+    if (!thiz || length <= 0 || position < 0) {
+        jclass ioExCls = (*env)->FindClass(env, "java/io/IOException");
+        if (ioExCls) (*env)->ThrowNew(env, ioExCls, "invalid map request");
+        return (jlong)-1;
+    }
+
+    jclass cls = (*env)->GetObjectClass(env, thiz);
+    jfieldID fdField = (*env)->GetFieldID(env, cls, "fd", "Ljava/io/FileDescriptor;");
+    if (!fdField) return (jlong)-1;
+    jobject fdObj = (*env)->GetObjectField(env, thiz, fdField);
+    int fd = getChannelFd(env, fdObj);
+    if (fd < 0) {
+        jclass ioExCls = (*env)->FindClass(env, "java/io/IOException");
+        if (ioExCls) (*env)->ThrowNew(env, ioExCls, "invalid file descriptor");
+        return (jlong)-1;
+    }
+
+    int mmap_prot = PROT_READ;
+    int mmap_flags = MAP_SHARED;
+    if (prot == 1) {          /* FileChannelImpl.MAP_RW */
+        mmap_prot = PROT_READ | PROT_WRITE;
+        mmap_flags = MAP_SHARED;
+    } else if (prot == 2) {   /* FileChannelImpl.MAP_PV */
+        mmap_prot = PROT_READ | PROT_WRITE;
+        mmap_flags = MAP_PRIVATE;
+    }
+
+    void* addr = mmap(NULL,
+                      (size_t)length,
+                      mmap_prot,
+                      mmap_flags,
+                      fd,
+                      (off_t)position);
+    if (addr == MAP_FAILED) {
+        jclass ioExCls = (*env)->FindClass(env, "java/io/IOException");
+        if (ioExCls) (*env)->ThrowNew(env, ioExCls, strerror(errno));
+        return (jlong)-1;
+    }
+
+    static int map_log_count = 0;
+    if (map_log_count < 80) {
+        map_log_count++;
+        fprintf(stderr,
+                "[PFCUT] FileChannelImpl.map0 fd=%d prot=%d pos=%lld len=%lld addr=%p\n",
+                fd,
+                prot,
+                (long long)position,
+                (long long)length,
+                addr);
+    }
+    return (jlong)(uintptr_t)addr;
+}
+
+static jint FileChannelImpl_unmap0(JNIEnv* env, jclass clazz, jlong address, jlong length) {
+    if (address == 0 || length <= 0) return 0;
+    int rc = munmap((void*)(uintptr_t)address, (size_t)length);
+    if (rc != 0) {
+        jclass ioExCls = (*env)->FindClass(env, "java/io/IOException");
+        if (ioExCls) (*env)->ThrowNew(env, ioExCls, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+/* ==================== sun.nio.ch.NativeThread natives ==================== */
+
+static jlong NativeThread_current(JNIEnv* env, jclass clazz) {
+    return (jlong)-1;
+}
+
+static void NativeThread_signal(JNIEnv* env, jclass clazz, jlong thread) {
+    (void)thread;
+}
+
+/* ==================== sun.nio.fs.UnixNativeDispatcher natives ==================== */
+
+static jfieldID und_attrs_st_mode;
+static jfieldID und_attrs_st_ino;
+static jfieldID und_attrs_st_dev;
+static jfieldID und_attrs_st_rdev;
+static jfieldID und_attrs_st_nlink;
+static jfieldID und_attrs_st_uid;
+static jfieldID und_attrs_st_gid;
+static jfieldID und_attrs_st_size;
+static jfieldID und_attrs_st_atime_sec;
+static jfieldID und_attrs_st_atime_nsec;
+static jfieldID und_attrs_st_mtime_sec;
+static jfieldID und_attrs_st_mtime_nsec;
+static jfieldID und_attrs_st_ctime_sec;
+static jfieldID und_attrs_st_ctime_nsec;
+static jfieldID und_attrs_st_birthtime_sec;
+
+static jbyteArray UnixNativeDispatcher_newByteArray(JNIEnv* env, const char* value) {
+    if (!value) return NULL;
+    size_t len = strlen(value);
+    jbyteArray result = (*env)->NewByteArray(env, (jsize)len);
+    if (result != NULL && len > 0) {
+        (*env)->SetByteArrayRegion(env, result, 0, (jsize)len, (const jbyte*)value);
+    }
+    return result;
+}
+
+static void UnixNativeDispatcher_throwUnixException(JNIEnv* env, int errnum) {
+    jclass cls = (*env)->FindClass(env, "sun/nio/fs/UnixException");
+    if (!cls) {
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        jclass ioCls = (*env)->FindClass(env, "java/io/IOException");
+        if (ioCls) (*env)->ThrowNew(env, ioCls, strerror(errnum));
+        return;
+    }
+    jmethodID ctor = (*env)->GetMethodID(env, cls, "<init>", "(I)V");
+    if (!ctor) {
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        (*env)->DeleteLocalRef(env, cls);
+        jclass ioCls = (*env)->FindClass(env, "java/io/IOException");
+        if (ioCls) (*env)->ThrowNew(env, ioCls, strerror(errnum));
+        return;
+    }
+    jobject ex = (*env)->NewObject(env, cls, ctor, (jint)errnum);
+    if (ex != NULL) {
+        (*env)->Throw(env, ex);
+    }
+    (*env)->DeleteLocalRef(env, cls);
+}
+
+static jfieldID UnixNativeDispatcher_requiredField(JNIEnv* env,
+                                                   jclass cls,
+                                                   const char* name,
+                                                   const char* sig) {
+    jfieldID field = (*env)->GetFieldID(env, cls, name, sig);
+    if (!field && (*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+    }
+    return field;
+}
+
+static int UnixNativeDispatcher_initAttributeFields(JNIEnv* env) {
+    if (und_attrs_st_mode != NULL) return 1;
+    jclass cls = (*env)->FindClass(env, "sun/nio/fs/UnixFileAttributes");
+    if (!cls) {
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        return 0;
+    }
+    und_attrs_st_mode = UnixNativeDispatcher_requiredField(env, cls, "st_mode", "I");
+    und_attrs_st_ino = UnixNativeDispatcher_requiredField(env, cls, "st_ino", "J");
+    und_attrs_st_dev = UnixNativeDispatcher_requiredField(env, cls, "st_dev", "J");
+    und_attrs_st_rdev = UnixNativeDispatcher_requiredField(env, cls, "st_rdev", "J");
+    und_attrs_st_nlink = UnixNativeDispatcher_requiredField(env, cls, "st_nlink", "I");
+    und_attrs_st_uid = UnixNativeDispatcher_requiredField(env, cls, "st_uid", "I");
+    und_attrs_st_gid = UnixNativeDispatcher_requiredField(env, cls, "st_gid", "I");
+    und_attrs_st_size = UnixNativeDispatcher_requiredField(env, cls, "st_size", "J");
+    und_attrs_st_atime_sec = UnixNativeDispatcher_requiredField(env, cls, "st_atime_sec", "J");
+    und_attrs_st_atime_nsec = UnixNativeDispatcher_requiredField(env, cls, "st_atime_nsec", "J");
+    und_attrs_st_mtime_sec = UnixNativeDispatcher_requiredField(env, cls, "st_mtime_sec", "J");
+    und_attrs_st_mtime_nsec = UnixNativeDispatcher_requiredField(env, cls, "st_mtime_nsec", "J");
+    und_attrs_st_ctime_sec = UnixNativeDispatcher_requiredField(env, cls, "st_ctime_sec", "J");
+    und_attrs_st_ctime_nsec = UnixNativeDispatcher_requiredField(env, cls, "st_ctime_nsec", "J");
+    und_attrs_st_birthtime_sec = UnixNativeDispatcher_requiredField(env, cls, "st_birthtime_sec", "J");
+    (*env)->DeleteLocalRef(env, cls);
+    return und_attrs_st_mode && und_attrs_st_ino && und_attrs_st_dev &&
+           und_attrs_st_rdev && und_attrs_st_nlink && und_attrs_st_uid &&
+           und_attrs_st_gid && und_attrs_st_size && und_attrs_st_atime_sec &&
+           und_attrs_st_mtime_sec && und_attrs_st_ctime_sec;
+}
+
+static void UnixNativeDispatcher_fillAttributes(JNIEnv* env, jobject attrs, const struct stat* sb) {
+    if (!attrs || !sb || !UnixNativeDispatcher_initAttributeFields(env)) return;
+    (*env)->SetIntField(env, attrs, und_attrs_st_mode, (jint)sb->st_mode);
+    (*env)->SetLongField(env, attrs, und_attrs_st_ino, (jlong)sb->st_ino);
+    (*env)->SetLongField(env, attrs, und_attrs_st_dev, (jlong)sb->st_dev);
+    (*env)->SetLongField(env, attrs, und_attrs_st_rdev, (jlong)sb->st_rdev);
+    (*env)->SetIntField(env, attrs, und_attrs_st_nlink, (jint)sb->st_nlink);
+    (*env)->SetIntField(env, attrs, und_attrs_st_uid, (jint)sb->st_uid);
+    (*env)->SetIntField(env, attrs, und_attrs_st_gid, (jint)sb->st_gid);
+    (*env)->SetLongField(env, attrs, und_attrs_st_size, (jlong)sb->st_size);
+    (*env)->SetLongField(env, attrs, und_attrs_st_atime_sec, (jlong)sb->st_atime);
+    (*env)->SetLongField(env, attrs, und_attrs_st_mtime_sec, (jlong)sb->st_mtime);
+    (*env)->SetLongField(env, attrs, und_attrs_st_ctime_sec, (jlong)sb->st_ctime);
+#if defined(__APPLE__)
+    if (und_attrs_st_atime_nsec) (*env)->SetLongField(env, attrs, und_attrs_st_atime_nsec, (jlong)sb->st_atimespec.tv_nsec);
+    if (und_attrs_st_mtime_nsec) (*env)->SetLongField(env, attrs, und_attrs_st_mtime_nsec, (jlong)sb->st_mtimespec.tv_nsec);
+    if (und_attrs_st_ctime_nsec) (*env)->SetLongField(env, attrs, und_attrs_st_ctime_nsec, (jlong)sb->st_ctimespec.tv_nsec);
+    if (und_attrs_st_birthtime_sec) (*env)->SetLongField(env, attrs, und_attrs_st_birthtime_sec, (jlong)sb->st_birthtimespec.tv_sec);
+#else
+    if (und_attrs_st_atime_nsec) (*env)->SetLongField(env, attrs, und_attrs_st_atime_nsec, (jlong)sb->st_atim.tv_nsec);
+    if (und_attrs_st_mtime_nsec) (*env)->SetLongField(env, attrs, und_attrs_st_mtime_nsec, (jlong)sb->st_mtim.tv_nsec);
+    if (und_attrs_st_ctime_nsec) (*env)->SetLongField(env, attrs, und_attrs_st_ctime_nsec, (jlong)sb->st_ctim.tv_nsec);
+    if (und_attrs_st_birthtime_sec) (*env)->SetLongField(env, attrs, und_attrs_st_birthtime_sec, (jlong)sb->st_mtime);
+#endif
+}
+
+static const char* UnixNativeDispatcher_path(jlong pathAddress) {
+    return (const char*)(uintptr_t)pathAddress;
+}
+
+static jint UnixNativeDispatcher_init(JNIEnv* env, jclass clazz) {
+    UnixNativeDispatcher_initAttributeFields(env);
+    return 2 | 4; /* SUPPORTS_OPENAT | SUPPORTS_FUTIMES */
+}
+
+static jbyteArray UnixNativeDispatcher_getcwd(JNIEnv* env, jclass clazz) {
+    char cwd[PATH_MAX];
+    if (getcwd(cwd, sizeof(cwd)) == NULL || cwd[0] != '/') {
+        snprintf(cwd, sizeof(cwd), "/data/local/tmp/westlake");
+    }
+    static int log_count = 0;
+    if (log_count < 12) {
+        log_count++;
+        fprintf(stderr, "[PFCUT] UnixNativeDispatcher.getcwd -> %s\n", cwd);
+    }
+    return UnixNativeDispatcher_newByteArray(env, cwd);
+}
+
+static jbyteArray UnixNativeDispatcher_strerror(JNIEnv* env, jclass clazz, jint errnum) {
+    return UnixNativeDispatcher_newByteArray(env, strerror(errnum));
+}
+
+static jint UnixNativeDispatcher_dup(JNIEnv* env, jclass clazz, jint fd) {
+    int rc = dup((int)fd);
+    if (rc < 0) UnixNativeDispatcher_throwUnixException(env, errno);
+    return (jint)rc;
+}
+
+static jint UnixNativeDispatcher_open0(JNIEnv* env, jclass clazz, jlong pathAddress, jint flags, jint mode) {
+    const char* path = UnixNativeDispatcher_path(pathAddress);
+    int fd = open(path, (int)flags, (mode_t)mode);
+    if (fd < 0) UnixNativeDispatcher_throwUnixException(env, errno);
+    return (jint)fd;
+}
+
+static void UnixNativeDispatcher_close(JNIEnv* env, jclass clazz, jint fd) {
+    if (close((int)fd) < 0) {
+        UnixNativeDispatcher_throwUnixException(env, errno);
+    }
+}
+
+static jint UnixNativeDispatcher_read(JNIEnv* env, jclass clazz, jint fd, jlong buf, jint nbyte) {
+    ssize_t rc = read((int)fd, (void*)(uintptr_t)buf, (size_t)nbyte);
+    if (rc < 0) {
+        UnixNativeDispatcher_throwUnixException(env, errno);
+        return -1;
+    }
+    return (jint)rc;
+}
+
+static jint UnixNativeDispatcher_write(JNIEnv* env, jclass clazz, jint fd, jlong buf, jint nbyte) {
+    ssize_t rc = write((int)fd, (const void*)(uintptr_t)buf, (size_t)nbyte);
+    if (rc < 0) {
+        UnixNativeDispatcher_throwUnixException(env, errno);
+        return -1;
+    }
+    return (jint)rc;
+}
+
+static void UnixNativeDispatcher_stat0(JNIEnv* env, jclass clazz, jlong pathAddress, jobject attrs) {
+    const char* path = UnixNativeDispatcher_path(pathAddress);
+    struct stat sb;
+    if (stat(path, &sb) < 0) {
+        UnixNativeDispatcher_throwUnixException(env, errno);
+        return;
+    }
+    UnixNativeDispatcher_fillAttributes(env, attrs, &sb);
+}
+
+static jint UnixNativeDispatcher_stat1(JNIEnv* env, jclass clazz, jlong pathAddress) {
+    const char* path = UnixNativeDispatcher_path(pathAddress);
+    struct stat sb;
+    if (stat(path, &sb) < 0) return 0;
+    return (jint)sb.st_mode;
+}
+
+static void UnixNativeDispatcher_lstat0(JNIEnv* env, jclass clazz, jlong pathAddress, jobject attrs) {
+    const char* path = UnixNativeDispatcher_path(pathAddress);
+    struct stat sb;
+    if (lstat(path, &sb) < 0) {
+        UnixNativeDispatcher_throwUnixException(env, errno);
+        return;
+    }
+    UnixNativeDispatcher_fillAttributes(env, attrs, &sb);
+}
+
+static void UnixNativeDispatcher_fstat(JNIEnv* env, jclass clazz, jint fd, jobject attrs) {
+    struct stat sb;
+    if (fstat((int)fd, &sb) < 0) {
+        UnixNativeDispatcher_throwUnixException(env, errno);
+        return;
+    }
+    UnixNativeDispatcher_fillAttributes(env, attrs, &sb);
+}
+
+static void UnixNativeDispatcher_fstatat0(JNIEnv* env,
+                                          jclass clazz,
+                                          jint dfd,
+                                          jlong pathAddress,
+                                          jint flag,
+                                          jobject attrs) {
+    const char* path = UnixNativeDispatcher_path(pathAddress);
+    struct stat sb;
+    int rc = fstatat((int)dfd, path, &sb, (int)flag);
+    if (rc < 0) {
+        UnixNativeDispatcher_throwUnixException(env, errno);
+        return;
+    }
+    UnixNativeDispatcher_fillAttributes(env, attrs, &sb);
+}
+
+static void UnixNativeDispatcher_access0(JNIEnv* env, jclass clazz, jlong pathAddress, jint amode) {
+    const char* path = UnixNativeDispatcher_path(pathAddress);
+    if (access(path, (int)amode) < 0) {
+        UnixNativeDispatcher_throwUnixException(env, errno);
+    }
+}
+
+static jboolean UnixNativeDispatcher_exists0(JNIEnv* env, jclass clazz, jlong pathAddress) {
+    const char* path = UnixNativeDispatcher_path(pathAddress);
+    return access(path, F_OK) == 0 ? JNI_TRUE : JNI_FALSE;
+}
+
+static jbyteArray UnixNativeDispatcher_realpath0(JNIEnv* env, jclass clazz, jlong pathAddress) {
+    const char* path = UnixNativeDispatcher_path(pathAddress);
+    char resolved[PATH_MAX];
+    if (realpath(path, resolved) == NULL) {
+        UnixNativeDispatcher_throwUnixException(env, errno);
+        return NULL;
+    }
+    return UnixNativeDispatcher_newByteArray(env, resolved);
+}
+
+static jbyteArray UnixNativeDispatcher_readlink0(JNIEnv* env, jclass clazz, jlong pathAddress) {
+    const char* path = UnixNativeDispatcher_path(pathAddress);
+    char target[PATH_MAX];
+    ssize_t len = readlink(path, target, sizeof(target) - 1);
+    if (len < 0) {
+        UnixNativeDispatcher_throwUnixException(env, errno);
+        return NULL;
+    }
+    target[len] = '\0';
+    return UnixNativeDispatcher_newByteArray(env, target);
+}
+
+static void UnixNativeDispatcher_mkdir0(JNIEnv* env, jclass clazz, jlong pathAddress, jint mode) {
+    const char* path = UnixNativeDispatcher_path(pathAddress);
+    if (mkdir(path, (mode_t)mode) < 0) {
+        UnixNativeDispatcher_throwUnixException(env, errno);
+    }
+}
+
+static void UnixNativeDispatcher_rmdir0(JNIEnv* env, jclass clazz, jlong pathAddress) {
+    const char* path = UnixNativeDispatcher_path(pathAddress);
+    if (rmdir(path) < 0) {
+        UnixNativeDispatcher_throwUnixException(env, errno);
+    }
+}
+
+static void UnixNativeDispatcher_unlink0(JNIEnv* env, jclass clazz, jlong pathAddress) {
+    const char* path = UnixNativeDispatcher_path(pathAddress);
+    if (unlink(path) < 0) {
+        UnixNativeDispatcher_throwUnixException(env, errno);
+    }
+}
+
+static void UnixNativeDispatcher_rename0(JNIEnv* env, jclass clazz, jlong fromAddress, jlong toAddress) {
+    const char* from = UnixNativeDispatcher_path(fromAddress);
+    const char* to = UnixNativeDispatcher_path(toAddress);
+    if (rename(from, to) < 0) {
+        UnixNativeDispatcher_throwUnixException(env, errno);
+    }
+}
+
+static void UnixNativeDispatcher_chmod0(JNIEnv* env, jclass clazz, jlong pathAddress, jint mode) {
+    const char* path = UnixNativeDispatcher_path(pathAddress);
+    if (chmod(path, (mode_t)mode) < 0) {
+        UnixNativeDispatcher_throwUnixException(env, errno);
+    }
+}
+
+static void UnixNativeDispatcher_fchmod(JNIEnv* env, jclass clazz, jint fd, jint mode) {
+    if (fchmod((int)fd, (mode_t)mode) < 0) {
+        UnixNativeDispatcher_throwUnixException(env, errno);
+    }
+}
+
+static jlong UnixNativeDispatcher_opendir0(JNIEnv* env, jclass clazz, jlong pathAddress) {
+    const char* path = UnixNativeDispatcher_path(pathAddress);
+    DIR* dir = opendir(path);
+    if (!dir) {
+        UnixNativeDispatcher_throwUnixException(env, errno);
+        return 0;
+    }
+    return (jlong)(uintptr_t)dir;
+}
+
+static jlong UnixNativeDispatcher_fdopendir(JNIEnv* env, jclass clazz, jint dfd) {
+    DIR* dir = fdopendir((int)dfd);
+    if (!dir) {
+        UnixNativeDispatcher_throwUnixException(env, errno);
+        return 0;
+    }
+    return (jlong)(uintptr_t)dir;
+}
+
+static void UnixNativeDispatcher_closedir(JNIEnv* env, jclass clazz, jlong dir) {
+    DIR* value = (DIR*)(uintptr_t)dir;
+    if (value && closedir(value) < 0) {
+        UnixNativeDispatcher_throwUnixException(env, errno);
+    }
+}
+
+static jbyteArray UnixNativeDispatcher_readdir(JNIEnv* env, jclass clazz, jlong dir) {
+    DIR* value = (DIR*)(uintptr_t)dir;
+    if (!value) return NULL;
+    errno = 0;
+    struct dirent* entry = readdir(value);
+    if (!entry) {
+        if (errno != 0) UnixNativeDispatcher_throwUnixException(env, errno);
+        return NULL;
+    }
+    return UnixNativeDispatcher_newByteArray(env, entry->d_name);
+}
+
+static jlong UnixNativeDispatcher_pathconf0(JNIEnv* env, jclass clazz, jlong pathAddress, jint name) {
+    const char* path = UnixNativeDispatcher_path(pathAddress);
+    long rc = pathconf(path, (int)name);
+    if (rc < 0) {
+        UnixNativeDispatcher_throwUnixException(env, errno);
+        return -1;
+    }
+    return (jlong)rc;
+}
+
+static jlong UnixNativeDispatcher_fpathconf(JNIEnv* env, jclass clazz, jint fd, jint name) {
+    long rc = fpathconf((int)fd, (int)name);
+    if (rc < 0) {
+        UnixNativeDispatcher_throwUnixException(env, errno);
+        return -1;
+    }
+    return (jlong)rc;
+}
+
 /* ==================== java.io.FileOutputStream natives ==================== */
 
 static void FileOutputStream_initIDs(JNIEnv* env, jclass clazz) { /* no-op */ }
@@ -292,9 +819,7 @@ static void FileOutputStream_open0(JNIEnv* env, jobject thiz, jstring jname, jbo
     if (!fdField) { close(fd); return; }
     jobject fdObj = (*env)->GetObjectField(env, thiz, fdField);
     if (!fdObj) { close(fd); return; }
-    jclass fdCls = (*env)->GetObjectClass(env, fdObj);
-    jfieldID descField = (*env)->GetFieldID(env, fdCls, "descriptor", "I");
-    if (descField) (*env)->SetIntField(env, fdObj, descField, fd);
+    setChannelFd(env, fdObj, fd);
 }
 
 static void FileOutputStream_write(JNIEnv* env, jobject thiz, jint b, jboolean append) {
@@ -345,9 +870,7 @@ static void FileInputStream_open0(JNIEnv* env, jobject thiz, jstring jname) {
     if (!fdField) { close(fd); return; }
     jobject fdObj = (*env)->GetObjectField(env, thiz, fdField);
     if (!fdObj) { close(fd); return; }
-    jclass fdCls = (*env)->GetObjectClass(env, fdObj);
-    jfieldID descField = (*env)->GetFieldID(env, fdCls, "descriptor", "I");
-    if (descField) (*env)->SetIntField(env, fdObj, descField, fd);
+    setChannelFd(env, fdObj, fd);
 }
 
 static jint FileInputStream_read0(JNIEnv* env, jobject thiz) {
@@ -438,8 +961,12 @@ static jint UnixFileSystem_computeBooleanAttributes(const char* path) {
     return rv;
 }
 
+/* WESTLAKE §639: a userspace pointer on this target has zero bits above 47. A value like
+ * 0x69b8014056fd8 (garbage<<32 | heap-ref) fails this and would otherwise be dereferenced. */
+#define WL_PTR_PLAUSIBLE(p) ((p) != NULL && ((uintptr_t)(p) >> 48) == 0)
+
 static const char* File_getPathChars(JNIEnv* env, jobject file, jstring* out_jpath) {
-    if (!file) return NULL;
+    if (!WL_PTR_PLAUSIBLE(file)) return NULL;
     jclass fileCls = (*env)->GetObjectClass(env, file);
     if (!fileCls) return NULL;
     jmethodID getPath = (*env)->GetMethodID(env, fileCls, "getPath", "()Ljava/lang/String;");
@@ -457,6 +984,28 @@ static const char* File_getPathChars(JNIEnv* env, jobject file, jstring* out_jpa
     const char* path = (*env)->GetStringUTFChars(env, jpath, NULL);
     if (!path && (*env)->ExceptionCheck(env)) {
         (*env)->ExceptionClear(env);
+        (*env)->DeleteLocalRef(env, jpath);
+        return NULL;
+    }
+    /* WESTLAKE §639 (2026-08-15): validate the pointer before ANY caller uses it.
+     * Toutiao faulted inside Westlake_UnixFileSystem_getLastModifiedTime at
+     * addr=0x69b8014056fd8 — note the shape: garbage<<32 | 0x14056fd8, where the low half is a
+     * plausible heap reference on this port. That is the §609 "int<<32 receiver" signature
+     * (wide/reference vreg confusion), so one of `file` / `jpath` / `path` arrives with junk in
+     * its upper 32 bits and the first strlen/stat on it walks off the map.
+     * Every UnixFileSystem_* caller here already handles a NULL return by yielding its safe
+     * default (0 / JNI_FALSE / NULL), so failing closed costs nothing — and the log names the
+     * pointer that was wrong, which is the only cheap way to see it. */
+    if (!WL_PTR_PLAUSIBLE(path)) {
+        static int wl_bad_path = 0;
+        if (wl_bad_path < 20) {
+            wl_bad_path++;
+            fprintf(stderr,
+                    "[WESTLAKE-639] implausible UTF chars: file=%p jpath=%p path=%p\n",
+                    (void*)file, (void*)jpath, (const void*)path);
+            fflush(stderr);
+        }
+        if (path) (*env)->ReleaseStringUTFChars(env, jpath, path);
         (*env)->DeleteLocalRef(env, jpath);
         return NULL;
     }
@@ -662,31 +1211,232 @@ static jlong UnixFileSystem_getNameMax0(JNIEnv* env, jobject thiz, jstring jpath
     return (jlong)result;
 }
 
+/* WESTLAKE §641 (2026-08-15): STOP INFERRING, MEASURE.
+ * These wrappers fault on their very first JNI call (`ldr x8,[x0]; ldr x8,[x8,#248]`), and reading
+ * the registers post-mortem left me unsure what x0 even is: it looked like a STACK address, and x1
+ * looked like a pointer into libart's mapping rather than an ART IndirectRef. Rather than keep
+ * guessing at the calling convention from disassembly, log exactly what the shim is handed.
+ * Reading `*env` is safe here (env itself was readable; the fault was one level deeper, on
+ * `(*env)[GetObjectClass]`), so we can test the function table pointer before using it.
+ * Bailing returns each caller's existing safe default. */
+static int wl_env_usable(JNIEnv* env, jobject thiz, jobject file, const char* who) {
+    if (WL_PTR_PLAUSIBLE(env)) {
+        const void* tbl = *(void* const*)env;
+        if (WL_PTR_PLAUSIBLE(tbl)) {
+            return 1;
+        }
+        static int wl_bad_tbl = 0;
+        if (wl_bad_tbl < 20) {
+            wl_bad_tbl++;
+            /* WESTLAKE §642: name the CALLER from the frames themselves. The CHILDSEGV
+             * backtracer claimed art_quick_generic_jni_trampoline, but codex established that
+             * path always passes a real self->GetJniEnv(), and its own frame 2 return address
+             * was not 4-byte aligned — so it was lying. __builtin_return_address walks the real
+             * frame chain: ra0 = inside this shim's wrapper, ra1 = whoever invoked the wrapper. */
+            fprintf(stderr,
+                    "[WESTLAKE-641] %s: env=%p *env=%p thiz=%p file=%p (bad table) "
+                    "ra0=%p ra1=%p slot0=0x%08x slot1=0x%08x\n",
+                    who, (void*)env, (void*)tbl, (void*)thiz, (void*)file,
+                    __builtin_return_address(0),
+                    __builtin_return_address(1),
+                    ((const unsigned*)env)[0], ((const unsigned*)env)[1]);
+            fflush(stderr);
+        }
+        return 0;
+    }
+    {
+        static int wl_bad_env = 0;
+        if (wl_bad_env < 20) {
+            wl_bad_env++;
+            fprintf(stderr, "[WESTLAKE-641] %s: env=%p thiz=%p file=%p (bad env ptr)\n",
+                    who, (void*)env, (void*)thiz, (void*)file);
+            fflush(stderr);
+        }
+    }
+    return 0;
+}
+
 /* Wrappers for public UnixFileSystem methods patched directly in runtime.cc. */
 int Westlake_UnixFileSystem_getBooleanAttributes(JNIEnv* env, jobject thiz, jobject file) {
+    if (!wl_env_usable(env, thiz, file, "getBooleanAttributes")) return 0;
     return UnixFileSystem_getBooleanAttributes0(env, thiz, file);
 }
 
 jboolean Westlake_UnixFileSystem_hasBooleanAttributes(JNIEnv* env, jobject thiz, jobject file, jint mask) {
+    if (!wl_env_usable(env, thiz, file, "hasBooleanAttributes")) return JNI_FALSE;
     jint attrs = UnixFileSystem_getBooleanAttributes0(env, thiz, file);
     return ((attrs & mask) == mask) ? JNI_TRUE : JNI_FALSE;
 }
 
 jboolean Westlake_UnixFileSystem_checkAccess(JNIEnv* env, jobject thiz, jobject file, jint access_mode) {
+    if (!wl_env_usable(env, thiz, file, "checkAccess")) return JNI_FALSE;
     return UnixFileSystem_checkAccess0(env, thiz, file, access_mode);
 }
 
 jlong Westlake_UnixFileSystem_getLastModifiedTime(JNIEnv* env, jobject thiz, jobject file) {
+    if (!wl_env_usable(env, thiz, file, "getLastModifiedTime")) return 0;
     return UnixFileSystem_getLastModifiedTime0(env, thiz, file);
 }
 
 jlong Westlake_UnixFileSystem_getLength(JNIEnv* env, jobject thiz, jobject file) {
+    if (!wl_env_usable(env, thiz, file, "getLength")) return 0;
     return UnixFileSystem_getLength0(env, thiz, file);
+}
+
+jobjectArray Westlake_UnixFileSystem_list(JNIEnv* env, jobject thiz, jobject file) {
+    if (!wl_env_usable(env, thiz, file, "list")) return NULL;
+    return UnixFileSystem_list0(env, thiz, file);
 }
 
 /* ==================== java.lang.Runtime natives ==================== */
 
+/* Defined in patches/runtime/runtime.cc (extern "C"); linked into the same libart.so. */
+extern int westlake_java_stack_contains(const char* needle);
+extern void* _ZN3art6Thread14CurrentFromGdbEv(void);
+extern jobject westlake_art_get_class_loader_override(void* thread);
+extern void westlake_art_set_class_loader_override(void* thread, jobject class_loader);
+
+/* WESTLAKE §754 (2026-08-20): opt-in diagnostics for the Android/OH native
+ * library boundary.  Keep this observational: Android libraries must register
+ * their own JNI surface through JNI_OnLoad rather than acquiring app-specific
+ * native stubs in the framework. */
+static int Westlake_trace_native_load(void) {
+    const char* value = getenv("WESTLAKE_TRACE_NATIVE_LOAD");
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0 &&
+           strcmp(value, "false") != 0 && strcmp(value, "FALSE") != 0 &&
+           strcmp(value, "no") != 0 && strcmp(value, "NO") != 0 &&
+           strcmp(value, "off") != 0 && strcmp(value, "OFF") != 0;
+}
+
+/* Opt-in Android native namespace boundary.
+ *
+ * OH's loader namespaces are the correct place to keep an app's Android
+ * libc++/NDK ABI separate from the OH process namespace.  Direct targets and
+ * the optional load-group anchor are supplied by the launcher so this runtime
+ * contains no package or library special cases. */
+typedef void (*WestlakeDlnsInitFn)(Dl_namespace*, const char*);
+typedef int (*WestlakeDlnsGetFn)(const char*, Dl_namespace*);
+typedef int (*WestlakeDlnsCreate2Fn)(Dl_namespace*, const char*, int);
+typedef int (*WestlakeDlnsInheritFn)(Dl_namespace*, Dl_namespace*, const char*);
+typedef void* (*WestlakeDlopenNsFn)(Dl_namespace*, const char*, int);
+
+static pthread_mutex_t g_westlake_android_ns_mutex = PTHREAD_MUTEX_INITIALIZER;
+static Dl_namespace g_westlake_android_ns;
+static WestlakeDlopenNsFn g_westlake_dlopen_ns;
+static int g_westlake_android_ns_state;
+
+static int Westlake_native_basename_in_list(const char* path,
+                                             const char* list) {
+    if (path == NULL || list == NULL || list[0] == '\0') return 0;
+    const char* basename = strrchr(path, '/');
+    basename = basename != NULL ? basename + 1 : path;
+    size_t basename_length = strlen(basename);
+    const char* item = list;
+    while (*item != '\0') {
+        const char* end = strchr(item, ':');
+        size_t item_length = end != NULL ? (size_t)(end - item) : strlen(item);
+        if (item_length == basename_length &&
+            memcmp(item, basename, basename_length) == 0) {
+            return 1;
+        }
+        if (end == NULL) break;
+        item = end + 1;
+    }
+    return 0;
+}
+
+static int Westlake_native_anchor_selected(const char* path) {
+    return Westlake_native_basename_in_list(
+            path, getenv("WESTLAKE_ANDROID_NATIVE_ANCHOR_TARGET"));
+}
+
+static int Westlake_native_direct_selected(const char* path) {
+    return Westlake_native_basename_in_list(
+            path, getenv("WESTLAKE_ANDROID_NATIVE_TARGETS"));
+}
+
+static void* Westlake_dlopen_android_boundary(const char* path,
+                                               int use_anchor) {
+    const char* search_path = getenv("WESTLAKE_ANDROID_NATIVE_SEARCH_PATH");
+    const char* inherit_list = getenv("WESTLAKE_ANDROID_NATIVE_INHERIT");
+    const char* open_path = path;
+    if (use_anchor) {
+        open_path = getenv("WESTLAKE_ANDROID_NATIVE_ANCHOR");
+    }
+    if (open_path == NULL || open_path[0] == '\0' ||
+        search_path == NULL || search_path[0] == '\0') {
+        fprintf(stderr,
+                "[WESTLAKE-NATIVENS-761] missing load path or search path"
+                " mode=%s\n",
+                use_anchor ? "anchor" : "direct");
+        return NULL;
+    }
+    if (inherit_list == NULL || inherit_list[0] == '\0') {
+        inherit_list =
+                "libc.so:libdl.so:libm.so:libz.so:libbionic_abi_shim.so";
+    }
+
+    pthread_mutex_lock(&g_westlake_android_ns_mutex);
+    if (g_westlake_android_ns_state == 0) {
+        WestlakeDlnsInitFn init_fn =
+                (WestlakeDlnsInitFn)dlsym(RTLD_DEFAULT, "dlns_init");
+        WestlakeDlnsGetFn get_fn =
+                (WestlakeDlnsGetFn)dlsym(RTLD_DEFAULT, "dlns_get");
+        WestlakeDlnsCreate2Fn create_fn =
+                (WestlakeDlnsCreate2Fn)dlsym(RTLD_DEFAULT, "dlns_create2");
+        WestlakeDlnsInheritFn inherit_fn =
+                (WestlakeDlnsInheritFn)dlsym(RTLD_DEFAULT, "dlns_inherit");
+        g_westlake_dlopen_ns =
+                (WestlakeDlopenNsFn)dlsym(RTLD_DEFAULT, "dlopen_ns");
+        Dl_namespace parent;
+        memset(&parent, 0, sizeof(parent));
+        memset(&g_westlake_android_ns, 0, sizeof(g_westlake_android_ns));
+        int get_rc = get_fn != NULL ? get_fn(NULL, &parent) : -1;
+        if (init_fn == NULL || create_fn == NULL || inherit_fn == NULL ||
+            g_westlake_dlopen_ns == NULL || get_rc != 0) {
+            g_westlake_android_ns_state = -1;
+        } else {
+            init_fn(&g_westlake_android_ns, "westlake_android_app");
+            int create_rc = create_fn(&g_westlake_android_ns, search_path, 0);
+            int inherit_rc = create_rc == 0
+                    ? inherit_fn(&g_westlake_android_ns, &parent, inherit_list)
+                    : -1;
+            g_westlake_android_ns_state =
+                    create_rc == 0 && inherit_rc == 0 ? 1 : -1;
+            fprintf(stderr,
+                    "[WESTLAKE-NATIVENS-761] create=%d inherit=%d state=%d"
+                    " search=%s\n",
+                    create_rc, inherit_rc, g_westlake_android_ns_state,
+                    search_path);
+        }
+    }
+    WestlakeDlopenNsFn open_fn = g_westlake_dlopen_ns;
+    int ready = g_westlake_android_ns_state == 1;
+    pthread_mutex_unlock(&g_westlake_android_ns_mutex);
+    if (!ready || open_fn == NULL) return NULL;
+
+    void* handle = open_fn(&g_westlake_android_ns, open_path,
+                           RTLD_NOW | RTLD_GLOBAL);
+    fprintf(stderr,
+            "[WESTLAKE-NATIVENS-761] mode=%s requested=%s opened=%s"
+            " handle=%p\n",
+            use_anchor ? "anchor" : "direct",
+            path != NULL ? path : "(null)", open_path, handle);
+    fflush(stderr);
+    return handle;
+}
+
 static void Runtime_nativeExit(JNIEnv* env, jclass clazz, jint status) {
+    /* WESTLAKE (2026-07-11): sun.misc.Cleaner.clean() fires System.exit(1) when a
+     * Cleaner thunk throws (restarted ReferenceQueueDaemon on this arm64 adapter).
+     * A native-buffer cleanup failure must NOT terminate the app — swallow that
+     * specific exit (Cleaner on the calling stack). All other exits proceed. */
+    if (westlake_java_stack_contains("Cleaner")) {
+        fprintf(stderr, "[EXIT-SWALLOW] Runtime_nativeExit(%d) suppressed — Cleaner thunk "
+                "failure must not kill the app (returning to caller)\n", (int)status);
+        fflush(stderr);
+        return;
+    }
     _exit(status);
 }
 
@@ -698,34 +1448,122 @@ static jstring Runtime_nativeLoad(JNIEnv* env, jclass clazz, jstring filename,
                                    jobject classLoader, jclass caller) {
     if (!filename) return (*env)->NewStringUTF(env, "null filename");
     const char* path = (*env)->GetStringUTFChars(env, filename, NULL);
+    fprintf(stderr, "[PF202N] Runtime_nativeLoad path=%s\n", path ? path : "(null)");
+    fflush(stderr);
     /* Return success for statically-linked libraries */
     if (strstr(path, "javacore") || strstr(path, "openjdk") ||
         strstr(path, "icu_jni") || strstr(path, "icu-jni")) {
+        fprintf(stderr, "[PF202N] Runtime_nativeLoad static-success path=%s\n", path);
+        fflush(stderr);
         (*env)->ReleaseStringUTFChars(env, filename, path);
         return NULL; /* null = success, already registered */
     }
     /* OHBridge: register methods now (deferred from InitNativeMethods) */
     if (strstr(path, "oh_bridge")) {
+        fprintf(stderr, "[PF202N] Runtime_nativeLoad oh_bridge dispatch path=%s\n", path);
+        fflush(stderr);
         (*env)->ReleaseStringUTFChars(env, filename, path);
         JavaVM* vm; (*env)->GetJavaVM(env, &vm);
         JNI_OnLoad_ohbridge(vm, NULL);
+        fprintf(stderr, "[PF202N] Runtime_nativeLoad oh_bridge returned\n");
+        fflush(stderr);
         return NULL; /* null = success */
     }
-    /* Try dlopen for other libraries */
-    void* handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+    /*
+     * android_runtime_stub: Westlake M3-finish.  The binder JNI methods
+     * (Java_android_os_ServiceManager_native*) are statically linked into
+     * dalvikvm via stubs/binder_jni_stub.cc.  Returning null = success makes
+     * the System.loadLibrary("android_runtime_stub") in ServiceManager.java
+     * succeed without invoking dlopen (which is a stub for bionic-static).
+     *
+     * Symbol resolution: ART's static build resolves Java natives via
+     * dlsym(handle, "Java_*").  Since our handle is null (success), dlsym
+     * never finds our static symbols — so we MUST RegisterNatives ourselves
+     * via JNI_OnLoad_binder_with_cl, passing the calling classLoader so
+     * FindClass("android/os/ServiceManager") works (the class lives in
+     * aosp-shim.dex on the -cp, not bootclasspath).
+     */
+    if (strstr(path, "android_runtime_stub")) {
+        fprintf(stderr, "[PF202N] Runtime_nativeLoad android_runtime_stub static-success path=%s\n", path);
+        fflush(stderr);
+        (*env)->ReleaseStringUTFChars(env, filename, path);
+        extern jint JNI_OnLoad_binder_with_cl(JavaVM* vm, jobject classLoader);
+        JavaVM* vm; (*env)->GetJavaVM(env, &vm);
+        JNI_OnLoad_binder_with_cl(vm, classLoader);
+        return NULL; /* null = success */
+    }
+    /*
+     * Platform-first Realm boundary probe.
+     *
+     * The portable/static Westlake runtime cannot load stock APK shared
+     * objects yet: bionic's static libdl path reports "libdl.a is a stub".
+     * Returning success for Realm only lets Java initialization continue to
+     * the interpreter-side Realm native-method defaults, so we can identify
+     * the next real APK runtime blocker without claiming native .so support.
+     */
+    if (path && strstr(path, "librealm-jni") != NULL) {
+        fprintf(stderr, "[PFCUT-REALM] Runtime_nativeLoad stub-success path=%s\n", path);
+        fflush(stderr);
+        (*env)->ReleaseStringUTFChars(env, filename, path);
+        return NULL;
+    }
+    /* Try dlopen for other libraries.  Capture each libdl error immediately:
+     * dlerror() consumes it, so a later diagnostic otherwise destroys the
+     * failure text used by Runtime.load0(). */
+    dlerror();
+    const int use_android_anchor = Westlake_native_anchor_selected(path);
+    const int use_android_direct = Westlake_native_direct_selected(path);
+    void* handle = use_android_anchor || use_android_direct
+            ? Westlake_dlopen_android_boundary(path, use_android_anchor)
+            : dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+    const char* open_error = dlerror();
+    if (Westlake_trace_native_load()) {
+        fprintf(stderr,
+                "[WESTLAKE-NATIVELOAD-754] dlopen path=%s handle=%p error=%s\n",
+                path ? path : "(null)", handle,
+                open_error ? open_error : "(none)");
+        fflush(stderr);
+    }
     if (!handle) {
-        const char* err = dlerror();
-        jstring result = (*env)->NewStringUTF(env, err ? err : "dlopen not supported");
+        jstring result = (*env)->NewStringUTF(
+                env, open_error ? open_error : "dlopen not supported");
         (*env)->ReleaseStringUTFChars(env, filename, path);
         return result;
     }
     /* Call JNI_OnLoad if present */
     typedef jint (*JNI_OnLoad_fn)(JavaVM*, void*);
+    dlerror();
     JNI_OnLoad_fn onLoad = (JNI_OnLoad_fn)dlsym(handle, "JNI_OnLoad");
+    const char* symbol_error = dlerror();
+    if (Westlake_trace_native_load()) {
+        fprintf(stderr,
+                "[WESTLAKE-NATIVELOAD-754] dlsym path=%s handle=%p "
+                "JNI_OnLoad=%p error=%s\n",
+                path ? path : "(null)", handle, (void*)onLoad,
+                symbol_error ? symbol_error : "(none)");
+        fflush(stderr);
+    }
     if (onLoad) {
         JavaVM* vm;
         (*env)->GetJavaVM(env, &vm);
+        void* art_thread = _ZN3art6Thread14CurrentFromGdbEv();
+        jobject old_class_loader = NULL;
+        if (art_thread != NULL) {
+            old_class_loader = (*env)->NewLocalRef(
+                    env, westlake_art_get_class_loader_override(art_thread));
+            westlake_art_set_class_loader_override(art_thread, classLoader);
+            fprintf(stderr,
+                    "[PF202N] Runtime_nativeLoad class-loader override thread=%p loader=%p\n",
+                    art_thread, classLoader);
+            fflush(stderr);
+        }
         jint ver = onLoad(vm, NULL);
+        if (art_thread != NULL) {
+            westlake_art_set_class_loader_override(art_thread, old_class_loader);
+            if (old_class_loader != NULL) {
+                (*env)->DeleteLocalRef(env, old_class_loader);
+            }
+        }
         if (ver < 0) {
             dlclose(handle);
             (*env)->ReleaseStringUTFChars(env, filename, path);
@@ -1102,6 +1940,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
         jclass cls = (*env)->FindClass(env, "sun/nio/ch/FileDispatcherImpl");
         if (cls) {
             JNINativeMethod methods[] = {
+                {"init0", "()V", (void*)FileDispatcherImpl_init},
                 {"read0", "(Ljava/io/FileDescriptor;JI)I", (void*)FileDispatcherImpl_read0},
                 {"write0", "(Ljava/io/FileDescriptor;JI)I", (void*)FileDispatcherImpl_write0},
                 {"pread0", "(Ljava/io/FileDescriptor;JIJ)I", (void*)FileDispatcherImpl_pread0},
@@ -1109,10 +1948,113 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
                 {"size0", "(Ljava/io/FileDescriptor;)J", (void*)FileDispatcherImpl_size0},
                 {"close0", "(Ljava/io/FileDescriptor;)V", (void*)FileDispatcherImpl_close0},
                 {"force0", "(Ljava/io/FileDescriptor;Z)I", (void*)FileDispatcherImpl_force0},
+                {"seek0", "(Ljava/io/FileDescriptor;J)J", (void*)FileDispatcherImpl_seek0},
                 {"truncate0", "(Ljava/io/FileDescriptor;J)I", (void*)FileDispatcherImpl_truncate0},
+                {"lock0", "(Ljava/io/FileDescriptor;ZJJZ)I", (void*)FileDispatcherImpl_lock0},
+                {"release0", "(Ljava/io/FileDescriptor;JJ)V", (void*)FileDispatcherImpl_release0},
+                {"closeIntFD", "(I)V", (void*)FileDispatcherImpl_closeIntFD},
+                {"allocationGranularity0", "()J", (void*)FileDispatcherImpl_allocationGranularity0},
+                {"map0", "(Ljava/io/FileDescriptor;IJJZ)J", (void*)FileDispatcherImpl_map0},
+                {"unmap0", "(JJ)I", (void*)FileChannelImpl_unmap0},
+                {"setDirect0", "(Ljava/io/FileDescriptor;)I", (void*)FileDispatcherImpl_setDirect0},
             };
             registerNativesOrSkip(env, cls, methods, sizeof(methods)/sizeof(methods[0]));
             (*env)->DeleteLocalRef(env, cls);
+        }
+    }
+
+    /* sun.nio.ch.UnixFileDispatcherImpl */
+    {
+        jclass cls = (*env)->FindClass(env, "sun/nio/ch/UnixFileDispatcherImpl");
+        if (cls) {
+            JNINativeMethod methods[] = {
+                {"read0", "(Ljava/io/FileDescriptor;JI)I", (void*)FileDispatcherImpl_read0},
+                {"write0", "(Ljava/io/FileDescriptor;JI)I", (void*)FileDispatcherImpl_write0},
+                {"pread0", "(Ljava/io/FileDescriptor;JIJ)I", (void*)FileDispatcherImpl_pread0},
+                {"pwrite0", "(Ljava/io/FileDescriptor;JIJ)I", (void*)FileDispatcherImpl_pwrite0},
+                {"force0", "(Ljava/io/FileDescriptor;Z)I", (void*)FileDispatcherImpl_force0},
+                {"seek0", "(Ljava/io/FileDescriptor;J)J", (void*)FileDispatcherImpl_seek0},
+                {"truncate0", "(Ljava/io/FileDescriptor;J)I", (void*)FileDispatcherImpl_truncate0},
+                {"size0", "(Ljava/io/FileDescriptor;)J", (void*)FileDispatcherImpl_size0},
+                {"lock0", "(Ljava/io/FileDescriptor;ZJJZ)I", (void*)FileDispatcherImpl_lock0},
+                {"release0", "(Ljava/io/FileDescriptor;JJ)V", (void*)FileDispatcherImpl_release0},
+                {"closeIntFD", "(I)V", (void*)FileDispatcherImpl_closeIntFD},
+                {"allocationGranularity0", "()J", (void*)FileDispatcherImpl_allocationGranularity0},
+                {"map0", "(Ljava/io/FileDescriptor;IJJZ)J", (void*)FileDispatcherImpl_map0},
+                {"unmap0", "(JJ)I", (void*)FileChannelImpl_unmap0},
+                {"setDirect0", "(Ljava/io/FileDescriptor;)I", (void*)FileDispatcherImpl_setDirect0},
+            };
+            registerNativesOrSkip(env, cls, methods, sizeof(methods)/sizeof(methods[0]));
+            (*env)->DeleteLocalRef(env, cls);
+        }
+    }
+
+    /* sun.nio.ch.FileChannelImpl */
+    {
+        jclass cls = (*env)->FindClass(env, "sun/nio/ch/FileChannelImpl");
+        if (cls) {
+            JNINativeMethod methods[] = {
+                {"initIDs", "()J", (void*)FileChannelImpl_initIDs},
+                {"map0", "(IJJ)J", (void*)FileChannelImpl_map0},
+                {"unmap0", "(JJ)I", (void*)FileChannelImpl_unmap0},
+            };
+            registerNativesOrSkip(env, cls, methods, sizeof(methods)/sizeof(methods[0]));
+            (*env)->DeleteLocalRef(env, cls);
+        }
+    }
+
+    /* sun.nio.ch.NativeThread */
+    {
+        jclass cls = (*env)->FindClass(env, "sun/nio/ch/NativeThread");
+        if (cls) {
+            JNINativeMethod methods[] = {
+                {"current", "()J", (void*)NativeThread_current},
+                {"signal", "(J)V", (void*)NativeThread_signal},
+            };
+            registerNativesOrSkip(env, cls, methods, sizeof(methods)/sizeof(methods[0]));
+            (*env)->DeleteLocalRef(env, cls);
+        }
+    }
+
+    /* sun.nio.fs.UnixNativeDispatcher */
+    {
+        jclass cls = (*env)->FindClass(env, "sun/nio/fs/UnixNativeDispatcher");
+        if (cls) {
+            JNINativeMethod methods[] = {
+                {"init", "()I", (void*)UnixNativeDispatcher_init},
+                {"getcwd", "()[B", (void*)UnixNativeDispatcher_getcwd},
+                {"strerror", "(I)[B", (void*)UnixNativeDispatcher_strerror},
+                {"dup", "(I)I", (void*)UnixNativeDispatcher_dup},
+                {"open0", "(JII)I", (void*)UnixNativeDispatcher_open0},
+                {"close", "(I)V", (void*)UnixNativeDispatcher_close},
+                {"read", "(IJI)I", (void*)UnixNativeDispatcher_read},
+                {"write", "(IJI)I", (void*)UnixNativeDispatcher_write},
+                {"stat0", "(JLsun/nio/fs/UnixFileAttributes;)V", (void*)UnixNativeDispatcher_stat0},
+                {"stat1", "(J)I", (void*)UnixNativeDispatcher_stat1},
+                {"lstat0", "(JLsun/nio/fs/UnixFileAttributes;)V", (void*)UnixNativeDispatcher_lstat0},
+                {"fstat", "(ILsun/nio/fs/UnixFileAttributes;)V", (void*)UnixNativeDispatcher_fstat},
+                {"fstatat0", "(IJILsun/nio/fs/UnixFileAttributes;)V", (void*)UnixNativeDispatcher_fstatat0},
+                {"access0", "(JI)V", (void*)UnixNativeDispatcher_access0},
+                {"exists0", "(J)Z", (void*)UnixNativeDispatcher_exists0},
+                {"realpath0", "(J)[B", (void*)UnixNativeDispatcher_realpath0},
+                {"readlink0", "(J)[B", (void*)UnixNativeDispatcher_readlink0},
+                {"mkdir0", "(JI)V", (void*)UnixNativeDispatcher_mkdir0},
+                {"rmdir0", "(J)V", (void*)UnixNativeDispatcher_rmdir0},
+                {"unlink0", "(J)V", (void*)UnixNativeDispatcher_unlink0},
+                {"rename0", "(JJ)V", (void*)UnixNativeDispatcher_rename0},
+                {"chmod0", "(JI)V", (void*)UnixNativeDispatcher_chmod0},
+                {"fchmod", "(II)V", (void*)UnixNativeDispatcher_fchmod},
+                {"opendir0", "(J)J", (void*)UnixNativeDispatcher_opendir0},
+                {"fdopendir", "(I)J", (void*)UnixNativeDispatcher_fdopendir},
+                {"closedir", "(J)V", (void*)UnixNativeDispatcher_closedir},
+                {"readdir", "(J)[B", (void*)UnixNativeDispatcher_readdir},
+                {"pathconf0", "(JI)J", (void*)UnixNativeDispatcher_pathconf0},
+                {"fpathconf", "(II)J", (void*)UnixNativeDispatcher_fpathconf},
+            };
+            registerNativesOrSkip(env, cls, methods, sizeof(methods)/sizeof(methods[0]));
+            (*env)->DeleteLocalRef(env, cls);
+        } else {
+            (*env)->ExceptionClear(env);
         }
     }
 

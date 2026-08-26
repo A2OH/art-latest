@@ -61,6 +61,34 @@ namespace instrumentation {
 
 constexpr bool kVerboseInstrumentation = false;
 
+static const void* PFCutCodeForInstrumentationInvoke(ArtMethod* method, const void* code)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  static constexpr uintptr_t kPFCutStaleEntry = 0xfffffffffffffb17ULL;
+  const bool stale_quick = reinterpret_cast<uintptr_t>(code) == kPFCutStaleEntry;
+  const bool stale_jni =
+      method->IsNative() &&
+      reinterpret_cast<uintptr_t>(method->GetEntryPointFromJni()) == kPFCutStaleEntry;
+  if (UNLIKELY(stale_quick || stale_jni)) {
+    code = method->IsNative() ? GetQuickGenericJniStub() : GetQuickToInterpreterBridge();
+    method->SetEntryPointFromQuickCompiledCode(code);
+    if (method->IsNative()) {
+      method->SetEntryPointFromJniPtrSize(nullptr, kRuntimePointerSize);
+    }
+    static thread_local int repair_count = 0;
+    if (repair_count < 80) {
+      repair_count++;
+      fprintf(stderr,
+              "[PFCUT] instrumentation stale entry repair native=%d stale_quick=%d stale_jni=%d %s\n",
+              method->IsNative() ? 1 : 0,
+              stale_quick ? 1 : 0,
+              stale_jni ? 1 : 0,
+              method->PrettyMethod().c_str());
+      fflush(stderr);
+    }
+  }
+  return code;
+}
+
 void InstrumentationListener::MethodExited(
     Thread* thread,
     ArtMethod* method,
@@ -1449,7 +1477,8 @@ const void* Instrumentation::GetCodeForInvoke(ArtMethod* method) {
   // and that should never be getting proxy methods.
   DCHECK(!method->IsProxyMethod()) << method->PrettyMethod();
   ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
-  const void* code = method->GetEntryPointFromQuickCompiledCodePtrSize(kRuntimePointerSize);
+  const void* code = PFCutCodeForInstrumentationInvoke(
+      method, method->GetEntryPointFromQuickCompiledCodePtrSize(kRuntimePointerSize));
   // If we don't have the instrumentation, the resolution stub, or the
   // interpreter, just return the current entrypoint,
   // assuming it's the most optimized.

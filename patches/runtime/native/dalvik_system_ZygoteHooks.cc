@@ -299,13 +299,24 @@ static void ZygoteHooks_nativePostForkChild(JNIEnv* env,
                                             jboolean is_zygote,
                                             jstring instruction_set) {
   DCHECK(!(is_system_server && is_zygote));
+  fprintf(stderr, "[PFC-CP] 0 entry nativePostForkChild\n"); fflush(stderr);
   // Reload the current flags first. In case we need to take any updated actions.
   Runtime::Current()->ReloadAllFlags(__FUNCTION__);
+  fprintf(stderr, "[PFC-CP] 1 after ReloadAllFlags\n"); fflush(stderr);
   // Then, set the runtime state, in case JIT and other services
   // start querying it.
   Runtime::Current()->SetAsZygoteChild(is_system_server, is_zygote);
 
   Thread* thread = reinterpret_cast<Thread*>(token);
+  if (thread == nullptr) {
+    // 2026-07-09: token==0 because ZygoteHooks.preFork() threw (its exception meant
+    // nativePreFork never returned the Thread* token). After fork the ONE surviving
+    // thread IS Thread::Current() — exactly what InitAfterFork must reset. Deref of
+    // null here in InitTid() (this->tls32_.tid=...) faults, and the OHOS fault
+    // handler cannot recover it (PC-edit dropped) → infinite re-fault SPIN (child
+    // stuck at postForkChild, state R). Fall back to Current().
+    thread = Thread::Current();
+  }
   // Our system thread ID, etc, has changed so reset Thread state.
   thread->InitAfterFork();
   runtime_flags = EnableDebugFeatures(runtime_flags);
@@ -346,6 +357,7 @@ static void ZygoteHooks_nativePostForkChild(JNIEnv* env,
   }
 
   runtime->GetHeap()->PostForkChildAction(thread);
+  fprintf(stderr, "[PFC-CP] 3 after Heap PostForkChildAction\n"); fflush(stderr);
 
   if (!is_zygote) {
     // Setup an app startup complete task in case the app doesn't notify it
@@ -363,6 +375,7 @@ static void ZygoteHooks_nativePostForkChild(JNIEnv* env,
     // This must be called after EnableDebugFeatures.
     runtime->GetJit()->PostForkChildAction(is_system_server, is_zygote);
   }
+  fprintf(stderr, "[PFC-CP] 4 after JIT PostForkChildAction\n"); fflush(stderr);
 
   // Update tracing.
   if (Trace::GetMethodTracingMode() != TracingMode::kTracingInactive) {
@@ -424,6 +437,7 @@ static void ZygoteHooks_nativePostForkChild(JNIEnv* env,
     std::srand(static_cast<uint32_t>(NanoTime()));
   }
 
+  fprintf(stderr, "[PFC-CP] 5 before InitNonZygoteOrPostFork\n"); fflush(stderr);
   if (instruction_set != nullptr && !is_system_server) {
     ScopedUtfChars isa_string(env, instruction_set);
     InstructionSet isa = GetInstructionSetFromString(isa_string.c_str());

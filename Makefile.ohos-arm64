@@ -159,7 +159,7 @@ RTP_PATCH_SRC = patches/compiler/optimizing/reference_type_propagation.cc
 RTP_PATCH_OBJ = $(BUILDDIR)/compiler/optimizing/reference_type_propagation.o
 $(RTP_PATCH_OBJ): $(RTP_PATCH_SRC)
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -iquote $(ART)/compiler/optimizing -c $< -o $@ 2>&1 && echo "OK: reference_type_propagation.cc (patched)" || { echo "FAIL: reference_type_propagation.cc (patched)"; rm -f $@; }
+	$(CXX) $(CXXFLAGS) -O2 -iquote $(ART)/compiler/optimizing -c $< -o $@ 2>&1 && echo "OK: reference_type_propagation.cc (patched, -O2 §793)" || { echo "FAIL: reference_type_propagation.cc (patched)"; rm -f $@; }
 COMPILER_OBJS += $(RTP_PATCH_OBJ)
 
 # ============ runtime ============
@@ -225,6 +225,8 @@ RUNTIME_EXCLUDE = %backtrace_helper.cc \
   %runtime/class_linker.cc \
   %runtime/thread.cc \
   %runtime/runtime.cc \
+  %interpreter/interpreter.cc \
+  %interpreter/interpreter_common.cc \
   %interpreter/unstarted_runtime.cc \
   %runtime/art_method.cc \
   %mirror/class.cc \
@@ -247,6 +249,17 @@ $(RT_PATCH_OBJ): $(RT_PATCH_SRC)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@ 2>&1 && echo "OK: runtime.cc (patched)" || { echo "FAIL: runtime.cc (patched)"; rm -f $@; }
 RUNTIME_OBJS += $(RT_PATCH_OBJ)
+
+# 2026-07-09: compile the arm64 fault handler back IN (it is in RUNTIME_EXCLUDE, so
+# ART had NO implicit-null-check recovery on arm64 → every framework null deref was a
+# fatal exit(1), incl. the ~18s parent death). Patched copy adds the MTE SEGV defines
+# + logs the faulting method.
+FH_PATCH_SRC = patches/runtime/arch/arm64/fault_handler_arm64.cc
+FH_PATCH_OBJ = $(BUILDDIR)/runtime/arch/arm64/fault_handler_arm64.o
+$(FH_PATCH_OBJ): $(FH_PATCH_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -I$(ART)/runtime/arch/arm64 -c $< -o $@ 2>&1 && echo "OK: fault_handler_arm64.cc (patched-IN)" || { echo "FAIL: fault_handler_arm64.cc"; rm -f $@; }
+RUNTIME_OBJS += $(FH_PATCH_OBJ)
 
 # Patched class_linker.cc
 CL_PATCH_SRC = patches/runtime/class_linker.cc
@@ -311,6 +324,27 @@ $(VARHANDLES_PATCH_OBJ): $(VARHANDLES_PATCH_SRC)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@ 2>&1 && echo "OK: var_handles.cc (patched)" || { echo "FAIL: var_handles.cc (patched)"; rm -f $@; }
 RUNTIME_OBJS += $(VARHANDLES_PATCH_OBJ)
+
+# Patched interpreter.cc (InterpreterJni shorty patterns)
+INTERP_PATCH_SRC = patches/runtime/interpreter/interpreter.cc
+INTERP_PATCH_OBJ = $(BUILDDIR)/runtime/interpreter/interpreter.o
+WESTLAKE_QUIET_STDIO_HDR = patches/runtime/interpreter/westlake_quiet_stdio.h
+# Opt-in experiment only.  The 2026-08-24 Toutiao A/B run rejected hot
+# diagnostic stderr as the primary article-delay cause, so normal builds must
+# retain the validated diagnostic behavior.
+WESTLAKE_INTERPRETER_DIAG_FLAGS ?=
+$(INTERP_PATCH_OBJ): $(INTERP_PATCH_SRC) $(WESTLAKE_QUIET_STDIO_HDR)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(WESTLAKE_INTERPRETER_DIAG_FLAGS) -I$(ART)/runtime/interpreter -c $< -o $@ 2>&1 && echo "OK: interpreter.cc (patched)" || { echo "FAIL: interpreter.cc (patched)"; rm -f $@; }
+RUNTIME_OBJS += $(INTERP_PATCH_OBJ)
+
+# Patched interpreter_common.cc (ShouldStayInSwitchInterpreter)
+INTERP_COMMON_PATCH_SRC = patches/runtime/interpreter/interpreter_common.cc
+INTERP_COMMON_PATCH_OBJ = $(BUILDDIR)/runtime/interpreter/interpreter_common.o
+$(INTERP_COMMON_PATCH_OBJ): $(INTERP_COMMON_PATCH_SRC) $(WESTLAKE_QUIET_STDIO_HDR)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(WESTLAKE_INTERPRETER_DIAG_FLAGS) -I$(ART)/runtime/interpreter -c $< -o $@ 2>&1 && echo "OK: interpreter_common.cc (patched)" || { echo "FAIL: interpreter_common.cc (patched)"; rm -f $@; }
+RUNTIME_OBJS += $(INTERP_COMMON_PATCH_OBJ)
 
 # Patched unstarted_runtime.cc
 UNSTARTED_PATCH_SRC = patches/runtime/interpreter/unstarted_runtime.cc
@@ -551,6 +585,7 @@ ziparchive:
 	@mkdir -p $(BUILDDIR)/ziparchive
 	@for f in zip_archive.cc zip_archive_stream_entry.cc; do \
 	  $(CXX) -std=c++17 -O2 -w -fPIC \
+	    -fvisibility=hidden -fvisibility-inlines-hidden \
 	    $(TARGET_FLAGS) \
 	    -I$(AOSP)/system/core/libziparchive/include \
 	    -I$(AOSP)/system/core/base/include \
@@ -772,6 +807,16 @@ $(BUILDDIR)/runtime/trace.o: $(ART)/runtime/trace.cc
 $(BUILDDIR)/runtime/verifier/%.o: $(ART)/runtime/verifier/%.cc
 	@mkdir -p $(dir $@)
 	@$(CXX) $(CXXFLAGS) -O1 -c $< -o $@ 2>&1 && echo "OK: $(notdir $<)" || { echo "FAIL: $(notdir $<)"; rm -f $@; }
+
+# WESTLAKE §793: §607's apparent -O1/-O2 miscompile was a false diagnosis. Filtered CFG and live
+# code disassembly show that the invoke argument moves are present. The small "garbage" references
+# (0x660a/0x6681) were dex string indices returned after the ARM64 quick-entrypoint assembly restored
+# x0 from the wrong save-everything slot; stubs/asm_defines.h had x86_64 spill counts. With the
+# ISA-correct frame constants, -O2 passes repeated Noice and Material Catalog JIT controls and avoids
+# the large compile-time penalty of -O0.
+$(BUILDDIR)/compiler/optimizing/%.o: $(ART)/compiler/optimizing/%.cc
+	@mkdir -p $(dir $@)
+	@$(CXX) $(CXXFLAGS) -O2 -c $< -o $@ 2>&1 && echo "OK: $(notdir $<) (-O2 §793)" || { echo "FAIL: $(notdir $<)"; rm -f $@; }
 
 # Pattern rule for ART sources
 $(BUILDDIR)/%.o: $(ART)/%.cc
