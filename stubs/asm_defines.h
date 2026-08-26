@@ -159,13 +159,26 @@
 #define TAGGED_JNI_SP_MASK_TOGGLED32 0xfffffffc
 #define TAGGED_JNI_SP_MASK_TOGGLED64 0xfffffffffffffffc
 
-// A15 callee-save frame constants for x86_64
+// A15 callee-save frame constants. These normally come from cpp-define-generator and are
+// ISA-specific; this portable build uses one checked-in shim for multiple targets. ARM64's
+// kSaveEverything frame spills x0-x17, x19-x29, and lr (30 core registers) plus d0-d31.
+// Using the x86_64 count (16) on ARM64 made SAVE_EVERYTHING_FRAME_X0_OFFSET point at sp+384
+// instead of the real x0 slot at sp+272, corrupting every quick-entrypoint result whenever the
+// deoptimization check path restored the frame.
+#if defined(__aarch64__)
+#define CALLEE_SAVE_EVERYTHING_NUM_CORE_SPILLS 30
+#define CALLEE_SAVE_EVERYTHING_NUM_FP_SPILLS 32
+#else
 #define CALLEE_SAVE_EVERYTHING_NUM_CORE_SPILLS 16
 #define CALLEE_SAVE_EVERYTHING_NUM_FP_SPILLS 16
+#endif
 
 /* ARM64-specific defines needed by A15 quick_entrypoints_arm64.S */
-#define THREAD_SUSPEND_TRIGGER_OFFSET 0xf0
-#define THREAD_DEOPT_CHECK_REQUIRED_OFFSET 0xf8
+// A15 Thread offsets, verified against the actual target layout.  The former
+// 0xf0/0xf8 values address stack_begin/stack_size and made quick entrypoints
+// treat stack metadata as suspend/deoptimization flags.
+#define THREAD_SUSPEND_TRIGGER_OFFSET 0xc0
+#define THREAD_DEOPT_CHECK_REQUIRED_OFFSET 0x24
 #define FRAME_SIZE_SAVE_EVERYTHING 0x230
 #define FRAME_SIZE_SAVE_REFS_AND_ARGS 0xe0
 #define FRAME_SIZE_SAVE_REFS_ONLY 0x60

@@ -120,13 +120,42 @@ static void emitf(float v) { emit4(&v); }
 static void emiti(int v) { emit4(&v); }
 static void emit2(short v) { if(dlist_pos+2<=DLIST_MAX-64){memcpy(dlist_buf+dlist_pos,&v,2);dlist_pos+=2;} }
 
-enum { OP_COLOR=1,OP_RECT=2,OP_TEXT=3,OP_LINE=4,OP_SAVE=5,OP_RESTORE=6,OP_TRANSLATE=7,OP_CLIP=8,OP_RRECT=9,OP_CIRCLE=10,OP_IMAGE=11,OP_ARGB_BITMAP=12 };
+enum { OP_COLOR=1,OP_RECT=2,OP_TEXT=3,OP_LINE=4,OP_SAVE=5,OP_RESTORE=6,OP_TRANSLATE=7,OP_CLIP=8,OP_RRECT=9,OP_CIRCLE=10,OP_IMAGE=11,OP_ARGB_BITMAP=12,OP_PATH=13 };
 
 #define MAX_H 256
 static int h_colors[MAX_H];
 static float h_fontsz[MAX_H];
 static int h_next = 1;
 static int idx(long h) { return (int)(h & 0xFF); }
+
+/* ── Path storage ── */
+/* Stored as a parallel binary command stream. Cap at 4KB per path. */
+#define PATH_BUF_MAX  4096
+#define PATH_POOL_MAX 8
+typedef struct {
+    int  in_use;
+    int  pos;      /* bytes used */
+    int  cmd_count;
+    unsigned char buf[PATH_BUF_MAX];
+} OhPath;
+static OhPath g_paths[PATH_POOL_MAX];
+
+static OhPath* path_get(jlong h) {
+    int i = (int)(h - 1);
+    if (i < 0 || i >= PATH_POOL_MAX) return NULL;
+    if (!g_paths[i].in_use) return NULL;
+    return &g_paths[i];
+}
+static void path_emit1(OhPath* p, unsigned char v) {
+    if (p->pos + 1 > PATH_BUF_MAX) return;
+    p->buf[p->pos++] = v;
+}
+static void path_emitf(OhPath* p, float v) {
+    if (p->pos + 4 > PATH_BUF_MAX) return;
+    memcpy(p->buf + p->pos, &v, 4);
+    p->pos += 4;
+}
+enum { PCMD_MOVE=0, PCMD_LINE=1, PCMD_QUAD=2, PCMD_CUBIC=3, PCMD_CLOSE=4 };
 
 /* Write all bytes to fd, handling partial writes */
 static void write_all(int fd, const void* buf, int len) {
@@ -146,7 +175,20 @@ JNIEXPORT jint JNICALL JF(arkuiInit)(JNIEnv* e, jclass c) {
     fprintf(stderr, "[OHBridge] pipe mode arkuiInit (pipe_fd=%d)\n", pipe_fd);
     return 0;
 }
-JNIEXPORT jlong JNICALL JF(surfaceCreate)(JNIEnv* e, jclass c, jlong u, jint w, jint h) { return 1; }
+JNIEXPORT jlong JNICALL JF(surfaceCreate)(JNIEnv* e, jclass c, jlong u, jint w, jint h) {
+    int pending = (*e)->ExceptionCheck(e) ? 1 : 0;
+    fprintf(stderr,
+            "[PF202N] ohbridge_stub surfaceCreate entry handle=%lld w=%d h=%d pending=%d pipe_fd=%d\n",
+            (long long)u,
+            (int)w,
+            (int)h,
+            pending,
+            pipe_fd);
+    fflush(stderr);
+    fprintf(stderr, "[PF202N] ohbridge_stub surfaceCreate return=1\n");
+    fflush(stderr);
+    return 1;
+}
 JNIEXPORT jlong JNICALL JF(surfaceGetCanvas)(JNIEnv* e, jclass c, jlong s) { dlist_pos=0; return 1; }
 JNIEXPORT jint JNICALL JF(surfaceFlush)(JNIEnv* e, jclass c, jlong s) {
     if(pipe_fd<0) return -1;
@@ -169,6 +211,14 @@ JNIEXPORT jint JNICALL JF(surfaceFlush)(JNIEnv* e, jclass c, jlong s) {
                 if (dlen >= 0 && dlen <= size - i - 21) {
                     img_count++;
                     i += 21 + dlen;
+                    continue;
+                }
+            }
+            if (op == OP_PATH && i + 7 <= size) {
+                /* [op(1)][color(4i)][payloadLen(2i)][payload(payloadLen)] */
+                short plen = *(short*)(dlist_buf + i + 5);
+                if (plen >= 0 && plen <= size - i - 7) {
+                    i += 7 + plen;
                     continue;
                 }
             }
@@ -216,7 +266,20 @@ JNIEXPORT void JNICALL JF(canvasRestore)(JNIEnv* e, jclass c, jlong cn) { emit1(
 JNIEXPORT void JNICALL JF(canvasTranslate)(JNIEnv* e, jclass c, jlong cn, jfloat dx, jfloat dy) { emit1(OP_TRANSLATE); emitf(dx); emitf(dy); }
 JNIEXPORT void JNICALL JF(canvasScale)(JNIEnv* e, jclass c, jlong cn, jfloat sx, jfloat sy) {}
 JNIEXPORT void JNICALL JF(canvasClipRect)(JNIEnv* e, jclass c, jlong cn, jfloat l, jfloat t, jfloat r, jfloat b2) { emit1(OP_CLIP); emitf(l); emitf(t); emitf(r); emitf(b2); }
-JNIEXPORT void JNICALL JF(canvasDrawPath)(JNIEnv* e, jclass c, jlong cn, jlong path, jlong pen, jlong brush) {}
+JNIEXPORT void JNICALL JF(canvasDrawPath)(JNIEnv* e, jclass c, jlong cn, jlong path, jlong pen, jlong brush) {
+    OhPath* pp = path_get(path);
+    if (!pp || pp->pos <= 0) return;
+    /* Brush wins over pen for fill color (matches canvasDrawRect convention). */
+    int color = h_colors[idx(brush > 0 ? brush : pen)];
+    int header = 1 + 4 + 2; /* op + color + payloadLen */
+    if (pp->pos > 65535) return; /* won't fit in short */
+    if (dlist_pos + header + pp->pos > DLIST_MAX - 64) return;
+    emit1(OP_PATH);
+    emiti(color);
+    emit2((short)pp->pos);
+    memcpy(dlist_buf + dlist_pos, pp->buf, pp->pos);
+    dlist_pos += pp->pos;
+}
 JNIEXPORT void JNICALL JF(canvasDrawBitmap)(JNIEnv* e, jclass c, jlong cn, jlong bmp, jfloat x, jfloat y) {
     /* Legacy: no-op for native-handle bitmaps in pipe mode */
 }
@@ -358,16 +421,98 @@ JNIEXPORT jintArray JNICALL JF(imageDecodeToPixels)(JNIEnv* e, jclass c, jbyteAr
     return result;
 }
 
-JNIEXPORT jlong JNICALL JF(pathCreate)(JNIEnv* e, jclass c) { return 1; }
-JNIEXPORT void JNICALL JF(pathDestroy)(JNIEnv* e, jclass c, jlong p) {}
-JNIEXPORT void JNICALL JF(pathMoveTo)(JNIEnv* e, jclass c, jlong p, jfloat x, jfloat y) {}
-JNIEXPORT void JNICALL JF(pathLineTo)(JNIEnv* e, jclass c, jlong p, jfloat x, jfloat y) {}
-JNIEXPORT void JNICALL JF(pathClose)(JNIEnv* e, jclass c, jlong p) {}
-JNIEXPORT void JNICALL JF(pathReset)(JNIEnv* e, jclass c, jlong p) {}
-JNIEXPORT void JNICALL JF(pathQuadTo)(JNIEnv* e, jclass c, jlong p, jfloat x1, jfloat y1, jfloat x2, jfloat y2) {}
-JNIEXPORT void JNICALL JF(pathCubicTo)(JNIEnv* e, jclass c, jlong p, jfloat x1, jfloat y1, jfloat x2, jfloat y2, jfloat x3, jfloat y3) {}
-JNIEXPORT void JNICALL JF(pathAddRect)(JNIEnv* e, jclass c, jlong p, jfloat l, jfloat t, jfloat r, jfloat b, jint dir) {}
-JNIEXPORT void JNICALL JF(pathAddCircle)(JNIEnv* e, jclass c, jlong p, jfloat cx, jfloat cy, jfloat r, jint dir) {}
+JNIEXPORT jlong JNICALL JF(pathCreate)(JNIEnv* e, jclass c) {
+    for (int i = 0; i < PATH_POOL_MAX; i++) {
+        if (!g_paths[i].in_use) {
+            g_paths[i].in_use = 1;
+            g_paths[i].pos = 0;
+            g_paths[i].cmd_count = 0;
+            return (jlong)(i + 1);
+        }
+    }
+    /* Pool exhausted — recycle slot 0 */
+    g_paths[0].in_use = 1;
+    g_paths[0].pos = 0;
+    g_paths[0].cmd_count = 0;
+    return 1;
+}
+JNIEXPORT void JNICALL JF(pathDestroy)(JNIEnv* e, jclass c, jlong p) {
+    OhPath* pp = path_get(p);
+    if (pp) { pp->in_use = 0; pp->pos = 0; pp->cmd_count = 0; }
+}
+JNIEXPORT void JNICALL JF(pathMoveTo)(JNIEnv* e, jclass c, jlong p, jfloat x, jfloat y) {
+    OhPath* pp = path_get(p); if (!pp) return;
+    if (pp->pos + 1 + 8 > PATH_BUF_MAX) return;
+    path_emit1(pp, PCMD_MOVE); path_emitf(pp, x); path_emitf(pp, y);
+    pp->cmd_count++;
+}
+JNIEXPORT void JNICALL JF(pathLineTo)(JNIEnv* e, jclass c, jlong p, jfloat x, jfloat y) {
+    OhPath* pp = path_get(p); if (!pp) return;
+    if (pp->pos + 1 + 8 > PATH_BUF_MAX) return;
+    path_emit1(pp, PCMD_LINE); path_emitf(pp, x); path_emitf(pp, y);
+    pp->cmd_count++;
+}
+JNIEXPORT void JNICALL JF(pathClose)(JNIEnv* e, jclass c, jlong p) {
+    OhPath* pp = path_get(p); if (!pp) return;
+    if (pp->pos + 1 > PATH_BUF_MAX) return;
+    path_emit1(pp, PCMD_CLOSE);
+    pp->cmd_count++;
+}
+JNIEXPORT void JNICALL JF(pathReset)(JNIEnv* e, jclass c, jlong p) {
+    OhPath* pp = path_get(p); if (!pp) return;
+    pp->pos = 0; pp->cmd_count = 0;
+}
+JNIEXPORT void JNICALL JF(pathQuadTo)(JNIEnv* e, jclass c, jlong p, jfloat x1, jfloat y1, jfloat x2, jfloat y2) {
+    OhPath* pp = path_get(p); if (!pp) return;
+    if (pp->pos + 1 + 16 > PATH_BUF_MAX) return;
+    path_emit1(pp, PCMD_QUAD);
+    path_emitf(pp, x1); path_emitf(pp, y1);
+    path_emitf(pp, x2); path_emitf(pp, y2);
+    pp->cmd_count++;
+}
+JNIEXPORT void JNICALL JF(pathCubicTo)(JNIEnv* e, jclass c, jlong p, jfloat x1, jfloat y1, jfloat x2, jfloat y2, jfloat x3, jfloat y3) {
+    OhPath* pp = path_get(p); if (!pp) return;
+    if (pp->pos + 1 + 24 > PATH_BUF_MAX) return;
+    path_emit1(pp, PCMD_CUBIC);
+    path_emitf(pp, x1); path_emitf(pp, y1);
+    path_emitf(pp, x2); path_emitf(pp, y2);
+    path_emitf(pp, x3); path_emitf(pp, y3);
+    pp->cmd_count++;
+}
+JNIEXPORT void JNICALL JF(pathAddRect)(JNIEnv* e, jclass c, jlong p, jfloat l, jfloat t, jfloat r, jfloat b, jint dir) {
+    OhPath* pp = path_get(p); if (!pp) return;
+    /* Emit M l,t L r,t L r,b L l,b Z (CW). Reverse if dir != 0 (CCW). */
+    if (dir == 0) {
+        JF(pathMoveTo)(e, c, p, l, t);
+        JF(pathLineTo)(e, c, p, r, t);
+        JF(pathLineTo)(e, c, p, r, b);
+        JF(pathLineTo)(e, c, p, l, b);
+    } else {
+        JF(pathMoveTo)(e, c, p, l, t);
+        JF(pathLineTo)(e, c, p, l, b);
+        JF(pathLineTo)(e, c, p, r, b);
+        JF(pathLineTo)(e, c, p, r, t);
+    }
+    JF(pathClose)(e, c, p);
+}
+JNIEXPORT void JNICALL JF(pathAddCircle)(JNIEnv* e, jclass c, jlong p, jfloat cx, jfloat cy, jfloat r, jint dir) {
+    OhPath* pp = path_get(p); if (!pp) return;
+    /* Approximate circle with 4 cubic Beziers (kappa ~ 0.5522847498). */
+    const float K = 0.5522847498f * r;
+    JF(pathMoveTo)(e, c, p, cx + r, cy);
+    if (dir == 0) {
+        JF(pathCubicTo)(e, c, p, cx + r, cy + K, cx + K, cy + r, cx, cy + r);
+        JF(pathCubicTo)(e, c, p, cx - K, cy + r, cx - r, cy + K, cx - r, cy);
+        JF(pathCubicTo)(e, c, p, cx - r, cy - K, cx - K, cy - r, cx, cy - r);
+        JF(pathCubicTo)(e, c, p, cx + K, cy - r, cx + r, cy - K, cx + r, cy);
+    } else {
+        JF(pathCubicTo)(e, c, p, cx + r, cy - K, cx + K, cy - r, cx, cy - r);
+        JF(pathCubicTo)(e, c, p, cx - K, cy - r, cx - r, cy - K, cx - r, cy);
+        JF(pathCubicTo)(e, c, p, cx - r, cy + K, cx - K, cy + r, cx, cy + r);
+        JF(pathCubicTo)(e, c, p, cx + K, cy + r, cx + r, cy + K, cx + r, cy);
+    }
+    JF(pathClose)(e, c, p);
+}
 
 /* === Logging & device info stubs === */
 JNIEXPORT void JNICALL JF(logDebug)(JNIEnv* e, jclass c, jstring tag, jstring msg) {
@@ -398,6 +543,163 @@ JNIEXPORT jstring JNICALL JF(getDeviceBrand)(JNIEnv* e, jclass c) { return (*e)-
 JNIEXPORT jstring JNICALL JF(getDeviceModel)(JNIEnv* e, jclass c) { return (*e)->NewStringUTF(e,"VM"); }
 JNIEXPORT jstring JNICALL JF(getOSVersion)(JNIEnv* e, jclass c) { return (*e)->NewStringUTF(e,"11"); }
 JNIEXPORT jint JNICALL JF(getSDKVersion)(JNIEnv* e, jclass c) { return 30; }
+JNIEXPORT jstring JNICALL JF(telephonyGetDeviceId)(JNIEnv* e, jclass c) { return (*e)->NewStringUTF(e,""); }
+JNIEXPORT jstring JNICALL JF(telephonyGetLine1Number)(JNIEnv* e, jclass c) { return (*e)->NewStringUTF(e,""); }
+JNIEXPORT jstring JNICALL JF(telephonyGetNetworkOperatorName)(JNIEnv* e, jclass c) { return (*e)->NewStringUTF(e,"Westlake"); }
+JNIEXPORT jint JNICALL JF(telephonyGetSimState)(JNIEnv* e, jclass c) { return 5; /* SIM_STATE_READY */ }
+JNIEXPORT jint JNICALL JF(telephonyGetPhoneType)(JNIEnv* e, jclass c) { return 1; /* PHONE_TYPE_GSM */ }
+JNIEXPORT jint JNICALL JF(telephonyGetNetworkType)(JNIEnv* e, jclass c) { return 13; /* NETWORK_TYPE_LTE */ }
+
+/* === Safe southbound defaults ===
+ * These methods close the gap between the Java OHBridge contract and the
+ * standalone static ART registration table. They are intentionally conservative
+ * compatibility defaults, not complete service implementations.
+ */
+static jlong ohb_next_stub_handle = 1000;
+static char ohb_clipboard[4096] = {0};
+
+static jstring ohb_empty_string(JNIEnv* e) { return (*e)->NewStringUTF(e, ""); }
+static jstring ohb_json_empty(JNIEnv* e) { return (*e)->NewStringUTF(e, "{}"); }
+static jbyteArray ohb_empty_bytes(JNIEnv* e) { return (*e)->NewByteArray(e, 0); }
+static jdoubleArray ohb_location_array(JNIEnv* e) {
+    jdoubleArray a = (*e)->NewDoubleArray(e, 2);
+    if (a) {
+        jdouble v[2] = {37.7749, -122.4194};
+        (*e)->SetDoubleArrayRegion(e, a, 0, 2, v);
+    }
+    return a;
+}
+static jfloatArray ohb_sensor_array(JNIEnv* e) {
+    jfloatArray a = (*e)->NewFloatArray(e, 3);
+    if (a) {
+        jfloat v[3] = {0.0f, 0.0f, 0.0f};
+        (*e)->SetFloatArrayRegion(e, a, 0, 3, v);
+    }
+    return a;
+}
+
+JNIEXPORT jlong JNICALL JF(preferencesOpen)(JNIEnv* e, jclass c, jstring name) { return ohb_next_stub_handle++; }
+JNIEXPORT jstring JNICALL JF(preferencesGetString)(JNIEnv* e, jclass c, jlong h, jstring k, jstring d) { return d ? d : ohb_empty_string(e); }
+JNIEXPORT jint JNICALL JF(preferencesGetInt)(JNIEnv* e, jclass c, jlong h, jstring k, jint d) { return d; }
+JNIEXPORT jlong JNICALL JF(preferencesGetLong)(JNIEnv* e, jclass c, jlong h, jstring k, jlong d) { return d; }
+JNIEXPORT jfloat JNICALL JF(preferencesGetFloat)(JNIEnv* e, jclass c, jlong h, jstring k, jfloat d) { return d; }
+JNIEXPORT jboolean JNICALL JF(preferencesGetBoolean)(JNIEnv* e, jclass c, jlong h, jstring k, jboolean d) { return d; }
+JNIEXPORT void JNICALL JF(preferencesPutString)(JNIEnv* e, jclass c, jlong h, jstring k, jstring v) {}
+JNIEXPORT void JNICALL JF(preferencesPutInt)(JNIEnv* e, jclass c, jlong h, jstring k, jint v) {}
+JNIEXPORT void JNICALL JF(preferencesPutLong)(JNIEnv* e, jclass c, jlong h, jstring k, jlong v) {}
+JNIEXPORT void JNICALL JF(preferencesPutFloat)(JNIEnv* e, jclass c, jlong h, jstring k, jfloat v) {}
+JNIEXPORT void JNICALL JF(preferencesPutBoolean)(JNIEnv* e, jclass c, jlong h, jstring k, jboolean v) {}
+JNIEXPORT void JNICALL JF(preferencesFlush)(JNIEnv* e, jclass c, jlong h) {}
+JNIEXPORT void JNICALL JF(preferencesRemove)(JNIEnv* e, jclass c, jlong h, jstring k) {}
+JNIEXPORT void JNICALL JF(preferencesClear)(JNIEnv* e, jclass c, jlong h) {}
+JNIEXPORT void JNICALL JF(preferencesClose)(JNIEnv* e, jclass c, jlong h) {}
+
+JNIEXPORT jlong JNICALL JF(rdbStoreOpen)(JNIEnv* e, jclass c, jstring db, jint version) { return ohb_next_stub_handle++; }
+JNIEXPORT void JNICALL JF(rdbStoreExecSQL)(JNIEnv* e, jclass c, jlong h, jstring sql) {}
+JNIEXPORT jlong JNICALL JF(rdbStoreQuery)(JNIEnv* e, jclass c, jlong h, jstring sql, jobjectArray args) { return ohb_next_stub_handle++; }
+JNIEXPORT jlong JNICALL JF(rdbStoreInsert)(JNIEnv* e, jclass c, jlong h, jstring table, jstring valuesJson) { return 1; }
+JNIEXPORT jint JNICALL JF(rdbStoreUpdate)(JNIEnv* e, jclass c, jlong h, jstring valuesJson, jstring table, jstring whereClause, jobjectArray whereArgs) { return 0; }
+JNIEXPORT jint JNICALL JF(rdbStoreDelete)(JNIEnv* e, jclass c, jlong h, jstring table, jstring whereClause, jobjectArray whereArgs) { return 0; }
+JNIEXPORT void JNICALL JF(rdbStoreBeginTransaction)(JNIEnv* e, jclass c, jlong h) {}
+JNIEXPORT void JNICALL JF(rdbStoreCommit)(JNIEnv* e, jclass c, jlong h) {}
+JNIEXPORT void JNICALL JF(rdbStoreRollback)(JNIEnv* e, jclass c, jlong h) {}
+JNIEXPORT void JNICALL JF(rdbStoreClose)(JNIEnv* e, jclass c, jlong h) {}
+
+JNIEXPORT jboolean JNICALL JF(resultSetGoToFirstRow)(JNIEnv* e, jclass c, jlong h) { return JNI_FALSE; }
+JNIEXPORT jboolean JNICALL JF(resultSetGoToNextRow)(JNIEnv* e, jclass c, jlong h) { return JNI_FALSE; }
+JNIEXPORT jint JNICALL JF(resultSetGetColumnIndex)(JNIEnv* e, jclass c, jlong h, jstring name) { return -1; }
+JNIEXPORT jstring JNICALL JF(resultSetGetString)(JNIEnv* e, jclass c, jlong h, jint index) { return ohb_empty_string(e); }
+JNIEXPORT jint JNICALL JF(resultSetGetInt)(JNIEnv* e, jclass c, jlong h, jint index) { return 0; }
+JNIEXPORT jlong JNICALL JF(resultSetGetLong)(JNIEnv* e, jclass c, jlong h, jint index) { return 0; }
+JNIEXPORT jfloat JNICALL JF(resultSetGetFloat)(JNIEnv* e, jclass c, jlong h, jint index) { return 0.0f; }
+JNIEXPORT jdouble JNICALL JF(resultSetGetDouble)(JNIEnv* e, jclass c, jlong h, jint index) { return 0.0; }
+JNIEXPORT jbyteArray JNICALL JF(resultSetGetBlob)(JNIEnv* e, jclass c, jlong h, jint index) { return ohb_empty_bytes(e); }
+JNIEXPORT jboolean JNICALL JF(resultSetIsNull)(JNIEnv* e, jclass c, jlong h, jint index) { return JNI_TRUE; }
+JNIEXPORT jint JNICALL JF(resultSetGetRowCount)(JNIEnv* e, jclass c, jlong h) { return 0; }
+JNIEXPORT jint JNICALL JF(resultSetGetColumnCount)(JNIEnv* e, jclass c, jlong h) { return 0; }
+JNIEXPORT jstring JNICALL JF(resultSetGetColumnName)(JNIEnv* e, jclass c, jlong h, jint index) { return ohb_empty_string(e); }
+JNIEXPORT void JNICALL JF(resultSetClose)(JNIEnv* e, jclass c, jlong h) {}
+
+JNIEXPORT void JNICALL JF(notificationPublish)(JNIEnv* e, jclass c, jint id, jstring title, jstring text, jstring channelId, jint priority) {}
+JNIEXPORT void JNICALL JF(notificationCancel)(JNIEnv* e, jclass c, jint id) {}
+JNIEXPORT void JNICALL JF(notificationAddSlot)(JNIEnv* e, jclass c, jstring channelId, jstring channelName, jint importance) {}
+JNIEXPORT jint JNICALL JF(reminderScheduleTimer)(JNIEnv* e, jclass c, jint delaySeconds, jstring title, jstring content, jstring targetAbility, jstring paramsJson) { return 0; }
+JNIEXPORT void JNICALL JF(reminderCancel)(JNIEnv* e, jclass c, jint id) {}
+JNIEXPORT void JNICALL JF(startAbility)(JNIEnv* e, jclass c, jstring bundle, jstring ability, jstring paramsJson) {}
+JNIEXPORT void JNICALL JF(terminateSelf)(JNIEnv* e, jclass c) {}
+
+JNIEXPORT void JNICALL JF(logWarn)(JNIEnv* e, jclass c, jstring tag, jstring msg) {
+    if(!tag||!msg) return;
+    const char* t=(*e)->GetStringUTFChars(e,tag,0);
+    const char* m=(*e)->GetStringUTFChars(e,msg,0);
+    fprintf(stderr,"W/%s: %s\n",t?t:"?",m?m:"");
+    if(t)(*e)->ReleaseStringUTFChars(e,tag,t);
+    if(m)(*e)->ReleaseStringUTFChars(e,msg,m);
+}
+JNIEXPORT void JNICALL JF(showToast)(JNIEnv* e, jclass c, jstring message, jint duration) {}
+JNIEXPORT jstring JNICALL JF(httpRequest)(JNIEnv* e, jclass c, jstring url, jstring method, jstring headersJson, jstring body) { return ohb_json_empty(e); }
+JNIEXPORT jboolean JNICALL JF(isNetworkAvailable)(JNIEnv* e, jclass c) { return JNI_TRUE; }
+JNIEXPORT jint JNICALL JF(getNetworkType)(JNIEnv* e, jclass c) { return 1; /* Wi-Fi */ }
+JNIEXPORT jboolean JNICALL JF(wifiIsEnabled)(JNIEnv* e, jclass c) { return JNI_TRUE; }
+JNIEXPORT jboolean JNICALL JF(wifiSetEnabled)(JNIEnv* e, jclass c, jboolean enabled) { return enabled; }
+JNIEXPORT jint JNICALL JF(wifiGetState)(JNIEnv* e, jclass c) { return 3; /* WIFI_STATE_ENABLED */ }
+JNIEXPORT jstring JNICALL JF(wifiGetSSID)(JNIEnv* e, jclass c) { return (*e)->NewStringUTF(e, "Westlake"); }
+JNIEXPORT jint JNICALL JF(wifiGetRssi)(JNIEnv* e, jclass c) { return -50; }
+JNIEXPORT jint JNICALL JF(wifiGetLinkSpeed)(JNIEnv* e, jclass c) { return 866; }
+JNIEXPORT jint JNICALL JF(wifiGetFrequency)(JNIEnv* e, jclass c) { return 5200; }
+JNIEXPORT jdoubleArray JNICALL JF(locationGetLast)(JNIEnv* e, jclass c) { return ohb_location_array(e); }
+JNIEXPORT jboolean JNICALL JF(locationIsEnabled)(JNIEnv* e, jclass c) { return JNI_TRUE; }
+
+JNIEXPORT jlong JNICALL JF(nodeCreate)(JNIEnv* e, jclass c, jint nodeType) { return ohb_next_stub_handle++; }
+JNIEXPORT void JNICALL JF(nodeDispose)(JNIEnv* e, jclass c, jlong node) {}
+JNIEXPORT void JNICALL JF(nodeAddChild)(JNIEnv* e, jclass c, jlong parent, jlong child) {}
+JNIEXPORT void JNICALL JF(nodeRemoveChild)(JNIEnv* e, jclass c, jlong parent, jlong child) {}
+JNIEXPORT void JNICALL JF(nodeInsertChildAt)(JNIEnv* e, jclass c, jlong parent, jlong child, jint position) {}
+JNIEXPORT jint JNICALL JF(nodeSetAttrFloat)(JNIEnv* e, jclass c, jlong node, jint attrType, jfloat v0, jfloat v1, jfloat v2, jfloat v3, jint count) { return 0; }
+JNIEXPORT jint JNICALL JF(nodeSetAttrColor)(JNIEnv* e, jclass c, jlong node, jint attrType, jint color) { return 0; }
+JNIEXPORT jint JNICALL JF(nodeSetAttrInt)(JNIEnv* e, jclass c, jlong node, jint attrType, jint value) { return 0; }
+JNIEXPORT jint JNICALL JF(nodeSetAttrString)(JNIEnv* e, jclass c, jlong node, jint attrType, jstring value) { return 0; }
+JNIEXPORT jint JNICALL JF(nodeRegisterEvent)(JNIEnv* e, jclass c, jlong node, jint eventType, jint eventId) { return 0; }
+JNIEXPORT void JNICALL JF(nodeUnregisterEvent)(JNIEnv* e, jclass c, jlong node, jint eventType) {}
+JNIEXPORT void JNICALL JF(nodeMarkDirty)(JNIEnv* e, jclass c, jlong node, jint flag) {}
+
+JNIEXPORT void JNICALL JF(clipboardSet)(JNIEnv* e, jclass c, jstring text) {
+    const char* s = text ? (*e)->GetStringUTFChars(e, text, 0) : "";
+    snprintf(ohb_clipboard, sizeof(ohb_clipboard), "%s", s ? s : "");
+    if (text && s) (*e)->ReleaseStringUTFChars(e, text, s);
+}
+JNIEXPORT jstring JNICALL JF(clipboardGet)(JNIEnv* e, jclass c) { return (*e)->NewStringUTF(e, ohb_clipboard); }
+
+JNIEXPORT jint JNICALL JF(audioGetStreamVolume)(JNIEnv* e, jclass c, jint streamType) { return 8; }
+JNIEXPORT jint JNICALL JF(audioGetStreamMaxVolume)(JNIEnv* e, jclass c, jint streamType) { return 15; }
+JNIEXPORT void JNICALL JF(audioSetStreamVolume)(JNIEnv* e, jclass c, jint streamType, jint index, jint flags) {}
+JNIEXPORT jint JNICALL JF(audioGetRingerMode)(JNIEnv* e, jclass c) { return 2; /* RINGER_MODE_NORMAL */ }
+JNIEXPORT void JNICALL JF(audioSetRingerMode)(JNIEnv* e, jclass c, jint mode) {}
+JNIEXPORT jboolean JNICALL JF(audioIsMusicActive)(JNIEnv* e, jclass c) { return JNI_FALSE; }
+
+JNIEXPORT jlong JNICALL JF(mediaPlayerCreate)(JNIEnv* e, jclass c) { return ohb_next_stub_handle++; }
+JNIEXPORT void JNICALL JF(mediaPlayerSetDataSource)(JNIEnv* e, jclass c, jlong handle, jstring path) {}
+JNIEXPORT void JNICALL JF(mediaPlayerPrepare)(JNIEnv* e, jclass c, jlong handle) {}
+JNIEXPORT void JNICALL JF(mediaPlayerStart)(JNIEnv* e, jclass c, jlong handle) {}
+JNIEXPORT void JNICALL JF(mediaPlayerPause)(JNIEnv* e, jclass c, jlong handle) {}
+JNIEXPORT void JNICALL JF(mediaPlayerStop)(JNIEnv* e, jclass c, jlong handle) {}
+JNIEXPORT void JNICALL JF(mediaPlayerRelease)(JNIEnv* e, jclass c, jlong handle) {}
+JNIEXPORT void JNICALL JF(mediaPlayerSeekTo)(JNIEnv* e, jclass c, jlong handle, jint msec) {}
+JNIEXPORT void JNICALL JF(mediaPlayerReset)(JNIEnv* e, jclass c, jlong handle) {}
+JNIEXPORT jint JNICALL JF(mediaPlayerGetDuration)(JNIEnv* e, jclass c, jlong handle) { return 0; }
+JNIEXPORT jint JNICALL JF(mediaPlayerGetCurrentPosition)(JNIEnv* e, jclass c, jlong handle) { return 0; }
+JNIEXPORT jboolean JNICALL JF(mediaPlayerIsPlaying)(JNIEnv* e, jclass c, jlong handle) { return JNI_FALSE; }
+JNIEXPORT void JNICALL JF(mediaPlayerSetVolume)(JNIEnv* e, jclass c, jlong handle, jfloat left, jfloat right) {}
+JNIEXPORT void JNICALL JF(mediaPlayerSetLooping)(JNIEnv* e, jclass c, jlong handle, jboolean looping) {}
+
+JNIEXPORT jint JNICALL JF(bitmapWriteToFile)(JNIEnv* e, jclass c, jlong bitmap, jstring path) { return 0; }
+JNIEXPORT jint JNICALL JF(bitmapBlitToFb0)(JNIEnv* e, jclass c, jlong bitmap, jint scrollY) { return 0; }
+JNIEXPORT jboolean JNICALL JF(vibratorHasVibrator)(JNIEnv* e, jclass c) { return JNI_FALSE; }
+JNIEXPORT void JNICALL JF(vibratorVibrate)(JNIEnv* e, jclass c, jlong ms) {}
+JNIEXPORT void JNICALL JF(vibratorCancel)(JNIEnv* e, jclass c) {}
+JNIEXPORT jint JNICALL JF(checkPermission)(JNIEnv* e, jclass c, jstring permission) { return 0; /* PERMISSION_GRANTED */ }
+JNIEXPORT jboolean JNICALL JF(sensorIsAvailable)(JNIEnv* e, jclass c, jint sensorType) { return JNI_FALSE; }
+JNIEXPORT jfloatArray JNICALL JF(sensorGetData)(JNIEnv* e, jclass c, jint sensorType) { return ohb_sensor_array(e); }
 
 /* === Registration table === */
 static JNINativeMethod methods[] = {
@@ -409,6 +711,114 @@ static JNINativeMethod methods[] = {
     {"getDeviceModel","()Ljava/lang/String;",(void*)JF(getDeviceModel)},
     {"getOSVersion","()Ljava/lang/String;",(void*)JF(getOSVersion)},
     {"getSDKVersion","()I",(void*)JF(getSDKVersion)},
+    {"telephonyGetDeviceId","()Ljava/lang/String;",(void*)JF(telephonyGetDeviceId)},
+    {"telephonyGetLine1Number","()Ljava/lang/String;",(void*)JF(telephonyGetLine1Number)},
+    {"telephonyGetNetworkOperatorName","()Ljava/lang/String;",(void*)JF(telephonyGetNetworkOperatorName)},
+    {"telephonyGetSimState","()I",(void*)JF(telephonyGetSimState)},
+    {"telephonyGetPhoneType","()I",(void*)JF(telephonyGetPhoneType)},
+    {"telephonyGetNetworkType","()I",(void*)JF(telephonyGetNetworkType)},
+    {"preferencesOpen","(Ljava/lang/String;)J",(void*)JF(preferencesOpen)},
+    {"preferencesGetString","(JLjava/lang/String;Ljava/lang/String;)Ljava/lang/String;",(void*)JF(preferencesGetString)},
+    {"preferencesGetInt","(JLjava/lang/String;I)I",(void*)JF(preferencesGetInt)},
+    {"preferencesGetLong","(JLjava/lang/String;J)J",(void*)JF(preferencesGetLong)},
+    {"preferencesGetFloat","(JLjava/lang/String;F)F",(void*)JF(preferencesGetFloat)},
+    {"preferencesGetBoolean","(JLjava/lang/String;Z)Z",(void*)JF(preferencesGetBoolean)},
+    {"preferencesPutString","(JLjava/lang/String;Ljava/lang/String;)V",(void*)JF(preferencesPutString)},
+    {"preferencesPutInt","(JLjava/lang/String;I)V",(void*)JF(preferencesPutInt)},
+    {"preferencesPutLong","(JLjava/lang/String;J)V",(void*)JF(preferencesPutLong)},
+    {"preferencesPutFloat","(JLjava/lang/String;F)V",(void*)JF(preferencesPutFloat)},
+    {"preferencesPutBoolean","(JLjava/lang/String;Z)V",(void*)JF(preferencesPutBoolean)},
+    {"preferencesFlush","(J)V",(void*)JF(preferencesFlush)},
+    {"preferencesRemove","(JLjava/lang/String;)V",(void*)JF(preferencesRemove)},
+    {"preferencesClear","(J)V",(void*)JF(preferencesClear)},
+    {"preferencesClose","(J)V",(void*)JF(preferencesClose)},
+    {"rdbStoreOpen","(Ljava/lang/String;I)J",(void*)JF(rdbStoreOpen)},
+    {"rdbStoreExecSQL","(JLjava/lang/String;)V",(void*)JF(rdbStoreExecSQL)},
+    {"rdbStoreQuery","(JLjava/lang/String;[Ljava/lang/String;)J",(void*)JF(rdbStoreQuery)},
+    {"rdbStoreInsert","(JLjava/lang/String;Ljava/lang/String;)J",(void*)JF(rdbStoreInsert)},
+    {"rdbStoreUpdate","(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;)I",(void*)JF(rdbStoreUpdate)},
+    {"rdbStoreDelete","(JLjava/lang/String;Ljava/lang/String;[Ljava/lang/String;)I",(void*)JF(rdbStoreDelete)},
+    {"rdbStoreBeginTransaction","(J)V",(void*)JF(rdbStoreBeginTransaction)},
+    {"rdbStoreCommit","(J)V",(void*)JF(rdbStoreCommit)},
+    {"rdbStoreRollback","(J)V",(void*)JF(rdbStoreRollback)},
+    {"rdbStoreClose","(J)V",(void*)JF(rdbStoreClose)},
+    {"resultSetGoToFirstRow","(J)Z",(void*)JF(resultSetGoToFirstRow)},
+    {"resultSetGoToNextRow","(J)Z",(void*)JF(resultSetGoToNextRow)},
+    {"resultSetGetColumnIndex","(JLjava/lang/String;)I",(void*)JF(resultSetGetColumnIndex)},
+    {"resultSetGetString","(JI)Ljava/lang/String;",(void*)JF(resultSetGetString)},
+    {"resultSetGetInt","(JI)I",(void*)JF(resultSetGetInt)},
+    {"resultSetGetLong","(JI)J",(void*)JF(resultSetGetLong)},
+    {"resultSetGetFloat","(JI)F",(void*)JF(resultSetGetFloat)},
+    {"resultSetGetDouble","(JI)D",(void*)JF(resultSetGetDouble)},
+    {"resultSetGetBlob","(JI)[B",(void*)JF(resultSetGetBlob)},
+    {"resultSetIsNull","(JI)Z",(void*)JF(resultSetIsNull)},
+    {"resultSetGetRowCount","(J)I",(void*)JF(resultSetGetRowCount)},
+    {"resultSetGetColumnCount","(J)I",(void*)JF(resultSetGetColumnCount)},
+    {"resultSetGetColumnName","(JI)Ljava/lang/String;",(void*)JF(resultSetGetColumnName)},
+    {"resultSetClose","(J)V",(void*)JF(resultSetClose)},
+    {"notificationPublish","(ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;I)V",(void*)JF(notificationPublish)},
+    {"notificationCancel","(I)V",(void*)JF(notificationCancel)},
+    {"notificationAddSlot","(Ljava/lang/String;Ljava/lang/String;I)V",(void*)JF(notificationAddSlot)},
+    {"reminderScheduleTimer","(ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I",(void*)JF(reminderScheduleTimer)},
+    {"reminderCancel","(I)V",(void*)JF(reminderCancel)},
+    {"startAbility","(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",(void*)JF(startAbility)},
+    {"terminateSelf","()V",(void*)JF(terminateSelf)},
+    {"logWarn","(Ljava/lang/String;Ljava/lang/String;)V",(void*)JF(logWarn)},
+    {"showToast","(Ljava/lang/String;I)V",(void*)JF(showToast)},
+    {"httpRequest","(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",(void*)JF(httpRequest)},
+    {"isNetworkAvailable","()Z",(void*)JF(isNetworkAvailable)},
+    {"getNetworkType","()I",(void*)JF(getNetworkType)},
+    {"wifiIsEnabled","()Z",(void*)JF(wifiIsEnabled)},
+    {"wifiSetEnabled","(Z)Z",(void*)JF(wifiSetEnabled)},
+    {"wifiGetState","()I",(void*)JF(wifiGetState)},
+    {"wifiGetSSID","()Ljava/lang/String;",(void*)JF(wifiGetSSID)},
+    {"wifiGetRssi","()I",(void*)JF(wifiGetRssi)},
+    {"wifiGetLinkSpeed","()I",(void*)JF(wifiGetLinkSpeed)},
+    {"wifiGetFrequency","()I",(void*)JF(wifiGetFrequency)},
+    {"locationGetLast","()[D",(void*)JF(locationGetLast)},
+    {"locationIsEnabled","()Z",(void*)JF(locationIsEnabled)},
+    {"nodeCreate","(I)J",(void*)JF(nodeCreate)},
+    {"nodeDispose","(J)V",(void*)JF(nodeDispose)},
+    {"nodeAddChild","(JJ)V",(void*)JF(nodeAddChild)},
+    {"nodeRemoveChild","(JJ)V",(void*)JF(nodeRemoveChild)},
+    {"nodeInsertChildAt","(JJI)V",(void*)JF(nodeInsertChildAt)},
+    {"nodeSetAttrFloat","(JIFFFFI)I",(void*)JF(nodeSetAttrFloat)},
+    {"nodeSetAttrColor","(JII)I",(void*)JF(nodeSetAttrColor)},
+    {"nodeSetAttrInt","(JII)I",(void*)JF(nodeSetAttrInt)},
+    {"nodeSetAttrString","(JILjava/lang/String;)I",(void*)JF(nodeSetAttrString)},
+    {"nodeRegisterEvent","(JII)I",(void*)JF(nodeRegisterEvent)},
+    {"nodeUnregisterEvent","(JI)V",(void*)JF(nodeUnregisterEvent)},
+    {"nodeMarkDirty","(JI)V",(void*)JF(nodeMarkDirty)},
+    {"clipboardSet","(Ljava/lang/String;)V",(void*)JF(clipboardSet)},
+    {"clipboardGet","()Ljava/lang/String;",(void*)JF(clipboardGet)},
+    {"audioGetStreamVolume","(I)I",(void*)JF(audioGetStreamVolume)},
+    {"audioGetStreamMaxVolume","(I)I",(void*)JF(audioGetStreamMaxVolume)},
+    {"audioSetStreamVolume","(III)V",(void*)JF(audioSetStreamVolume)},
+    {"audioGetRingerMode","()I",(void*)JF(audioGetRingerMode)},
+    {"audioSetRingerMode","(I)V",(void*)JF(audioSetRingerMode)},
+    {"audioIsMusicActive","()Z",(void*)JF(audioIsMusicActive)},
+    {"mediaPlayerCreate","()J",(void*)JF(mediaPlayerCreate)},
+    {"mediaPlayerSetDataSource","(JLjava/lang/String;)V",(void*)JF(mediaPlayerSetDataSource)},
+    {"mediaPlayerPrepare","(J)V",(void*)JF(mediaPlayerPrepare)},
+    {"mediaPlayerStart","(J)V",(void*)JF(mediaPlayerStart)},
+    {"mediaPlayerPause","(J)V",(void*)JF(mediaPlayerPause)},
+    {"mediaPlayerStop","(J)V",(void*)JF(mediaPlayerStop)},
+    {"mediaPlayerRelease","(J)V",(void*)JF(mediaPlayerRelease)},
+    {"mediaPlayerSeekTo","(JI)V",(void*)JF(mediaPlayerSeekTo)},
+    {"mediaPlayerReset","(J)V",(void*)JF(mediaPlayerReset)},
+    {"mediaPlayerGetDuration","(J)I",(void*)JF(mediaPlayerGetDuration)},
+    {"mediaPlayerGetCurrentPosition","(J)I",(void*)JF(mediaPlayerGetCurrentPosition)},
+    {"mediaPlayerIsPlaying","(J)Z",(void*)JF(mediaPlayerIsPlaying)},
+    {"mediaPlayerSetVolume","(JFF)V",(void*)JF(mediaPlayerSetVolume)},
+    {"mediaPlayerSetLooping","(JZ)V",(void*)JF(mediaPlayerSetLooping)},
+    {"bitmapWriteToFile","(JLjava/lang/String;)I",(void*)JF(bitmapWriteToFile)},
+    {"bitmapBlitToFb0","(JI)I",(void*)JF(bitmapBlitToFb0)},
+    {"vibratorHasVibrator","()Z",(void*)JF(vibratorHasVibrator)},
+    {"vibratorVibrate","(J)V",(void*)JF(vibratorVibrate)},
+    {"vibratorCancel","()V",(void*)JF(vibratorCancel)},
+    {"checkPermission","(Ljava/lang/String;)I",(void*)JF(checkPermission)},
+    {"sensorIsAvailable","(I)Z",(void*)JF(sensorIsAvailable)},
+    {"sensorGetData","(I)[F",(void*)JF(sensorGetData)},
     {"surfaceCreate","(JII)J",(void*)JF(surfaceCreate)},
     {"surfaceGetCanvas","(J)J",(void*)JF(surfaceGetCanvas)},
     {"surfaceFlush","(J)I",(void*)JF(surfaceFlush)},
@@ -437,7 +847,7 @@ static JNINativeMethod methods[] = {
     {"penSetCap","(JI)V",(void*)JF(penSetCap)},{"penSetJoin","(JI)V",(void*)JF(penSetJoin)},
     {"penDestroy","(J)V",(void*)JF(penDestroy)},
     {"brushCreate","()J",(void*)JF(brushCreate)},{"brushSetColor","(JI)V",(void*)JF(brushSetColor)},
-    {"brushDestroy","(J)V",(void*)JF(brushDestroy)},{"brushSetAntiAlias","(JZ)V",(void*)JF(brushSetAntiAlias)},
+    {"brushDestroy","(J)V",(void*)JF(brushDestroy)},
     {"fontCreate","()J",(void*)JF(fontCreate)},{"fontSetSize","(JF)V",(void*)JF(fontSetSize)},
     {"fontMeasureText","(JLjava/lang/String;)F",(void*)JF(fontMeasureText)},
     {"fontDestroy","(J)V",(void*)JF(fontDestroy)},{"fontGetMetrics","(J)[F",(void*)JF(fontGetMetrics)},
@@ -581,6 +991,101 @@ static void ohb_mq_nativePollOnce(JNIEnv* e, jobject t, jlong p, jint ms) {
 static void ohb_mq_nativeWake(JNIEnv* e, jobject t, jlong p) {}
 static jboolean ohb_mq_nativeIsPolling(JNIEnv* e, jobject t, jlong p) { return 0; }
 static void ohb_mq_nativeSetFdEvents(JNIEnv* e, jobject t, jlong p, jint fd, jint ev) {}
+
+/* PF-arch-013 (2026-05-11): libcore.util.NativeAllocationRegistry.applyFreeFunction.
+ * Per Agent C audit: the pc=0x0 SIGBUS signature is this method being called
+ * with freeFunction=0. Every JNI handle's GC finalizer goes through this. The
+ * default ART implementation does `((void(*)(jlong))freeFunction)(nativePtr)`
+ * which faults if freeFunction is 0. We null-guard. */
+static void ohb_nar_applyFreeFunction(JNIEnv* e, jclass c, jlong freeFunc, jlong nativePtr) {
+    if (freeFunc == 0) return;  /* the whole point of this stub */
+    void (*fn)(jlong) = (void (*)(jlong)) (uintptr_t) freeFunc;
+    fn(nativePtr);
+}
+
+/* PF-arch-013: dalvik.system.VMRuntime — top-priority natives that need stubs
+ * before any framework class init triggers GC handle setup. */
+static jlong ohb_vmrt_addressOf(JNIEnv* e, jobject t, jobject arr) { return 0; }
+static jstring ohb_vmrt_bootClassPath(JNIEnv* e, jobject t) { return (*e)->NewStringUTF(e, ""); }
+static void ohb_vmrt_clampGrowthLimit(JNIEnv* e, jobject t) {}
+static jstring ohb_vmrt_classPath(JNIEnv* e, jobject t) { return (*e)->NewStringUTF(e, ""); }
+static void ohb_vmrt_clearGrowthLimit(JNIEnv* e, jobject t) {}
+static jlong ohb_vmrt_getFinalizerTimeoutMs(JNIEnv* e, jobject t) { return 10000; }
+static jfloat ohb_vmrt_getTargetHeapUtilization(JNIEnv* e, jobject t) { return 0.75f; }
+static jboolean ohb_vmrt_is64Bit(JNIEnv* e, jobject t) { return JNI_TRUE; }
+static jboolean ohb_vmrt_isCheckJniEnabled(JNIEnv* e, jobject t) { return JNI_FALSE; }
+static jboolean ohb_vmrt_isJavaDebuggable(JNIEnv* e, jobject t) { return JNI_FALSE; }
+static jboolean ohb_vmrt_isNativeDebuggable(JNIEnv* e, jobject t) { return JNI_FALSE; }
+/* Helper: dispatch on component-type Class to allocate the right primitive
+ * array or Object[] array. Real Android's newUnpaddedArray / newNonMovableArray
+ * accept primitive component types via Class.isPrimitive(). */
+static jobject ohb_vmrt_allocArray(JNIEnv* e, jclass cls, jint len) {
+    if (len < 0) len = 0;
+    if (cls == NULL) return (*e)->NewObjectArray(e, len, NULL, NULL);
+    /* Use getName() to inspect primitive type. Cheaper than reflective
+     * Class.isPrimitive() call; getName() returns "int", "long", etc. */
+    jclass classCls = (*e)->FindClass(e, "java/lang/Class");
+    jmethodID getName = (*e)->GetMethodID(e, classCls, "getName", "()Ljava/lang/String;");
+    jstring nameStr = (jstring) (*e)->CallObjectMethod(e, cls, getName);
+    if (!nameStr) return (*e)->NewObjectArray(e, len, cls, NULL);
+    const char* name = (*e)->GetStringUTFChars(e, nameStr, NULL);
+    jobject result = NULL;
+    if (name) {
+        if (strcmp(name, "int") == 0)       result = (*e)->NewIntArray(e, len);
+        else if (strcmp(name, "long") == 0) result = (*e)->NewLongArray(e, len);
+        else if (strcmp(name, "byte") == 0) result = (*e)->NewByteArray(e, len);
+        else if (strcmp(name, "short") == 0) result = (*e)->NewShortArray(e, len);
+        else if (strcmp(name, "char") == 0) result = (*e)->NewCharArray(e, len);
+        else if (strcmp(name, "boolean") == 0) result = (*e)->NewBooleanArray(e, len);
+        else if (strcmp(name, "float") == 0) result = (*e)->NewFloatArray(e, len);
+        else if (strcmp(name, "double") == 0) result = (*e)->NewDoubleArray(e, len);
+        else result = (*e)->NewObjectArray(e, len, cls, NULL);
+        (*e)->ReleaseStringUTFChars(e, nameStr, name);
+    }
+    return result;
+}
+static jobject ohb_vmrt_newNonMovableArray(JNIEnv* e, jobject t, jclass cls, jint len) {
+    return ohb_vmrt_allocArray(e, cls, len);
+}
+static jobject ohb_vmrt_newUnpaddedArray(JNIEnv* e, jobject t, jclass cls, jint len) {
+    return ohb_vmrt_allocArray(e, cls, len);
+}
+static void ohb_vmrt_bootCompleted(JNIEnv* e, jclass c) {}
+static jstring ohb_vmrt_getCurrentInstructionSet(JNIEnv* e, jclass c) { return (*e)->NewStringUTF(e, "arm64"); }
+static jint ohb_vmrt_getNotifyNativeInterval(JNIEnv* e, jclass c) { return 0; }
+static jint ohb_vmrt_getSdkVersionNative(JNIEnv* e, jclass c, jint def) { return 35; }
+static jboolean ohb_vmrt_isBootClassPathOnDisk(JNIEnv* e, jclass c, jstring s) { return JNI_FALSE; }
+static jboolean ohb_vmrt_isValidClassLoaderContext(JNIEnv* e, jclass c, jstring s) { return JNI_TRUE; }
+static void ohb_vmrt_nativeSetTargetHeapUtilization(JNIEnv* e, jclass c, jfloat f) {}
+static void ohb_vmrt_registerAppInfo(JNIEnv* e, jclass c, jstring a, jstring b, jstring d, jobjectArray e2, jint i) {}
+static void ohb_vmrt_registerSensitiveThread(JNIEnv* e, jclass c) {}
+static void ohb_vmrt_resetJitCounters(JNIEnv* e, jclass c) {}
+static void ohb_vmrt_setDedupeHiddenApiWarnings(JNIEnv* e, jclass c, jboolean b) {}
+static void ohb_vmrt_setDisabledCompatChangesNative(JNIEnv* e, jclass c, jlongArray a) {}
+static void ohb_vmrt_setProcessDataDirectory(JNIEnv* e, jclass c, jstring s) {}
+static void ohb_vmrt_setProcessPackageName(JNIEnv* e, jclass c, jstring s) {}
+static void ohb_vmrt_setSystemDaemonThreadPriority(JNIEnv* e, jclass c) {}
+static void ohb_vmrt_setTargetSdkVersionNative(JNIEnv* e, jclass c, jint i) {}
+
+/* PF-arch-009 (2026-05-11): dalvik.system.VMStack native stubs.
+ * Used internally by Thread.getStackTrace() and by ClassLoader error-message
+ * construction. Unregistered → fault_addr=0x0 SIGBUS during ClassNotFoundException
+ * message build. Stubs return null/empty/zero which is fine for diagnostic paths. */
+static jobjectArray ohb_vmstack_getThreadStackTrace(JNIEnv* e, jclass c, jobject thread) {
+    /* Return empty StackTraceElement[] — error messages get [] instead of real trace. */
+    jclass steCls = (*e)->FindClass(e, "java/lang/StackTraceElement");
+    if (!steCls) { (*e)->ExceptionClear(e); return NULL; }
+    return (*e)->NewObjectArray(e, 0, steCls, NULL);
+}
+static jint ohb_vmstack_fillStackTraceElements(JNIEnv* e, jclass c, jobject thread, jobjectArray arr) {
+    return 0;  /* nothing filled */
+}
+static jobjectArray ohb_vmstack_getAnnotatedThreadStackTrace(JNIEnv* e, jclass c, jobject thread) {
+    return NULL;
+}
+static jobject ohb_vmstack_getCallingClassLoader(JNIEnv* e, jclass c) { return NULL; }
+static jobject ohb_vmstack_getClosestUserClassLoader(JNIEnv* e, jclass c) { return NULL; }
+static jclass  ohb_vmstack_getStackClass2(JNIEnv* e, jclass c) { return NULL; }
 static jstring ohb_sp_get(JNIEnv* e, jclass c, jstring k, jstring d) {
     const char* key = k ? (*e)->GetStringUTFChars(e, k, NULL) : "";
     fprintf(stderr, "[SP-old] get('%s')\n", key);
@@ -760,6 +1265,8 @@ static int try_tcp_connect(int port) {
 }
 
 static jint OHBridge_JNI_OnLoad_Impl(JavaVM* vm, void* reserved) {
+    fprintf(stderr, "[PF202N] OHBridge_JNI_OnLoad_Impl entry vm=%p reserved=%p\n", vm, reserved);
+    fflush(stderr);
     g_vm = vm;
     sigbus_vm = vm;
     /* Record main thread for signal handler */
@@ -793,6 +1300,8 @@ static jint OHBridge_JNI_OnLoad_Impl(JavaVM* vm, void* reserved) {
         (*env)->DeleteLocalRef(env, cls);
     } else { (*env)->ExceptionClear(env); }
     fprintf(stderr, "[OHBridge] JNI_OnLoad (pipe stub) %d/%d registered, pipe_fd=%d\n", ok, count, pipe_fd);
+    fprintf(stderr, "[PF202N] OHBridge_JNI_OnLoad_Impl OHBridge register ok=%d count=%d pipe_fd=%d\n", ok, count, pipe_fd);
+    fflush(stderr);
 
     /* ── Framework native stubs (for real framework.jar on BCP) ── */
     {
@@ -813,6 +1322,82 @@ static jint OHBridge_JNI_OnLoad_Impl(JavaVM* vm, void* reserved) {
                 else (*env)->ExceptionClear(env);
             }
             fprintf(stderr, "[OHBridge] MessageQueue stubs: %d/6\n", mq_ok);
+        } else { (*env)->ExceptionClear(env); }
+
+        /* PF-arch-013: libcore.util.NativeAllocationRegistry — null-guard the
+         * free-function trampoline that's at the heart of every JNI handle's
+         * GC finalizer. Per Agent C audit, the pc=0 SIGBUS in startActivity
+         * is this native being called with freeFunc=0. */
+        jclass narCls = (*env)->FindClass(env, "libcore/util/NativeAllocationRegistry");
+        if (narCls) {
+            JNINativeMethod nar[] = {
+                {"applyFreeFunction", "(JJ)V", (void*)ohb_nar_applyFreeFunction},
+            };
+            int rc = (*env)->RegisterNatives(env, narCls, &nar[0], 1);
+            (*env)->ExceptionClear(env);
+            fprintf(stderr, "[OHBridge] NativeAllocationRegistry stub: %s\n", rc == 0 ? "OK" : "FAIL");
+        } else { (*env)->ExceptionClear(env); }
+
+        /* PF-arch-013: dalvik.system.VMRuntime — heap/sdk/process settings */
+        jclass vmrtCls = (*env)->FindClass(env, "dalvik/system/VMRuntime");
+        if (vmrtCls) {
+            JNINativeMethod vmrt[] = {
+                {"addressOf", "(Ljava/lang/Object;)J", (void*)ohb_vmrt_addressOf},
+                {"bootClassPath", "()Ljava/lang/String;", (void*)ohb_vmrt_bootClassPath},
+                {"clampGrowthLimit", "()V", (void*)ohb_vmrt_clampGrowthLimit},
+                {"classPath", "()Ljava/lang/String;", (void*)ohb_vmrt_classPath},
+                {"clearGrowthLimit", "()V", (void*)ohb_vmrt_clearGrowthLimit},
+                {"getFinalizerTimeoutMs", "()J", (void*)ohb_vmrt_getFinalizerTimeoutMs},
+                {"getTargetHeapUtilization", "()F", (void*)ohb_vmrt_getTargetHeapUtilization},
+                {"is64Bit", "()Z", (void*)ohb_vmrt_is64Bit},
+                {"isCheckJniEnabled", "()Z", (void*)ohb_vmrt_isCheckJniEnabled},
+                {"isJavaDebuggable", "()Z", (void*)ohb_vmrt_isJavaDebuggable},
+                {"isNativeDebuggable", "()Z", (void*)ohb_vmrt_isNativeDebuggable},
+                {"newNonMovableArray", "(Ljava/lang/Class;I)Ljava/lang/Object;", (void*)ohb_vmrt_newNonMovableArray},
+                {"newUnpaddedArray", "(Ljava/lang/Class;I)Ljava/lang/Object;", (void*)ohb_vmrt_newUnpaddedArray},
+                {"bootCompleted", "()V", (void*)ohb_vmrt_bootCompleted},
+                {"getCurrentInstructionSet", "()Ljava/lang/String;", (void*)ohb_vmrt_getCurrentInstructionSet},
+                {"getNotifyNativeInterval", "()I", (void*)ohb_vmrt_getNotifyNativeInterval},
+                {"getSdkVersionNative", "(I)I", (void*)ohb_vmrt_getSdkVersionNative},
+                {"isBootClassPathOnDisk", "(Ljava/lang/String;)Z", (void*)ohb_vmrt_isBootClassPathOnDisk},
+                {"isValidClassLoaderContext", "(Ljava/lang/String;)Z", (void*)ohb_vmrt_isValidClassLoaderContext},
+                {"nativeSetTargetHeapUtilization", "(F)V", (void*)ohb_vmrt_nativeSetTargetHeapUtilization},
+                {"registerAppInfo", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;I)V", (void*)ohb_vmrt_registerAppInfo},
+                {"registerSensitiveThread", "()V", (void*)ohb_vmrt_registerSensitiveThread},
+                {"resetJitCounters", "()V", (void*)ohb_vmrt_resetJitCounters},
+                {"setDedupeHiddenApiWarnings", "(Z)V", (void*)ohb_vmrt_setDedupeHiddenApiWarnings},
+                {"setDisabledCompatChangesNative", "([J)V", (void*)ohb_vmrt_setDisabledCompatChangesNative},
+                {"setProcessDataDirectory", "(Ljava/lang/String;)V", (void*)ohb_vmrt_setProcessDataDirectory},
+                {"setProcessPackageName", "(Ljava/lang/String;)V", (void*)ohb_vmrt_setProcessPackageName},
+                {"setSystemDaemonThreadPriority", "()V", (void*)ohb_vmrt_setSystemDaemonThreadPriority},
+                {"setTargetSdkVersionNative", "(I)V", (void*)ohb_vmrt_setTargetSdkVersionNative},
+            };
+            int n = sizeof(vmrt)/sizeof(vmrt[0]);
+            int i, ok = 0;
+            for (i = 0; i < n; i++) {
+                if ((*env)->RegisterNatives(env, vmrtCls, &vmrt[i], 1) == 0) ok++;
+                else (*env)->ExceptionClear(env);
+            }
+            fprintf(stderr, "[OHBridge] VMRuntime stubs: %d/%d\n", ok, n);
+        } else { (*env)->ExceptionClear(env); }
+
+        /* PF-arch-009: dalvik.system.VMStack — used by Thread.getStackTrace() */
+        jclass vmStackCls = (*env)->FindClass(env, "dalvik/system/VMStack");
+        if (vmStackCls) {
+            JNINativeMethod vm[] = {
+                {"getThreadStackTrace", "(Ljava/lang/Thread;)[Ljava/lang/StackTraceElement;", (void*)ohb_vmstack_getThreadStackTrace},
+                {"fillStackTraceElements", "(Ljava/lang/Thread;[Ljava/lang/StackTraceElement;)I", (void*)ohb_vmstack_fillStackTraceElements},
+                {"getAnnotatedThreadStackTrace", "(Ljava/lang/Thread;)[Ldalvik/system/AnnotatedStackTraceElement;", (void*)ohb_vmstack_getAnnotatedThreadStackTrace},
+                {"getCallingClassLoader", "()Ljava/lang/ClassLoader;", (void*)ohb_vmstack_getCallingClassLoader},
+                {"getClosestUserClassLoader", "()Ljava/lang/ClassLoader;", (void*)ohb_vmstack_getClosestUserClassLoader},
+                {"getStackClass2", "()Ljava/lang/Class;", (void*)ohb_vmstack_getStackClass2},
+            };
+            int i, vm_ok = 0;
+            for (i = 0; i < 6; i++) {
+                if ((*env)->RegisterNatives(env, vmStackCls, &vm[i], 1) == 0) vm_ok++;
+                else (*env)->ExceptionClear(env);
+            }
+            fprintf(stderr, "[OHBridge] VMStack stubs: %d/6\n", vm_ok);
         } else { (*env)->ExceptionClear(env); }
 
         /* Log */
@@ -845,7 +1430,7 @@ static jint OHBridge_JNI_OnLoad_Impl(JavaVM* vm, void* reserved) {
             fprintf(stderr, "[OHBridge] Binder stubs registered\n");
         } else { (*env)->ExceptionClear(env); }
 
-        /* SystemClock */
+        /* SystemClock — register all 6 entries with per-method status. */
         jclass scCls = (*env)->FindClass(env, "android/os/SystemClock");
         if (scCls) {
             JNINativeMethod scM[] = {
@@ -856,8 +1441,18 @@ static jint OHBridge_JNI_OnLoad_Impl(JavaVM* vm, void* reserved) {
                 {"currentTimeMicro", "()J", (void*)ohb_sc_currentTimeMicro},
                 {"currentThreadTimeMicro", "()J", (void*)ohb_sc_currentThreadTimeMicro},
             };
-            int i; for (i = 0; i < 4; i++) { (*env)->RegisterNatives(env, scCls, &scM[i], 1); (*env)->ExceptionClear(env); }
-            fprintf(stderr, "[OHBridge] SystemClock stubs registered\n");
+            int sc_ok = 0;
+            int n_sc = (int)(sizeof(scM)/sizeof(scM[0]));
+            int i; for (i = 0; i < n_sc; i++) {
+                jint r = (*env)->RegisterNatives(env, scCls, &scM[i], 1);
+                if (r == 0) sc_ok++;
+                else {
+                    fprintf(stderr, "[OHBridge] SystemClock register FAIL: %s%s (r=%d)\n",
+                            scM[i].name, scM[i].signature, (int)r);
+                }
+                (*env)->ExceptionClear(env);
+            }
+            fprintf(stderr, "[OHBridge] SystemClock stubs: %d/%d\n", sc_ok, n_sc);
         } else { (*env)->ExceptionClear(env); }
 
         /* Trace */
@@ -952,11 +1547,16 @@ static jint OHBridge_JNI_OnLoad_Impl(JavaVM* vm, void* reserved) {
                 {"nativeGetResourceIdentifier", "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;)I", (void*)ohb_am_nativeGetResourceIdentifier},
             };
             int i, am_ok = 0;
-            for (i = 0; i < 11; i++) {
-                if ((*env)->RegisterNatives(env, amCls, &amM[i], 1) == 0) am_ok++;
-                else (*env)->ExceptionClear(env);
+            int n_am = (int)(sizeof(amM)/sizeof(amM[0]));
+            for (i = 0; i < n_am; i++) {
+                if ((*env)->RegisterNatives(env, amCls, &amM[i], 1) == 0) {
+                    am_ok++;
+                } else {
+                    fprintf(stderr, "[OHBridge] AssetManager FAIL: %s%s\n", amM[i].name, amM[i].signature);
+                    (*env)->ExceptionClear(env);
+                }
             }
-            fprintf(stderr, "[OHBridge] AssetManager stubs: %d/11\n", am_ok);
+            fprintf(stderr, "[OHBridge] AssetManager stubs: %d/%d\n", am_ok, n_am);
         } else { (*env)->ExceptionClear(env); }
 
         /* BinderInternal */

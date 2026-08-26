@@ -22,13 +22,17 @@
 #include <stdlib.h>
 #include <sys/resource.h>
 #include <sys/time.h>
+#include <time.h>
 
 #include <algorithm>
 #include <atomic>
 #include <bitset>
 #include <cerrno>
+#include <chrono>
+#include <condition_variable>
 #include <iostream>
 #include <list>
+#include <mutex>
 #include <optional>
 #include <sstream>
 
@@ -306,6 +310,11 @@ enum {
   kNoPermitWaiterWaiting = 2
 };
 
+#if !ART_USE_FUTEXES
+static std::mutex gWestlakeFallbackParkMutex;
+static std::condition_variable gWestlakeFallbackParkCv;
+#endif
+
 void Thread::Park(bool is_absolute, int64_t time) {
   DCHECK(this == Thread::Current());
 #if ART_USE_FUTEXES
@@ -395,13 +404,39 @@ void Thread::Park(bool is_absolute, int64_t time) {
     DCHECK_EQ(old_state, kPermitAvailable);
   }
 #else
-  #pragma clang diagnostic push
-  #pragma clang diagnostic warning "-W#warnings"
-  #warning "LockSupport.park/unpark implemented as noops without FUTEX support."
-  #pragma clang diagnostic pop
-  UNUSED(is_absolute, time);
-  UNIMPLEMENTED(WARNING);
-  sched_yield();
+  int old_state = tls32_.park_state_.fetch_add(1, std::memory_order_relaxed);
+  if (old_state == kPermitAvailable) {
+    return;
+  }
+
+  bool timed_out = false;
+  Runtime::Current()->GetRuntimeCallbacks()->ThreadParkStart(is_absolute, time);
+  if (!is_absolute && time == 0) {
+    ScopedThreadSuspension sts(this, ThreadState::kWaiting);
+    DCHECK_EQ(NumberOfHeldMutexes(), 0u);
+    std::unique_lock<std::mutex> lock(gWestlakeFallbackParkMutex);
+    gWestlakeFallbackParkCv.wait(lock, [this] {
+      return tls32_.park_state_.load(std::memory_order_relaxed) != kNoPermitWaiterWaiting;
+    });
+  } else if (time > 0) {
+    ScopedThreadSuspension sts(this, ThreadState::kTimedWaiting);
+    DCHECK_EQ(NumberOfHeldMutexes(), 0u);
+    std::unique_lock<std::mutex> lock(gWestlakeFallbackParkMutex);
+    auto predicate = [this] {
+      return tls32_.park_state_.load(std::memory_order_relaxed) != kNoPermitWaiterWaiting;
+    };
+    bool woke = false;
+    if (is_absolute) {
+      const auto deadline =
+          std::chrono::system_clock::time_point(std::chrono::milliseconds(time));
+      woke = gWestlakeFallbackParkCv.wait_until(lock, deadline, predicate);
+    } else {
+      woke = gWestlakeFallbackParkCv.wait_for(lock, std::chrono::nanoseconds(time), predicate);
+    }
+    timed_out = !woke;
+  }
+  tls32_.park_state_.store(kNoPermit, std::memory_order_relaxed);
+  Runtime::Current()->GetRuntimeCallbacks()->ThreadParkFinished(timed_out);
 #endif
 }
 
@@ -422,7 +457,11 @@ void Thread::Unpark() {
     }
   }
 #else
-  UNIMPLEMENTED(WARNING);
+  {
+    std::lock_guard<std::mutex> lock(gWestlakeFallbackParkMutex);
+    tls32_.park_state_.store(kPermitAvailable, std::memory_order_relaxed);
+  }
+  gWestlakeFallbackParkCv.notify_all();
 #endif
 }
 
@@ -698,6 +737,12 @@ static size_t FixStackSize(size_t stack_size) {
   // Dalvik used the bionic pthread default stack size for native threads,
   // so include that here to support apps that expect large native stacks.
   stack_size += 1 * MB;
+
+  // Westlake currently runs app bytecode through the C++ interpreter. Real
+  // apps with Gson, reflection, Kotlin coroutines, and annotation proxies can
+  // exceed Android's small default managed-thread stack before reaching UI.
+  // Keep this high while the interpreter still uses large C++ frames.
+  stack_size = std::max(stack_size, static_cast<size_t>(32 * MB));
 
   // Under sanitization, frames of the interpreter may become bigger, both for C code as
   // well as the ShadowFrame. Ensure a larger minimum size. Otherwise initialization
@@ -2412,7 +2457,19 @@ void Thread::ThreadExitCallback(void* arg) {
 #endif
     self->tls32_.thread_exit_check_count = 1;
   } else {
-    LOG(FATAL) << "Native thread exited without calling DetachCurrentThread: " << *self;
+    // [ARM64-OHOS 2026-07-08] Non-bionic (OHOS musl) port: some ART daemon
+    // exits during Runtime::Start without DetachCurrentThread, and the stock
+    // FATAL here aborts the whole runtime before it can execute Java. Downgrade
+    // to a warning and clear the TLS self so the pthread-key destructor stops
+    // firing (no repeat, no use-after-free); the Thread object leaks, which is
+    // acceptable for a leaked daemon. Lets the runtime come up.
+    LOG(WARNING) << "Native thread exited without calling DetachCurrentThread (leaked, non-fatal on OHOS): " << *self;
+#ifdef __BIONIC__
+    __get_tls()[TLS_SLOT_ART_THREAD_SELF] = nullptr;
+#else
+    Thread::self_tls_ = nullptr;
+    pthread_setspecific(Thread::pthread_key_self_, nullptr);
+#endif
   }
 }
 
@@ -3739,6 +3796,16 @@ Thread* Thread::CurrentFromGdb() {
   return Thread::Current();
 }
 
+extern "C" jobject westlake_art_get_class_loader_override(Thread* thread) {
+  return thread != nullptr ? thread->GetClassLoaderOverride() : nullptr;
+}
+
+extern "C" void westlake_art_set_class_loader_override(Thread* thread, jobject class_loader) {
+  if (thread != nullptr) {
+    thread->SetClassLoaderOverride(class_loader);
+  }
+}
+
 void Thread::DumpFromGdb() const {
   std::ostringstream ss;
   Dump(ss);
@@ -4805,7 +4872,116 @@ bool Thread::ObserveAsyncException() {
   }
 }
 
+// WESTLAKE §212d: defined in interpreter_common.cc (namespace art::interpreter), set true by the
+// FragmentContainerView probe. Declaring it at art scope instead makes libart fail to LOAD with
+// "Error relocating: _ZN3art11interpreter20g_westlake_infl_gateE: symbol not found".
+namespace interpreter { extern bool g_westlake_infl_gate; }
+// WESTLAKE §280: DEFINED HERE (libart) and set/cleared by the bridge via dlsym. Defining it in the
+// bridge and declaring it extern here would make libart fail to LOAD ("symbol not found", §212d).
+extern "C" { bool g_wl_in_surfacectl = false; }
+
 void Thread::SetException(ObjPtr<mirror::Throwable> new_exception) {
+  // WESTLAKE (arm64 board, 2026-07-21) XMLTHROW-DIAG: every thrown exception passes through
+  // here, including ones created by Java `new`.  noice's drawable inflation dies with
+  //   XmlPullParserException: No start tag found
+  // and the adapter only surfaces it as a wrapped cause, so dump the Java stack of the
+  // ORIGINAL throw to identify the thrower.  Not env-gated (the child resets environ),
+  // rate-limited, and matched on descriptor so nothing else is affected.
+  if (new_exception != nullptr) {
+    ObjPtr<mirror::Class> wl_c = new_exception->GetClass();
+    if (wl_c != nullptr) {
+      std::string wl_tmp;
+      const char* wl_d = wl_c->GetDescriptor(&wl_tmp);
+      // WESTLAKE (2026-07-22): also dump NoSuchAlgorithmException -- the remaining wall is
+      // "SunX509 TrustManagerFactory not available" thrown during MainActivity start, and the
+      // adapter only surfaces it as a wrapped cause, so we cannot see WHO asks for it.
+      if (wl_d != nullptr && strstr(wl_d, "NoSuchAlgorithmException") != nullptr) {
+        static int wl_nsa_throw = 0;
+        if (wl_nsa_throw < 2) {
+          wl_nsa_throw++;
+          fprintf(stderr, "[WESTLAKE-NSATHROW] %s thrown, Java stack:\n", wl_d);
+          fflush(stderr);
+          DumpJavaStack(std::cerr);
+          std::cerr.flush();
+        }
+      }
+      // WESTLAKE §212: §207's missing view is constructed but never gets its id/attach, and nothing
+      // is reported -- classic swallowed exception. List EVERY exception thrown (class only, no
+      // stack: cheap) so the one being caught during inflation becomes visible.
+      {
+        static pid_t wl_epid = 0;
+        static int wl_en = 0;
+        if (wl_epid != getpid()) { wl_epid = getpid(); wl_en = 0; }
+        // §212d: startup noise (ICU MissingResourceException, fonts_customization.xml
+        // FileNotFoundException) exhausted the budget before inflation even began. Gate on the flag
+        // the FragmentContainerView probe sets, so this logs only the window where §207's view dies.
+        // §212c: 56/60 were the SAME internal hidden-api annotation lookup
+        // ("No InvokeType(4) method maxTargetSdk()I"), which ART catches itself. It exhausted the
+        // budget and hid every other exception -- skip it so real throws are visible.
+        bool wl_skip = false;
+        {
+          ObjPtr<mirror::String> wl_dm0 = new_exception->GetDetailMessage();
+          if (wl_dm0 != nullptr) {
+            std::string wl_m0 = wl_dm0->ToModifiedUtf8();
+            if (wl_m0.find("maxTargetSdk") != std::string::npos) { wl_skip = true; }
+          }
+        }
+        // WESTLAKE §280: also report anything thrown inside the relayout SurfaceControl region,
+        // which the adapter swallows with a Log.e that never reaches any visible sink (§279/§279b).
+        if (g_wl_in_surfacectl && wl_d != nullptr) {
+            // WESTLAKE §281e: this hook fires in SetException, i.e. BEFORE any handler clears
+            // the exception -- so it also reports THROWS THAT ARE FULLY RECOVERED FROM.  The
+            // IContentProvider.call NoSuchMethodError is exactly that: ResolveMethod throws it
+            // (class_linker-inl.h:548), then DoInvoke's repair path clears it
+            // (interpreter_common.h:436) and successfully calls the proxy.  It is BENIGN, and
+            // with the old cap of 6 it saturated the probe and hid the real failure.  Skip it
+            // and raise the cap.
+            std::string wl_m;
+            ObjPtr<mirror::String> wl_dm2 = new_exception->GetDetailMessage();
+            if (wl_dm2 != nullptr) { wl_m = wl_dm2->ToModifiedUtf8(); }
+            const bool wl_benign =
+                (wl_m.find("IContentProvider") != std::string::npos) ||
+                (wl_m.find("Settings$Readable") != std::string::npos);
+            static int wl_scn = 0;
+            if (!wl_benign && wl_scn < 40) {
+                wl_scn++;
+                fprintf(stderr, "[WESTLAKE-SCTHROW] %s: %s\n", wl_d, wl_m.c_str());
+                fflush(stderr);
+                static int wl_sc_stack = 0;
+                if (wl_sc_stack < 3) {
+                    wl_sc_stack++;
+                    fprintf(stderr, "[WESTLAKE-SCTHROW] ^ Java stack:\n");
+                    fflush(stderr);
+                    DumpJavaStack(std::cerr);
+                    std::cerr.flush();
+                }
+            }
+        }
+        if (interpreter::g_westlake_infl_gate && !wl_skip && wl_en < 60 && wl_d != nullptr) {
+          wl_en++;
+          // §212b: 56 of 60 are NoSuchMethodError, all swallowed -- the missing METHOD NAME is the
+          // whole story, so print the detail message (cheap; no stack walk).
+          std::string wl_msg;
+          ObjPtr<mirror::String> wl_dm = new_exception->GetDetailMessage();
+          if (wl_dm != nullptr) {
+            wl_msg = wl_dm->ToModifiedUtf8();
+          }
+          fprintf(stderr, "[WESTLAKE-ANYTHROW] %s: %s\n", wl_d, wl_msg.c_str());
+          fflush(stderr);
+        }
+      }
+      if (wl_d != nullptr && strstr(wl_d, "XmlPullParserException") != nullptr) {
+        static int wl_xml_throw = 0;
+        if (wl_xml_throw < 3) {
+          wl_xml_throw++;
+          fprintf(stderr, "[WESTLAKE-XMLTHROW] %s thrown, Java stack:\n", wl_d);
+          fflush(stderr);
+          DumpJavaStack(std::cerr);
+          std::cerr.flush();
+        }
+      }
+    }
+  }
   // Relaxed for standalone dex2oat: pre-allocated exceptions may be null
   // when using cross-version core JARs (A11 JARs with A15 runtime).
   if (new_exception == nullptr) {

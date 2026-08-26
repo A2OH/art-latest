@@ -1,0 +1,641 @@
+diff --git a/compiler/driver/compiler_options.h b/compiler/driver/compiler_options.h
+index 36ecf881993b9c4599d3380bc181708549647e2e..51182948225efc7d683893ebfc27af77b7fba8b3 100644
+--- a/compiler/driver/compiler_options.h
++++ b/compiler/driver/compiler_options.h
+@@ -62,7 +62,14 @@ class CompilerOptions final {
+  public:
+   // Default values for parameters set via flags.
+   static constexpr bool kDefaultGenerateDebugInfo = false;
+-  static constexpr bool kDefaultGenerateMiniDebugInfo = true;
++  // WESTLAKE §603i: was `true`. With the JIT enabled, every compiled method adds a mini-debug-info
++  // ELF, and the periodic repack XZ-compresses them -- which eventually fails on this port and
++  // CHECK-aborts the app mid-use:
++  //     xz_utils.cc:90] Check failed: res == 0 (res=-1, 0=0)   [held: "JIT native debug entries"]
++  // Reproduced by walking noice's tab bar with the JIT on: SIGABRT after a few taps.
++  // Mini-debug-info exists only so a debugger/simpleperf can symbolize JIT frames; nothing on this
++  // port consumes it, so it is pure overhead plus a fatal failure mode. Off.
++  static constexpr bool kDefaultGenerateMiniDebugInfo = false;
+   static constexpr size_t kDefaultHugeMethodThreshold = 10000;
+   static constexpr size_t kDefaultInlineMaxCodeUnits = 32;
+   // Token to represent no value set for `inline_max_code_units_`.
+diff --git a/compiler/jit/jit_compiler.cc b/compiler/jit/jit_compiler.cc
+index 4ae3cd1f88b605012d49fabc87e1e17bbe1b4663..2e3e605047d1cfef0be3eb20d234c1f47d344764 100644
+--- a/compiler/jit/jit_compiler.cc
++++ b/compiler/jit/jit_compiler.cc
+@@ -78,6 +78,17 @@ void JitCompiler::ParseCompilerOptions() {
+   compiler_options_->implicit_so_checks_ = runtime->GetImplicitStackOverflowChecks();
+   compiler_options_->implicit_suspend_checks_ = runtime->GetImplicitSuspendChecks();
+ 
++  // WESTLAKE §606d: env-gated CFG dump so the JIT's HGraph (incl. register allocation) can be
++  // inspected offline — to see whether the dropped reference-arg move is an ALLOCATION bug (arg not
++  // assigned to x3) or an EMISSION bug (assigned to x3 but the store is elided). JitCompiler is a
++  // friend of CompilerOptions so the private fields are settable directly.
++  if (const char* wl_cfg = getenv("WESTLAKE_DUMP_CFG"); wl_cfg != nullptr && wl_cfg[0] != '\0') {
++    compiler_options_->dump_cfg_file_name_ = wl_cfg;
++    compiler_options_->dump_cfg_append_ = true;
++    fprintf(stderr, "[WESTLAKE-606d] JIT CFG dump enabled -> %s\n", wl_cfg);
++    fflush(stderr);
++  }
++
+   const InstructionSet instruction_set = compiler_options_->GetInstructionSet();
+   if (kRuntimeISA == InstructionSet::kArm) {
+     DCHECK_EQ(instruction_set, InstructionSet::kThumb2);
+diff --git a/runtime/common_throws.cc b/runtime/common_throws.cc
+index b6338cf50fb1b0e3bf6eed8681bb3e97a000ac56..802cd7e23fa9c4ce6a94213266de77c47e12fcc3 100644
+--- a/runtime/common_throws.cc
++++ b/runtime/common_throws.cc
+@@ -146,8 +146,75 @@ void ThrowArrayIndexOutOfBoundsException(int index, int length) {
+ 
+ // ArrayStoreException
+ 
++// WESTLAKE §603g: identity dump for one Class, used by ASE-DIAG below. The question it answers is
++// whether a Class pointer is a GENUINE second class object (real meta-class, real loader, real dex)
++// or a CORRUPT field value that merely happens to be readable. Deliberately defensive: GetDexFile()
++// CHECK-fails on array/primitive/proxy classes and would crash on garbage, so it is only consulted
++// once the meta-class has been confirmed to be java.lang.Class.
++static void WlDumpClassIdentity(const char* tag, ObjPtr<mirror::Class> c)
++    REQUIRES_SHARED(Locks::mutator_lock_) {
++  if (c == nullptr) {
++    fprintf(stderr, "[WESTLAKE-ASE-DIAG]   %s: null\n", tag);
++    fflush(stderr);
++    return;
++  }
++  ObjPtr<mirror::Class> meta = c->GetClass();
++  std::string meta_desc = (meta != nullptr) ? mirror::Class::PrettyDescriptor(meta)
++                                            : std::string("<null>");
++  const bool meta_ok = (meta != nullptr && meta_desc == "java.lang.Class");
++  std::string dex_loc = "<skipped>";
++  if (meta_ok && !c->IsArrayClass() && !c->IsPrimitive() && !c->IsProxyClass()) {
++    dex_loc = c->GetDexFile().GetLocation();
++  }
++  fprintf(stderr,
++          "[WESTLAKE-ASE-DIAG]   %s: cls=%p meta=%p(%s) meta_ok=%d loader=%p status=%d "
++          "array=%d primitive=%d proxy=%d dex=%s\n",
++          tag, c.Ptr(), meta.Ptr(), meta_desc.c_str(), meta_ok ? 1 : 0,
++          c->GetClassLoader().Ptr(), static_cast<int>(c->GetStatus()),
++          c->IsArrayClass() ? 1 : 0, c->IsPrimitive() ? 1 : 0, c->IsProxyClass() ? 1 : 0,
++          dex_loc.c_str());
++  fflush(stderr);
++}
++
+ void ThrowArrayStoreException(ObjPtr<mirror::Class> element_class,
+                               ObjPtr<mirror::Class> array_class) {
++  // WESTLAKE §603f ASE-DIAG: with the JIT on, this port throws IMPOSSIBLE array-store exceptions
++  // ("java.lang.String cannot be stored in an array of type java.lang.String[]"), 3 per launch,
++  // never with the JIT off (§603e). Storing a String into a String[] is always legal, so the
++  // assignability test is answering wrongly. The decisive question is whether element_class and
++  // array_class->GetComponentType() are the SAME Class object: if the pointers differ while the
++  // descriptors match, there are DUPLICATE Class objects (class-loader / dex-cache identity) rather
++  // than a broken comparison. Dump both pointers plus the Java stack that names the store.
++  // Gated on WESTLAKE_ASE_DIAG and capped at 10, so normal runs are unaffected.
++  {
++    static const bool wl_ase_diag = (getenv("WESTLAKE_ASE_DIAG") != nullptr);
++    static int wl_ase_count = 0;
++    if (UNLIKELY(wl_ase_diag) && wl_ase_count < 10) {
++      wl_ase_count++;
++      ObjPtr<mirror::Class> comp =
++          (array_class != nullptr) ? array_class->GetComponentType() : nullptr;
++      fprintf(stderr,
++              "[WESTLAKE-ASE-DIAG] #%d element=%p (%s) array=%p (%s) component=%p (%s) "
++              "element_eq_component=%d\n",
++              wl_ase_count,
++              element_class.Ptr(), mirror::Class::PrettyDescriptor(element_class).c_str(),
++              array_class.Ptr(), mirror::Class::PrettyDescriptor(array_class).c_str(),
++              comp.Ptr(), mirror::Class::PrettyDescriptor(comp).c_str(),
++              (element_class.Ptr() == comp.Ptr()) ? 1 : 0);
++      fflush(stderr);
++      // §603g: is `component` a real second java.lang.String, or a corrupt field value?
++      WlDumpClassIdentity("element  ", element_class);
++      WlDumpClassIdentity("array    ", array_class);
++      WlDumpClassIdentity("component", comp);
++      Thread* self_ase = Thread::Current();
++      if (self_ase != nullptr) {
++        fprintf(stderr, "[WESTLAKE-ASE-DIAG] #%d Java stack:\n", wl_ase_count);
++        fflush(stderr);
++        self_ase->DumpJavaStack(std::cerr);
++        std::cerr.flush();
++      }
++    }
++  }
+   ThrowException("Ljava/lang/ArrayStoreException;", nullptr,
+                  StringPrintf("%s cannot be stored in an array of type %s",
+                               mirror::Class::PrettyDescriptor(element_class).c_str(),
+@@ -720,8 +787,27 @@ void ThrowNullPointerExceptionFromDexPC(bool check_address, uintptr_t addr) {
+         // the known-good libart — proved by diffing the two binaries' PFCUT/WESTLAKE marker
+         // strings — and walking shadow frames + PrettyMethod() on every null-array NPE
+         // SIGSEGVs the child during startup. Flip to `< 80` only for targeted debugging.
++        // WESTLAKE §611: re-enabled behind WESTLAKE_NULLARR_DIAG (default off, so the §434
++        // startup-SIGSEGV hazard stays dormant). The shadow-frame walk below additionally
++        // requires WESTLAKE_NULLARR_WALK — the walk is what §434 blamed for the crash, and
++        // the throwing method + dex_pc alone usually names the site.
++        // WESTLAKE §657 (2026-08-15): the getenv() gate NEVER OPENS — environment variables do
++        // not reach appspawn-x children (verified: exported in run_*.sh, 0 hits in the child's
++        // /proc/<pid>/environ). That is why this reported 0 for Toutiao's
++        // "Attempt to get length of null array", which is what aborts Application.onCreate.
++        // File trigger instead: the child can READ /data/local/tmp/asx even though it cannot
++        // write there (it runs as an app uid).
++        //     touch /data/local/tmp/asx/NULLARR        (+ NULLARR_WALK for the frame walk)
++        // ⚠️NOTE FOR NEXT TIME: `patches/runtime/common_throws.cc` in art-latest is NOT compiled —
++        // common_throws has no Makefile patch rule, so the generic pattern rule builds THIS file
++        // ($(ART)/runtime/common_throws.cc). Editing the patches/ copy changes nothing.
+         static thread_local int pfc_null_array_count = 0;
+-        if (false && pfc_null_array_count < 80) {
++        static thread_local int wl_nullarr_state = -1;   // -1 unknown, 0 off, 1 on
++        if (wl_nullarr_state < 0) {
++          wl_nullarr_state = (access("/data/local/tmp/asx/NULLARR", F_OK) == 0) ? 1 : 0;
++        }
++        const bool wl_nullarr_diag = (wl_nullarr_state == 1);
++        if (wl_nullarr_diag && pfc_null_array_count < 40) {
+           pfc_null_array_count++;
+           Thread* self = Thread::Current();
+           fprintf(stderr,
+@@ -734,7 +820,8 @@ void ThrowNullPointerExceptionFromDexPC(bool check_address, uintptr_t addr) {
+                   self != nullptr && self->GetManagedStack() != nullptr
+                       ? self->GetManagedStack()->GetTopQuickFrame()
+                       : nullptr);
+-          if (self != nullptr && self->GetManagedStack() != nullptr) {
++          if (access("/data/local/tmp/asx/NULLARR_WALK", F_OK) == 0 &&
++              self != nullptr && self->GetManagedStack() != nullptr) {
+             int depth = 0;
+             for (auto* frame = self->GetManagedStack()->GetTopShadowFrame();
+                  frame != nullptr && depth < 16;
+diff --git a/runtime/entrypoints/entrypoint_utils-inl.h b/runtime/entrypoints/entrypoint_utils-inl.h
+index 974a4ae8d023b64318e3df9784ae0147eee01e2b..215be99a5d67dd32df43d1fd87f5cb65c1e0eebb 100644
+--- a/runtime/entrypoints/entrypoint_utils-inl.h
++++ b/runtime/entrypoints/entrypoint_utils-inl.h
+@@ -55,6 +55,40 @@ static ALWAYS_INLINE bool& PFCutFindMethodTraceFlag() {
+   return flag;
+ }
+ 
++// WESTLAKE §632 (2026-08-15): is it safe to call m->GetNameView() / m->GetSignature()?
++// Both index m's own dex file by m->GetDexMethodIndex() and, in a release build, do so with NO
++// bounds check (the DCHECKs in art_method-inl.h and DexFile::GetMethodId compile away). Callers
++// that merely *validate* must therefore establish the invariant themselves rather than trust it.
++// Order matters: every step below must be cheap and must not dereference anything the previous
++// step has not already vouched for.
++static ALWAYS_INLINE bool WlCanReadMethodNameFromDex(ArtMethod* m)
++    REQUIRES_SHARED(Locks::mutator_lock_) {
++  if (UNLIKELY(m == nullptr)) {
++    return false;
++  }
++  const uint32_t idx = m->GetDexMethodIndex();
++  if (idx == dex::kDexNoIndex) {
++    // Runtime methods (imt-conflict, resolution, callee-save). GetNameView() takes its
++    // GetRuntimeMethodName() branch and never touches a dex, so this is already safe — and it
++    // must stay TRUE: their name genuinely mismatches, which is what drives the local repair.
++    return true;
++  }
++  const DexFile* dex_file = m->GetDexFile();
++  if (UNLIKELY(dex_file == nullptr)) {
++    return false;
++  }
++  // The only condition that actually fires: the index belongs to a different dex than the one
++  // reachable from this method's declaring class.
++  //
++  // Deliberately NOT excluded here: proxy and copied/default methods. ART points those at the
++  // interface's dex, where their index IS in range, so they pass and keep their previous
++  // behaviour. An earlier revision of this guard also skipped IsProxyMethod()/IsRuntimeMethod();
++  // that suppressed the §551 proxy repair that noice's IContentProvider dispatch depends on and
++  // turned a working launch into a SIGSEGV in INVOKE_INTERFACE. Keep this predicate narrow: it
++  // must change behaviour ONLY in the case that would otherwise fault.
++  return LIKELY(idx < dex_file->NumMethodIds());
++}
++
+ inline std::string GetResolvedMethodErrorString(ClassLinker* class_linker,
+                                                 ArtMethod* inlined_method,
+                                                 ArtMethod* parent_method,
+@@ -826,7 +860,26 @@ ArtMethod* FindMethodToCall(Thread* self,
+       }
+   }
+ 
+-  if (LIKELY(called_method != nullptr) && LIKELY(caller != nullptr) && !*string_init) {
++  if (LIKELY(called_method != nullptr) && LIKELY(caller != nullptr) && !*string_init &&
++      // WESTLAKE §632 (2026-08-15): this validation block is a LOCAL addition (§440/§551);
++      // upstream AOSP does not check the resolved target here at all. It calls
++      // ArtMethod::GetNameView(), which indexes the method's OWN dex file with its
++      // dex_method_index_ and — in a release build — performs NO bounds check
++      // (art_method-inl.h: the DCHECKs compile away, so GetMethodId() reads unchecked).
++      //
++      // Measured on Toutiao (21 dex files, Tinker + Mira multi-classloader), the target that
++      // reaches this line can carry an index that is out of range for the dex reached via
++      // declaring_class_->dex_cache_: dex_method_index_ = 62215 against a dex whose header
++      // says method_ids_size = 41100. The MethodId read then lands in unrelated dex bytes and
++      // yields name_idx = 812,646,432 (that dex has 39,578 strings), so `string_ids_[name_idx]`
++      // is ~3 GB past the mapping => SIGSEGV (SEGV_MAPERR, si_addr == string_ids_ + idx*4).
++      // The method is otherwise ordinary — access_flags 0x1a300011 has neither kAccCopied,
++      // kAccDefault, kAccObsoleteMethod nor kAccStatic — so none of ART's own "this method's
++      // name lives in another dex" cases apply.
++      //
++      // Skipping the check when it cannot be evaluated safely is exactly upstream behaviour,
++      // so this can only lose a local repair, never break a case upstream handles.
++      LIKELY(WlCanReadMethodNameFromDex(called_method))) {
+     const uint32_t method_idx = inst.VRegB();
+     const DexFile* dex_file = caller->GetDexFile();
+     const dex::MethodId& method_id = dex_file->GetMethodId(method_idx);
+@@ -852,8 +905,12 @@ ArtMethod* FindMethodToCall(Thread* self,
+         if (interface_method != nullptr && this_object->Ptr() != nullptr) {
+           replacement = (*this_object)->GetClass()->FindVirtualMethodForInterface(
+               interface_method, pointer_size);
++          // §632: same hazard as the call site above — a replacement candidate can itself be
++          // foreign, and GetNameView() would read its dex unchecked. Treat "cannot read the
++          // name" as a mismatch so we fall through to the by-name lookup below.
+           if (replacement != nullptr &&
+-              (replacement->GetNameView() != expected_name ||
++              (!WlCanReadMethodNameFromDex(replacement) ||
++               replacement->GetNameView() != expected_name ||
+                replacement->GetSignature() != expected_signature)) {
+             replacement = (*this_object)->GetClass()->FindClassMethod(
+                 expected_name, expected_signature, pointer_size);
+@@ -885,6 +942,7 @@ ArtMethod* FindMethodToCall(Thread* self,
+                                                 pointer_size);
+       }
+       if (replacement != nullptr &&
++          LIKELY(WlCanReadMethodNameFromDex(replacement)) &&   // §632
+           replacement->GetNameView() == expected_name &&
+           replacement->GetSignature() == expected_signature) {
+         called_method = replacement;
+diff --git a/runtime/interpreter/interpreter_common.h b/runtime/interpreter/interpreter_common.h
+index b5457d8db9053f754bbbe0f8b2f1b17c2b218268..447c062540bfb96cd41949c4e1e5cc060e5fe40a 100644
+--- a/runtime/interpreter/interpreter_common.h
++++ b/runtime/interpreter/interpreter_common.h
+@@ -66,6 +66,51 @@
+ namespace art HIDDEN {
+ namespace interpreter {
+ 
++// WESTLAKE §658 (2026-08-15): when a stubbed/null-receiver call has an ARRAY return type, hand
++// back an EMPTY array rather than null.
++//
++// The PF-arch-020/020b shims below answer a null receiver with null for both 'L' and '[' returns.
++// For 'L' that is usually survivable, but for '[' it is not: the caller almost always does
++// `.length` or a for-each immediately. Measured on Toutiao — 336 hits in a single
++// Application.onCreate, all the same chain:
++//     Environment$UserEnvironment.getExternalDirs()          <- null array, `.length` at dex_pc=8
++//       <- buildExternalStorageAppFilesDirs
++//       <- ContextImpl.getExternalFilesDirs / getExternalFilesDir
++//       <- StorageKnotImpl.<clinit>   (com.bytedance.bdauditsdkbase.privacy.hook)
++// which is what aborts onCreate with "Attempt to get length of null array".
++// An empty array means "this API has nothing for you", which is what a stub should say; null means
++// "broken". Falls back to null if the type cannot be resolved, so this can only improve on the
++// previous behaviour.
++static inline bool WlSetEmptyArrayResult(Thread* self,
++                                         ArtMethod* referrer,
++                                         const DexFile* dex_file,
++                                         const dex::MethodId& method_id,
++                                         JValue* result)
++    REQUIRES_SHARED(Locks::mutator_lock_) {
++  const dex::ProtoId& proto_id = dex_file->GetProtoId(method_id.proto_idx_);
++  ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
++  ObjPtr<mirror::Class> ret_cls = class_linker->ResolveType(proto_id.return_type_idx_, referrer);
++  if (ret_cls == nullptr) {
++    self->ClearException();
++    return false;
++  }
++  if (!ret_cls->IsArrayClass()) {
++    return false;
++  }
++  gc::Heap* heap = Runtime::Current()->GetHeap();
++  ObjPtr<mirror::Array> empty = mirror::Array::Alloc(self,
++                                                     ret_cls,
++                                                     /*component_count=*/0,
++                                                     ret_cls->GetComponentSizeShift(),
++                                                     heap->GetCurrentAllocator());
++  if (empty == nullptr) {
++    self->ClearException();
++    return false;
++  }
++  result->SetL(empty);
++  return true;
++}
++
+ extern "C" void* Westlake_NumberingSystem_newDefaultForQuick();
+ 
+ EXPORT void ThrowNullPointerExceptionFromInterpreter()
+@@ -242,6 +287,55 @@ static ALWAYS_INLINE bool DoInvoke(Thread* self,
+   const char* sf_method_name = sf_method != nullptr ? sf_method->GetName() : nullptr;
+   const bool pfc_lookup_probe =
+       sf_method_name != nullptr && strcmp(sf_method_name, "runLookupProbe") == 0;
++
++  // WESTLAKE §672 (2026-08-17): make the null-receiver VIRTUAL path LIVE.
++  // PF-arch-020b was nested inside `if (pfc_diag)` and `pfc_diag` is a hard-coded `false`, so it has
++  // never executed — while its interface twin (PF-arch-020) runs on every launch. That asymmetry is
++  // why an absent service kills a virtual call but not an interface one:
++  //   "Unable to resume activity {…/MainActivity}: NPE: 'boolean android.permission.PermissionManager
++  //    .shouldShowRequestPermissionRationale(String)' on a null object reference"   (InvokeType(2))
++  // `getSystemService(PermissionManager)` is null because OHServiceManager knows only six services,
++  // so the receiver is null and this port throws instead of returning the documented `false`.
++  // Same defaults as the interface path, plus §658's empty-array rule.
++  if constexpr (type == kVirtual) {
++    if (UNLIKELY(obj == nullptr)) {
++        const uint32_t method_idx = is_range ? inst->VRegB_3rc() : inst->VRegB_35c();
++        /* PF-arch-020b: same as the interface-invoke fix below — for object/
++         * void/primitive returns on null receiver, return null/0 instead of
++         * throwing NPE that long-jumps through a broken Context. Boot makes
++         * progress; semantic correctness can be addressed later. */
++        const DexFile* dex_file = sf_method->GetDexFile();
++        const dex::MethodId& method_id = dex_file->GetMethodId(method_idx);
++        std::string_view sig_str = dex_file->GetMethodSignature(method_id).ToString();
++        size_t close_paren = sig_str.find(')');
++        if (close_paren != std::string_view::npos && close_paren + 1 < sig_str.size()) {
++          char ret = sig_str[close_paren + 1];
++          static thread_local int pf_arch_020b_count = 0;
++          if (pf_arch_020b_count < 40) {
++            pf_arch_020b_count++;
++            fprintf(stderr,
++                    "[PF-arch-020b] null-receiver virtual invoke %s%.*s — null/0\n",
++                    dex_file->GetMethodName(method_id),
++                    static_cast<int>(sig_str.size()),
++                    sig_str.data());
++            fflush(stderr);
++          }
++          if (ret == '[' &&
++              WlSetEmptyArrayResult(self, sf_method, dex_file, method_id, result)) {
++            return true;   // §658: empty array beats null for array-typed stubs
++          }
++          if (ret == 'L' || ret == '[') { result->SetL(nullptr); return true; }
++          if (ret == 'V') { return true; }
++          result->SetJ(0);
++          return true;
++        }
++        ThrowNullPointerExceptionForMethodAccess(method_idx, type);
++        result->SetJ(0);
++        return false;
++      }
++  }
++
++
+   if (pfc_diag) {
+     fprintf(stderr,
+             "[PFCUT] DoInvoke before FindMethodToCall vregC=%u obj=%p sf_method=%p\n",
+@@ -278,37 +372,6 @@ static ALWAYS_INLINE bool DoInvoke(Thread* self,
+           return false;
+         }
+       }
+-      if (UNLIKELY(obj == nullptr)) {
+-        const uint32_t method_idx = is_range ? inst->VRegB_3rc() : inst->VRegB_35c();
+-        /* PF-arch-020b: same as the interface-invoke fix below — for object/
+-         * void/primitive returns on null receiver, return null/0 instead of
+-         * throwing NPE that long-jumps through a broken Context. Boot makes
+-         * progress; semantic correctness can be addressed later. */
+-        const DexFile* dex_file = sf_method->GetDexFile();
+-        const dex::MethodId& method_id = dex_file->GetMethodId(method_idx);
+-        std::string_view sig_str = dex_file->GetMethodSignature(method_id).ToString();
+-        size_t close_paren = sig_str.find(')');
+-        if (close_paren != std::string_view::npos && close_paren + 1 < sig_str.size()) {
+-          char ret = sig_str[close_paren + 1];
+-          static thread_local int pf_arch_020b_count = 0;
+-          if (pf_arch_020b_count < 40) {
+-            pf_arch_020b_count++;
+-            fprintf(stderr,
+-                    "[PF-arch-020b] null-receiver virtual invoke %s%.*s — null/0\n",
+-                    dex_file->GetMethodName(method_id),
+-                    static_cast<int>(sig_str.size()),
+-                    sig_str.data());
+-            fflush(stderr);
+-          }
+-          if (ret == 'L' || ret == '[') { result->SetL(nullptr); return true; }
+-          if (ret == 'V') { return true; }
+-          result->SetJ(0);
+-          return true;
+-        }
+-        ThrowNullPointerExceptionForMethodAccess(method_idx, type);
+-        result->SetJ(0);
+-        return false;
+-      }
+       ObjPtr<mirror::Class> klass = obj->GetClass();
+       fprintf(stderr,
+               "[PFCUT] DoInvoke virtual before GetVTableEntry obj=%p klass=%p tls=0x%zx\n",
+@@ -672,6 +735,19 @@ static ALWAYS_INLINE bool DoInvoke(Thread* self,
+                             "returning null/void" : "throwing NPE");
+                 fflush(stderr);
+               }
++              // §658: an ARRAY-typed stub must hand back an EMPTY array, not null — the caller
++              // does `.length` immediately. This is the site that actually fires for
++              // IStorageManager.getVolumeList, whose null return makes
++              // Environment$UserEnvironment.getExternalDirs() throw and abort Toutiao's
++              // Application.onCreate (336 hits/launch).
++              if (returns_object && close_paren + 1 < sig_str.size() &&
++                  sig_str[close_paren + 1] == '[') {
++                const DexFile* wl_df = sf_method->GetDexFile();
++                const dex::MethodId& wl_mid = wl_df->GetMethodId(method_idx);
++                if (WlSetEmptyArrayResult(self, sf_method, wl_df, wl_mid, result)) {
++                  return true;
++                }
++              }
+               if (returns_object) {
+                 result->SetL(nullptr);
+                 return true;
+diff --git a/runtime/interpreter/interpreter_switch_impl-inl.h b/runtime/interpreter/interpreter_switch_impl-inl.h
+index 197ab55281e672ce021d2d14f12d8f267b3d2912..c4b32a41724a6b605931dfa1b63d387ae7a870b1 100644
+--- a/runtime/interpreter/interpreter_switch_impl-inl.h
++++ b/runtime/interpreter/interpreter_switch_impl-inl.h
+@@ -17,6 +17,8 @@
+ #ifndef ART_RUNTIME_INTERPRETER_INTERPRETER_SWITCH_IMPL_INL_H_
+ #define ART_RUNTIME_INTERPRETER_INTERPRETER_SWITCH_IMPL_INL_H_
+ 
++#include <unistd.h>
++
+ #include "interpreter_switch_impl.h"
+ 
+ #include "base/globals.h"
+@@ -847,6 +849,37 @@ class InstructionHandler {
+       return false;  // Pending exception.
+     }
+     SetVRegReference(A(), c);
++    // WESTLAKE §664 (2026-08-16): verify the write actually STUCK.
++    // Toutiao dies with "Parameter specified as non-null is null: …ViewModelProvider.get, parameter
++    // modelClass", and the app's bytecode leaves no room for doubt about where that value is born:
++    //     [3] CONST_CLASS v0 Landroidx/fragment/app/FragmentManagerViewModel;
++    //     [4] INVOKE_VIRTUAL {v1,v0} ViewModelProvider->get(Ljava/lang/Class;)…
++    // so if `modelClass` is null then either resolution returned null (impossible — handled above,
++    // it would leave a pending exception) or the vreg write did not take effect. This port has a
++    // history of vreg-index/width confusion (§609's `int<<32` receiver), which is exactly what
++    // would corrupt a reference write.
++    // File-gated; reads back the register we just wrote and reports only a MISMATCH, so it is
++    // silent on a healthy run.
++    {
++      static thread_local int wl_cc_state = -1;
++      static thread_local int wl_cc_count = 0;
++      if (wl_cc_state < 0) {
++        wl_cc_state = (access("/data/local/tmp/asx/CONSTCLASS", F_OK) == 0) ? 1 : 0;
++      }
++      if (wl_cc_state == 1 && wl_cc_count < 40) {
++        ObjPtr<mirror::Object> back = shadow_frame_.GetVRegReference(A());
++        if (back == nullptr || back.Ptr() != c.Ptr()) {
++          wl_cc_count++;
++          fprintf(stderr,
++                  "[WESTLAKE-664] CONST_CLASS vreg WRITE MISMATCH: v%u expected=%p got=%p type=%s "
++                  "in %s\n",
++                  A(), c.Ptr(), back.Ptr(),
++                  c->PrettyDescriptor().c_str(),
++                  shadow_frame_.GetMethod()->PrettyMethod().c_str());
++          fflush(stderr);
++        }
++      }
++    }
+     return true;
+   }
+ 
+diff --git a/runtime/jit/debugger_interface.cc b/runtime/jit/debugger_interface.cc
+index d367bbf5cdde6c22883b4947d059f1a53eaf2982..36bde4ece344bd5fee9a9005150ac015c309020b 100644
+--- a/runtime/jit/debugger_interface.cc
++++ b/runtime/jit/debugger_interface.cc
+@@ -553,6 +553,12 @@ static void RepackEntries(bool compress_entries, ArrayRef<const void*> removed)
+ 
+     // Optimization: Don't compress the last group since it will likely change again soon.
+     bool compress = compress_entries && end != entries.end();
++#if defined(__MUSL__)
++    // The standalone OpenHarmony boundary does not link an LZMA encoder; Xz_Encode() is an
++    // explicit failure stub. Keep the native debug ELF entries and repack them normally, but
++    // leave them uncompressed so long-running JIT processes do not abort at the 64-entry repack.
++    compress = false;
++#endif
+ 
+     // Bail out early if there is nothing to do for this group.
+     if (elfs.size() == 1 && removed_subset.empty() && (*begin)->is_compressed_ == compress) {
+diff --git a/runtime/jni/jni_internal.cc b/runtime/jni/jni_internal.cc
+index 09a9862a95bd7735188873e4a23be83f293d5ea5..58438366a60e5cec695c3627a127e109ee2c514f 100644
+--- a/runtime/jni/jni_internal.cc
++++ b/runtime/jni/jni_internal.cc
+@@ -679,7 +679,34 @@ class JNI {
+     if (runtime->IsStarted()) {
+       StackHandleScope<1> hs(soa.Self());
+       Handle<mirror::ClassLoader> class_loader(hs.NewHandle(GetClassLoader<kEnableIndexIds>(soa)));
++      const bool westlake_webview_find_diag =
++          descriptor == "Lorg/chromium/net/NetworkActiveNotifier;";
++      if (UNLIKELY(westlake_webview_find_diag)) {
++        ArtMethod* current = soa.Self()->GetCurrentMethod(nullptr);
++        const std::string current_name =
++            current != nullptr ? current->PrettyMethod() : std::string("<no-current-method>");
++        ObjPtr<mirror::ClassLoader> declaring_loader =
++            current != nullptr ? current->GetDeclaringClass()->GetClassLoader() : nullptr;
++        fprintf(stderr,
++                "[WESTLAKE-WEBVIEW-FINDCLASS] name=%s current=%p method=%s "
++                "declaring_loader=%p selected_loader=%p override=%p system=%p\n",
++                descriptor.c_str(),
++                current,
++                current_name.c_str(),
++                declaring_loader.Ptr(),
++                class_loader.Get(),
++                soa.Self()->GetClassLoaderOverride(),
++                runtime->GetSystemClassLoader());
++        fflush(stderr);
++      }
+       c = class_linker->FindClass(soa.Self(), descriptor.c_str(), class_loader);
++      if (UNLIKELY(westlake_webview_find_diag)) {
++        fprintf(stderr,
++                "[WESTLAKE-WEBVIEW-FINDCLASS] result=%p pending=%d\n",
++                c.Ptr(),
++                soa.Self()->IsExceptionPending());
++        fflush(stderr);
++      }
+     } else {
+       c = class_linker->FindSystemClass(soa.Self(), descriptor.c_str());
+     }
+diff --git a/runtime/native/java_lang_Throwable.cc b/runtime/native/java_lang_Throwable.cc
+index 45496b1a3c574363451b0b0da2779ebf057c07b4..c9868a9795e7ef719ccd972199f6863cfd69646f 100644
+--- a/runtime/native/java_lang_Throwable.cc
++++ b/runtime/native/java_lang_Throwable.cc
+@@ -16,6 +16,9 @@
+ 
+ #include "java_lang_Throwable.h"
+ 
++#include <unistd.h>
++#include <sstream>
++
+ #include "nativehelper/jni_macros.h"
+ 
+ #include "jni/jni_internal.h"
+@@ -27,6 +30,32 @@ namespace art HIDDEN {
+ 
+ static jobject Throwable_nativeFillInStackTrace(JNIEnv* env, jclass) {
+   ScopedFastNativeObjectAccess soa(env);
++  // WESTLAKE §661 (2026-08-16): dump the managed stack AT CONSTRUCTION.
++  // Toutiao's blocking failure is a Kotlin intrinsic NPE ("Parameter specified as non-null is
++  // null: method androidx.lifecycle.ViewModelProvider.get, parameter modelClass") — thrown by APP
++  // code, so ART's common_throws diagnostics never see it, and `getStackTrace()` came back with
++  // ZERO frames (`[INITCHILD-FAIL] with-frames=0`), so the catch site cannot report it either.
++  // Every `new Throwable(...)` passes through here, so this is the one place that always knows.
++  //
++  // ⚠️Hard-gated and hard-capped: this fires on EVERY exception construction, and §650 is the
++  // standing lesson that hot-path logging can dominate wall-clock and fake "progress".
++  //   touch /data/local/tmp/asx/THROWTRACE      (child can read that dir; it cannot write there)
++  // ⚠️NOT the §175/§208 trap: those were about dumping from inside printStackTrace's handler.
++  {
++    static thread_local int wl_state = -1;
++    static thread_local int wl_count = 0;
++    if (wl_state < 0) {
++      wl_state = (access("/data/local/tmp/asx/THROWTRACE", F_OK) == 0) ? 1 : 0;
++    }
++    if (wl_state == 1 && wl_count < 12) {
++      wl_count++;
++      std::ostringstream oss;
++      soa.Self()->DumpJavaStack(oss, /*check_suspended=*/false, /*dump_locks=*/false);
++      const std::string st = oss.str();
++      fprintf(stderr, "[WESTLAKE-661] throwable constructed, stack:\n%s\n", st.c_str());
++      fflush(stderr);
++    }
++  }
+   return soa.AddLocalReference<jobject>(soa.Self()->CreateInternalStackTrace(soa));
+ }
+ 
+diff --git a/runtime/var_handles.cc b/runtime/var_handles.cc
+index 15bae37d93b07a857d58fb3601e4fa468bd5ac94..334ac4318d2d4a75a61701b02f31c2e92de816e2 100644
+--- a/runtime/var_handles.cc
++++ b/runtime/var_handles.cc
+@@ -76,8 +76,8 @@ const char* PFCutVarHandleAccessModeName(mirror::VarHandle::AccessMode access_mo
+   return "<unknown>";
+ }
+ 
+-bool PFCutIsZeroMaskFieldVarHandleModeSupported(Handle<mirror::VarHandle> var_handle,
+-                                                mirror::VarHandle::AccessMode access_mode)
++bool PFCutIsZeroMaskVarHandleModeSupported(Handle<mirror::VarHandle> var_handle,
++                                           mirror::VarHandle::AccessMode access_mode)
+     REQUIRES_SHARED(Locks::mutator_lock_) {
+   if (var_handle.IsNull() ||
+       var_handle->GetField32(mirror::VarHandle::AccessModesBitMaskOffset()) != 0) {
+@@ -85,18 +85,30 @@ bool PFCutIsZeroMaskFieldVarHandleModeSupported(Handle<mirror::VarHandle> var_ha
+   }
+ 
+   ObjPtr<mirror::Class> vh_class = var_handle->GetClass();
+-  if (vh_class == nullptr ||
+-      (!vh_class->DescriptorEquals("Ljava/lang/invoke/FieldVarHandle;") &&
+-       !vh_class->DescriptorEquals("Ljava/lang/invoke/StaticFieldVarHandle;"))) {
++  if (vh_class == nullptr) {
+     return false;
+   }
+ 
+-  ArtField* field = ObjPtr<mirror::FieldVarHandle>::DownCast(var_handle.Get())->GetArtField();
+-  if (field == nullptr) {
++  // The managed VarHandle constructors normally populate accessModesBitMask. On this
++  // standalone boot-classpath port those final instance fields can remain zero even though
++  // the native mirror has all of the type and target metadata needed to execute the access.
++  // Recover only the aligned VarHandle kinds whose support rules can be derived exactly.
++  bool is_final = false;
++  if (vh_class->DescriptorEquals("Ljava/lang/invoke/FieldVarHandle;") ||
++      vh_class->DescriptorEquals("Ljava/lang/invoke/StaticFieldVarHandle;")) {
++    ArtField* field = ObjPtr<mirror::FieldVarHandle>::DownCast(var_handle.Get())->GetArtField();
++    if (field == nullptr) {
++      return false;
++    }
++    is_final = field->IsFinal();
++  } else if (vh_class->DescriptorEquals("Ljava/lang/invoke/ArrayElementVarHandle;")) {
++    // Java array elements are mutable and aligned. This deliberately excludes byte-array and
++    // byte-buffer view VarHandles, whose supported modes depend on alignment and byte order.
++    is_final = false;
++  } else {
+     return false;
+   }
+ 
+-  const bool is_final = field->IsFinal();
+   const Primitive::Type primitive_type = var_handle->GetVarType()->GetPrimitiveType();
+   switch (access_mode) {
+     case mirror::VarHandle::AccessMode::kGet:
+@@ -234,7 +246,7 @@ bool VarHandleInvokeAccessorImpl(Thread* self,
+   }
+ 
+   if (!var_handle->IsAccessModeSupported(access_mode) &&
+-      !PFCutIsZeroMaskFieldVarHandleModeSupported(var_handle, access_mode)) {
++      !PFCutIsZeroMaskVarHandleModeSupported(var_handle, access_mode)) {
+     static thread_local int pfc_vh_uoe_count = 0;
+     if (pfc_vh_uoe_count < 40) {
+       pfc_vh_uoe_count++;

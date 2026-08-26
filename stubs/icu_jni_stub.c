@@ -96,61 +96,18 @@ static jobject NativeConverter_charsetForName(JNIEnv* env, jclass clazz, jstring
     (*env)->ReleaseStringUTFChars(env, jname, name);
     if (!info) return NULL;
 
-    /* Create Charset object without calling Charset(String, String[]) constructor.
-     * The constructor calls Collections.unmodifiableSet() which triggers a broken
-     * interface dispatch (Set.iterator() AbstractMethodError) in our standalone build.
-     * Instead, use Unsafe.allocateInstance + manual field setting. */
     jclass charsetCls = (*env)->FindClass(env, "com/android/icu/charset/CharsetICU");
     if (!charsetCls) return NULL;
 
-    /* Call CharsetICU constructor normally (sets up ICU fields), but then
-     * replace the aliasSet with a plain HashSet to avoid Collections$UnmodifiableSet
-     * which has broken itable dispatch for Set.iterator(). */
-    jobject result = NULL;
-    {
-        jmethodID ctor = (*env)->GetMethodID(env, charsetCls, "<init>",
-            "(Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;)V");
-        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
-        if (ctor) {
-            jclass stringCls = (*env)->FindClass(env, "java/lang/String");
-            jobjectArray aliases = (*env)->NewObjectArray(env, info->aliasCount, stringCls, NULL);
-            for (int i = 0; i < info->aliasCount; i++) {
-                (*env)->SetObjectArrayElement(env, aliases, i,
-                    (*env)->NewStringUTF(env, info->aliases[i]));
-            }
-            result = (*env)->NewObject(env, charsetCls, ctor,
-                (*env)->NewStringUTF(env, info->name),
-                (*env)->NewStringUTF(env, info->icuName),
-                aliases);
-            if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); result = NULL; }
-            /* Replace aliasSet (UnmodifiableSet) with an empty HashSet.
-             * UnmodifiableSet has broken itable dispatch for iterator().
-             * Aliases won't be available via aliases() but cache() won't crash. */
-            if (result) {
-                jclass baseCls = (*env)->FindClass(env, "java/nio/charset/Charset");
-                jfieldID aliasF = baseCls ? (*env)->GetFieldID(env, baseCls, "aliasSet", "Ljava/util/Set;") : NULL;
-                if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
-                if (aliasF) {
-                    jclass hsCls = (*env)->FindClass(env, "java/util/HashSet");
-                    jmethodID hsInit0 = hsCls ? (*env)->GetMethodID(env, hsCls, "<init>", "()V") : NULL;
-                    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
-                    if (hsInit0) {
-                        jobject emptySet = (*env)->NewObject(env, hsCls, hsInit0);
-                        if (emptySet && !(*env)->ExceptionCheck(env)) {
-                            (*env)->SetObjectField(env, result, aliasF, emptySet);
-                        }
-                    }
-                    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
-                }
-            }
-        }
-    }
+    /* Constructor-free path for standalone Westlake:
+     * CharsetICU.<init> delegates into Charset(String, String[]). In this
+     * stripped runtime that constructor still crosses broken collection/array
+     * edges. Allocate the concrete object and populate the same fields directly.
+     */
+    jobject result = (*env)->AllocObject(env, charsetCls);
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); result = NULL; }
 
     if (result) {
-        /* Set Charset fields manually:
-         * - name (String) - canonical name
-         * - aliasSet (Set<String>) - use a plain HashSet to avoid UnmodifiableSet
-         */
         jclass baseCharsetCls = (*env)->FindClass(env, "java/nio/charset/Charset");
         if (baseCharsetCls) {
             jfieldID nameField = (*env)->GetFieldID(env, baseCharsetCls, "name", "Ljava/lang/String;");
@@ -160,7 +117,6 @@ static jobject NativeConverter_charsetForName(JNIEnv* env, jclass clazz, jstring
             if (nameField)
                 (*env)->SetObjectField(env, result, nameField, (*env)->NewStringUTF(env, info->name));
 
-            /* Create a plain HashSet for aliases (avoids Collections.unmodifiableSet) */
             if (aliasSetField) {
                 jclass hsCls = (*env)->FindClass(env, "java/util/HashSet");
                 jmethodID hsInit = hsCls ? (*env)->GetMethodID(env, hsCls, "<init>", "()V") : NULL;
@@ -189,24 +145,9 @@ static jobject NativeConverter_charsetForName(JNIEnv* env, jclass clazz, jstring
                 (*env)->SetObjectField(env, result, icuNameField, (*env)->NewStringUTF(env, info->icuName));
             if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
         }
-    } else {
-        /* Fallback: try constructor (will fail if UnmodifiableSet is broken) */
-        jmethodID ctor = (*env)->GetMethodID(env, charsetCls, "<init>",
-            "(Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;)V");
-        if (ctor) {
-            jclass stringCls = (*env)->FindClass(env, "java/lang/String");
-            jobjectArray aliases = (*env)->NewObjectArray(env, info->aliasCount, stringCls, NULL);
-            for (int i = 0; i < info->aliasCount; i++) {
-                (*env)->SetObjectArrayElement(env, aliases, i, (*env)->NewStringUTF(env, info->aliases[i]));
-            }
-            result = (*env)->NewObject(env, charsetCls, ctor,
-                (*env)->NewStringUTF(env, info->name),
-                (*env)->NewStringUTF(env, info->icuName),
-                aliases);
-            if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); result = NULL; }
-        }
     }
 
+    fprintf(stderr, "[icu] charsetForName result=%p\n", result);
     (*env)->DeleteLocalRef(env, charsetCls);
     return result;
 }

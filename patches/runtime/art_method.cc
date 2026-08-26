@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdio>
 
 #include "android-base/stringprintf.h"
 
@@ -38,6 +39,7 @@
 #include "gc/accounting/card_table-inl.h"
 #include "hidden_api.h"
 #include "interpreter/interpreter.h"
+#include "interpreter/interpreter_common.h"
 #include "interpreter/unstarted_runtime.h"
 #include "intrinsics_enum.h"
 #include "jit/jit.h"
@@ -180,6 +182,19 @@ uint16_t ArtMethod::FindObsoleteDexClassDefIndex() {
 }
 
 void ArtMethod::ThrowInvocationTimeError(ObjPtr<mirror::Object> receiver) {
+  // WESTLAKE-DIAG (2026-07-11): non-invokable method invocation is the suspected
+  // arity/method-resolution wall that kills the noice child. Name the exact method
+  // + which error path fires. Safe: PrettyMethod/IsAbstract are internal ART, no JNI.
+  {
+    const char* kind = IsDefaultConflicting() ? "IncompatibleClassChange(default-conflict)"
+                     : (GetDeclaringClass()->IsInterface() && receiver != nullptr) ? "interface-abstract"
+                     : IsAbstract() ? "AbstractMethodError" : "non-invokable";
+    fprintf(stderr, "[INVOKE-ERR] ThrowInvocationTimeError kind=%s method=%s decl=%s recv=%s\n",
+            kind, PrettyMethod(/*with_signature=*/true).c_str(),
+            GetDeclaringClass()->PrettyDescriptor().c_str(),
+            receiver != nullptr ? receiver->GetClass()->PrettyDescriptor().c_str() : "null");
+    fflush(stderr);
+  }
   DCHECK(!IsInvokable());
   if (IsDefaultConflicting()) {
     ThrowIncompatibleClassChangeErrorForMethodConflict(this);
@@ -386,13 +401,45 @@ void ArtMethod::Invoke(Thread* self, uint32_t* args, uint32_t args_size, JValue*
   // Invocation by the interpreter, explicitly forcing interpretation over JIT to prevent
   // cycling around the various JIT/Interpreter methods that handle method invocation.
 
+  static constexpr uintptr_t kPFCutStaleQuickEntry = 0xfffffffffffffb17ULL;
+  const void* current_quick_entry = GetEntryPointFromQuickCompiledCode();
+  if (UNLIKELY(reinterpret_cast<uintptr_t>(current_quick_entry) == kPFCutStaleQuickEntry)) {
+    static thread_local int stale_quick_repair_count = 0;
+    if (stale_quick_repair_count < 80) {
+      stale_quick_repair_count++;
+      fprintf(stderr,
+              "[PFCUT] ArtMethod::Invoke stale quick repair native=%d %s\n",
+              IsNative() ? 1 : 0,
+              PrettyMethod().c_str());
+      fflush(stderr);
+    }
+    SetEntryPointFromQuickCompiledCode(IsNative()
+                                           ? GetQuickGenericJniStub()
+                                           : GetQuickToInterpreterBridge());
+  }
+  if (UNLIKELY(IsNative() &&
+               reinterpret_cast<uintptr_t>(GetEntryPointFromJni()) == kPFCutStaleQuickEntry)) {
+    SetEntryPointFromJniPtrSize(nullptr, kRuntimePointerSize);
+  }
+
   // Force interpreter for ALL non-native Java methods.
   // Without AOT compilation or JIT, there is no compiled code to execute.
   // Entry points may contain Nterp stubs (just 'ret') or uninitialized values,
   // causing SIGBUS when the invoke stub jumps to them.
   bool force_interpreter_path = false;
   if (!IsNative() && IsInvokable() && !IsProxyMethod()) {
-    force_interpreter_path = true;
+    // WESTLAKE §601: only force the interpreter when there is genuinely NO compiled code.
+    // The blanket force-interpret above was a safety measure for the JIT-off configuration
+    // ("without AOT or JIT there is no compiled code to execute"). Once the JIT is live that
+    // premise is false: an entry point inside the JIT code cache IS real compiled code. Running
+    // it is exactly what Jit::CanInvokeCompiledCode already authorises, and force-interpreting
+    // it instead is what produced the infinite Execute<->ToCompiledCodeBridge recursion (SOE).
+    jit::Jit* wl_jit = runtime->GetJit();
+    const void* wl_ep = GetEntryPointFromQuickCompiledCode();
+    const bool wl_has_jit_code =
+        (wl_jit != nullptr && wl_jit->GetCodeCache() != nullptr && wl_ep != nullptr &&
+         wl_jit->GetCodeCache()->ContainsPc(wl_ep));
+    force_interpreter_path = !wl_has_jit_code;
   }
 
   if (UNLIKELY(!runtime->IsStarted() || force_interpreter_path ||
@@ -410,17 +457,75 @@ void ArtMethod::Invoke(Thread* self, uint32_t* args, uint32_t args_size, JValue*
     DCHECK_EQ(runtime->GetClassLinker()->GetImagePointerSize(), kRuntimePointerSize);
 
     constexpr bool kLogInvocationStartAndReturn = false;
-    bool have_quick_code = GetEntryPointFromQuickCompiledCode() != nullptr;
+    const void* quick_code = GetEntryPointFromQuickCompiledCode();
+    bool have_quick_code = quick_code != nullptr;
+    const bool is_vmstack_diag = false;
     if (LIKELY(have_quick_code)) {
-      // Route ALL methods through EnterInterpreterFromInvoke — bypasses assembly
-      // stubs entirely. The assembly stubs dispatch through entry_point which may
-      // point to DEX data or Nterp 'ret' stubs, causing SIGBUS.
-      // Native methods are handled by InterpreterJni (pure C++ function call).
-      {
+      // Keep Java methods on the interpreter path in standalone mode because many
+      // quick entrypoints still point at unusable image/Nterp state. Native methods
+      // need the stock quick invoke/JNI shape so interpreter callers do not create
+      // a second shadow frame for the same native callee.
+      if (IsNative()) {
+        static constexpr uintptr_t kPFCutStaleNativeQuickEntry = 0xfffffffffffffb17ULL;
+        const void* jni_code = GetEntryPointFromJni();
+        if (UNLIKELY(reinterpret_cast<uintptr_t>(quick_code) == kPFCutStaleNativeQuickEntry ||
+                     reinterpret_cast<uintptr_t>(jni_code) == kPFCutStaleNativeQuickEntry)) {
+          SetEntryPointFromJniPtrSize(nullptr, kRuntimePointerSize);
+          ObjPtr<mirror::Object> receiver = IsStatic() ? nullptr :
+              reinterpret_cast<StackReference<mirror::Object>*>(args)->AsMirrorPtr();
+          interpreter::EnterInterpreterFromInvoke(
+              self,
+              this,
+              receiver,
+              args + (IsStatic() ? 0 : 1),
+              result,
+              /*stay_in_interpreter=*/ true);
+        } else {
+          if (IsStatic()) {
+            art_quick_invoke_static_stub(this, args, args_size, self, result, shorty);
+          } else {
+            art_quick_invoke_stub(this, args, args_size, self, result, shorty);
+          }
+        }
+      } else if (UNLIKELY(IsProxyMethod())) {
+        // WESTLAKE §638 (2026-08-15): a PROXY method must NOT be forced onto the interpreter path.
+        // It has no code item and is not native, so EnterInterpreterFromInvoke falls through to
+        // Execute() with a NULL dex instruction pointer and the switch interpreter faults on its
+        // first opcode fetch (`ldrh w25,[x28]`, x28 == 0 => sig=11 code=1 addr=0).
+        // Upstream never routes one here — ArtMethod::Invoke's force-interpreter predicate is
+        //     self->IsForceInterpreter() && !IsNative() && !IsProxyMethod() && IsInvokable()
+        // — so the fix is simply to honour the same exclusion in this local branch and let the
+        // stock quick stub run, which reaches artQuickProxyInvokeHandler and the InvocationHandler.
+        // Named by the §637 guard: `IActivityManager.getMemoryInfo ... proxy=1`, reached through
+        // Method.invoke; this port serves system services as dynamic proxies (§416), so it is a
+        // hot path, not a corner case.
+        if (IsStatic()) {
+          art_quick_invoke_static_stub(this, args, args_size, self, result, shorty);
+        } else {
+          art_quick_invoke_stub(this, args, args_size, self, result, shorty);
+        }
+      } else {
+        if (is_vmstack_diag) {
+          fprintf(stderr,
+                  "[PFCUT] ArtMethod::Invoke before EnterInterpreterFromInvoke top_shadow=%p top_quick=%p link=%p\n",
+                  self->GetManagedStack()->GetTopShadowFrame(),
+                  self->GetManagedStack()->GetTopQuickFrame(),
+                  self->GetManagedStack()->GetLink());
+          fflush(stderr);
+        }
         ObjPtr<mirror::Object> receiver = IsStatic() ? nullptr :
             reinterpret_cast<StackReference<mirror::Object>*>(args)->AsMirrorPtr();
         interpreter::EnterInterpreterFromInvoke(
             self, this, receiver, args + (IsStatic() ? 0 : 1), result, /*stay_in_interpreter=*/true);
+        if (is_vmstack_diag) {
+          fprintf(stderr,
+                  "[PFCUT] ArtMethod::Invoke after EnterInterpreterFromInvoke result=%p top_shadow=%p top_quick=%p link=%p\n",
+                  result != nullptr ? result->GetL() : nullptr,
+                  self->GetManagedStack()->GetTopShadowFrame(),
+                  self->GetManagedStack()->GetTopQuickFrame(),
+                  self->GetManagedStack()->GetLink());
+          fflush(stderr);
+        }
       }
       if (UNLIKELY(self->GetException() == Thread::GetDeoptimizationException())) {
         // Unusual case where we were running generated code and an
@@ -478,7 +583,6 @@ void ArtMethod::Invoke(Thread* self, uint32_t* args, uint32_t args_size, JValue*
     }
   }
 
-  // Pop transition.
   self->PopManagedStackFragment(fragment);
 }
 
@@ -866,6 +970,27 @@ void ArtMethod::CopyFrom(ArtMethod* src, PointerSize image_pointer_size) {
     SetNativePointer(EntryPointFromQuickCompiledCodeOffset(image_pointer_size),
                      GetQuickToInterpreterBridge(),
                      image_pointer_size);
+  }
+  static constexpr uintptr_t kPFCutStaleQuickEntry = 0xfffffffffffffb17ULL;
+  entry_point = GetEntryPointFromQuickCompiledCodePtrSize(image_pointer_size);
+  if (UNLIKELY(reinterpret_cast<uintptr_t>(entry_point) == kPFCutStaleQuickEntry)) {
+    const void* replacement = IsNative() ? GetQuickGenericJniStub() : GetQuickToInterpreterBridge();
+    SetNativePointer(EntryPointFromQuickCompiledCodeOffset(image_pointer_size),
+                     replacement,
+                     image_pointer_size);
+    if (IsNative()) {
+      SetEntryPointFromJniPtrSize(nullptr, image_pointer_size);
+    }
+    static thread_local int copy_repair_count = 0;
+    if (copy_repair_count < 80) {
+      copy_repair_count++;
+      fprintf(stderr,
+              "[PFCUT] ArtMethod::CopyFrom stale quick repair native=%d %s -> %p\n",
+              IsNative() ? 1 : 0,
+              PrettyMethod().c_str(),
+              replacement);
+      fflush(stderr);
+    }
   }
 
   // Clear the data pointer, it will be set if needed by the caller.

@@ -16,6 +16,7 @@
 
 #include "interpreter.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -32,8 +33,10 @@
 #include "jit/jit.h"
 #include "jit/jit_code_cache.h"
 #include "jvalue-inl.h"
+#include "mirror/array.h"
 #include "mirror/class-inl.h"
 #include "mirror/method_handles_lookup.h"
+#include "mirror/object_array-inl.h"
 #include "mirror/object-inl.h"
 #include "mirror/string-inl.h"
 #include "nativehelper/scoped_local_ref.h"
@@ -46,12 +49,90 @@
 #include "jni/java_vm_ext.h"
 #include "jni/jni_env_ext.h"
 
+#include "westlake_quiet_stdio.h"
+
 namespace art HIDDEN {
 namespace interpreter {
 
 ALWAYS_INLINE static ObjPtr<mirror::Object> ObjArg(uint32_t arg)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   return reinterpret_cast<mirror::Object*>(arg);
+}
+
+static bool PFCutIsBogusInterpreterUnsafeObject(ObjPtr<mirror::Object> value) {
+  const uintptr_t ptr = reinterpret_cast<uintptr_t>(value.Ptr());
+  static constexpr uintptr_t kPFCutStaleObject64 = 0xfffffffffffffb17ULL;
+  static constexpr uintptr_t kPFCutStaleObject32 = 0xfffffb17ULL;
+  return ptr == kPFCutStaleObject64 ||
+         ptr == kPFCutStaleObject32 ||
+         (ptr != 0u && ptr < 0x10000u) ||
+         ((ptr & 0x3u) != 0u);
+}
+
+static bool PFCutUnsafeObjectArrayIndexFromOffset(ObjPtr<mirror::Object> obj,
+                                                  jlong offset,
+                                                  int32_t* index_out)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (obj == nullptr || !obj->IsObjectArray()) {
+    return false;
+  }
+  const int32_t base = mirror::Array::DataOffset(kHeapReferenceSize).Int32Value();
+  if (offset < base) {
+    return false;
+  }
+  const jlong delta = offset - base;
+  if ((delta % kHeapReferenceSize) != 0) {
+    return false;
+  }
+  const jlong index64 = delta / kHeapReferenceSize;
+  ObjPtr<mirror::ObjectArray<mirror::Object>> array =
+      obj->AsObjectArray<mirror::Object>();
+  if (index64 < 0 ||
+      index64 > static_cast<jlong>(std::numeric_limits<int32_t>::max()) ||
+      index64 >= array->GetLength()) {
+    return false;
+  }
+  *index_out = static_cast<int32_t>(index64);
+  return true;
+}
+
+static ObjPtr<mirror::Object> PFCutUnsafeGetObjectArraySlot(ObjPtr<mirror::Object> obj,
+                                                            int32_t index)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  return obj->AsObjectArray<mirror::Object>()->GetWithoutChecks(index);
+}
+
+static void PFCutUnsafeSetObjectArraySlot(ObjPtr<mirror::Object> obj,
+                                          int32_t index,
+                                          ObjPtr<mirror::Object> value)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  obj->AsObjectArray<mirror::Object>()->SetWithoutChecks</*kTransactionActive=*/ false,
+                                               /*kCheckTransaction=*/ false>(index, value);
+}
+
+static void PFCutDumpInterpreterUnsafeCallers(Thread* self)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  int depth = 0;
+  for (auto* frame = self->GetManagedStack()->GetTopShadowFrame();
+       frame != nullptr && depth < 6;
+       frame = frame->GetLink(), ++depth) {
+    ArtMethod* caller = frame->GetMethod();
+    if (caller != nullptr) {
+      fprintf(stderr,
+              "[PFCUT]   caller#%d %s dex_pc=%u\n",
+              depth,
+              caller->PrettyMethod().c_str(),
+      frame->GetDexPC());
+    }
+  }
+}
+
+static bool PFCutIsRealMcdCasIntSpin(jlong offset,
+                                     jint current,
+                                     jint expected_value,
+                                     jint new_value,
+                                     bool success) {
+  return !success && offset == 160 && current == 0 && expected_value == -1 && new_value == 0;
 }
 
 static bool WestlakeTraceTimeZoneBridge() {
@@ -77,6 +158,324 @@ static void InterpreterJni(Thread* self,
       return;
     }
     result->SetC(receiver->AsString()->CharAt(static_cast<int32_t>(args[0])));
+    return;
+  }
+
+  if (!method->IsStatic() &&
+      shorty == "ZLJII" &&
+      strcmp(method->GetName(), "compareAndSetInt") == 0 &&
+      method->GetDeclaringClass()->DescriptorEquals("Ljdk/internal/misc/Unsafe;")) {
+    ObjPtr<mirror::Object> target = ObjArg(args[0]);
+    const jlong offset = (static_cast<uint64_t>(args[2]) << 32) | args[1];
+    const jint expected_value = static_cast<jint>(args[3]);
+    const jint new_value = static_cast<jint>(args[4]);
+    const bool bad_target =
+        target == nullptr ||
+        PFCutIsBogusInterpreterUnsafeObject(target);
+    if (UNLIKELY(bad_target || offset < 0 || offset > (1LL << 30))) {
+      static thread_local int bad_count = 0;
+      if (bad_count < 32) {
+        bad_count++;
+        fprintf(stderr,
+                "[PFCUT] InterpreterJni jdk.Unsafe compareAndSetInt bad target=%p offset=%lld expected=%d new=%d\n",
+                target.Ptr(),
+                static_cast<long long>(offset),
+                expected_value,
+                new_value);
+        fflush(stderr);
+      }
+      result->SetZ(JNI_FALSE);
+      return;
+    }
+    MemberOffset member_offset(offset);
+    jint current = target->GetField32Volatile(member_offset);
+    const bool success = target->CasField32<false>(member_offset,
+                                                   expected_value,
+                                                   new_value,
+                                                   CASMode::kStrong,
+                                                   std::memory_order_seq_cst);
+    if (!success) {
+      current = target->GetField32Volatile(member_offset);
+    }
+    const bool real_mcd_spin_probe =
+        PFCutIsRealMcdCasIntSpin(offset, current, expected_value, new_value, success);
+    static thread_local int real_mcd_spin_count = 0;
+    static thread_local int cas_count = 0;
+    if (UNLIKELY(real_mcd_spin_probe && real_mcd_spin_count < 48)) {
+      real_mcd_spin_count++;
+      std::string target_type = target->PrettyTypeOf();
+      fprintf(stderr,
+              "[PFCUT] InterpreterJni jdk.Unsafe CAS int spin-probe target=%p type=%s "
+              "offset=%lld current=%d expected=%d new=%d success=%d count=%d\n",
+              target.Ptr(),
+              target_type.c_str(),
+              static_cast<long long>(offset),
+              current,
+              expected_value,
+              new_value,
+              success ? 1 : 0,
+              real_mcd_spin_count);
+      PFCutDumpInterpreterUnsafeCallers(self);
+      fflush(stderr);
+    } else if (cas_count < 0 /*§650*/) {
+      cas_count++;
+      fprintf(stderr,
+              "[PFCUT] InterpreterJni jdk.Unsafe CAS int target=%p offset=%lld current=%d expected=%d new=%d success=%d\n",
+              target.Ptr(),
+              static_cast<long long>(offset),
+              current,
+              expected_value,
+              new_value,
+              success ? 1 : 0);
+      if (cas_count <= 12) {
+        PFCutDumpInterpreterUnsafeCallers(self);
+      }
+      fflush(stderr);
+    }
+    result->SetZ(success ? JNI_TRUE : JNI_FALSE);
+    return;
+  }
+
+  if (!method->IsStatic() &&
+      shorty == "ZLJJJ" &&
+      strcmp(method->GetName(), "compareAndSetLong") == 0 &&
+      method->GetDeclaringClass()->DescriptorEquals("Ljdk/internal/misc/Unsafe;")) {
+    ObjPtr<mirror::Object> target = ObjArg(args[0]);
+    const jlong offset = (static_cast<uint64_t>(args[2]) << 32) | args[1];
+    const jlong expected_value = (static_cast<uint64_t>(args[4]) << 32) | args[3];
+    const jlong new_value = (static_cast<uint64_t>(args[6]) << 32) | args[5];
+    if (UNLIKELY(target == nullptr ||
+                 PFCutIsBogusInterpreterUnsafeObject(target) ||
+                 offset < 0 ||
+                 offset > (1LL << 30))) {
+      static thread_local int bad_count = 0;
+      if (bad_count < 32) {
+        bad_count++;
+        fprintf(stderr,
+                "[PFCUT] InterpreterJni jdk.Unsafe compareAndSetLong bad target=%p offset=%lld expected=%lld new=%lld\n",
+                target.Ptr(),
+                static_cast<long long>(offset),
+                static_cast<long long>(expected_value),
+                static_cast<long long>(new_value));
+        fflush(stderr);
+      }
+      result->SetZ(JNI_FALSE);
+      return;
+    }
+    MemberOffset member_offset(offset);
+    jlong current = target->GetField64Volatile(member_offset);
+    const bool success =
+        target->CasFieldStrongSequentiallyConsistent64<false>(member_offset,
+                                                              expected_value,
+                                                              new_value);
+    if (!success) {
+      current = target->GetField64Volatile(member_offset);
+    }
+    static thread_local int cas_long_count = 0;
+    if (cas_long_count < 96) {
+      cas_long_count++;
+      fprintf(stderr,
+              "[PFCUT] InterpreterJni jdk.Unsafe CAS long target=%p offset=%lld current=%lld expected=%lld new=%lld success=%d\n",
+              target.Ptr(),
+              static_cast<long long>(offset),
+              static_cast<long long>(current),
+              static_cast<long long>(expected_value),
+              static_cast<long long>(new_value),
+              success ? 1 : 0);
+      if (cas_long_count <= 12) {
+        PFCutDumpInterpreterUnsafeCallers(self);
+      }
+      fflush(stderr);
+    }
+    result->SetZ(success ? JNI_TRUE : JNI_FALSE);
+    return;
+  }
+
+  if (!method->IsStatic() &&
+      shorty == "VLJI" &&
+      (strcmp(method->GetName(), "putInt") == 0 ||
+       strcmp(method->GetName(), "putIntVolatile") == 0) &&
+      method->GetDeclaringClass()->DescriptorEquals("Ljdk/internal/misc/Unsafe;")) {
+    ObjPtr<mirror::Object> target = ObjArg(args[0]);
+    const jlong offset = (static_cast<uint64_t>(args[2]) << 32) | args[1];
+    const jint new_value = static_cast<jint>(args[3]);
+    if (UNLIKELY(target == nullptr ||
+                 PFCutIsBogusInterpreterUnsafeObject(target) ||
+                 offset < 0 ||
+                 offset > (1LL << 30))) {
+      static thread_local int bad_count = 0;
+      if (bad_count < 32) {
+        bad_count++;
+        fprintf(stderr,
+                "[PFCUT] InterpreterJni jdk.Unsafe %s bad target=%p offset=%lld new=%d\n",
+                method->GetName(),
+                target.Ptr(),
+                static_cast<long long>(offset),
+                new_value);
+        fflush(stderr);
+      }
+      return;
+    }
+    MemberOffset member_offset(offset);
+    static thread_local int put_int_count = 0;
+    if (put_int_count < 96) {
+      put_int_count++;
+      fprintf(stderr,
+              "[PFCUT] InterpreterJni jdk.Unsafe %s target=%p offset=%lld new=%d\n",
+              method->GetName(),
+              target.Ptr(),
+              static_cast<long long>(offset),
+              new_value);
+      if (put_int_count <= 8) {
+        PFCutDumpInterpreterUnsafeCallers(self);
+      }
+      fflush(stderr);
+    }
+    if (strcmp(method->GetName(), "putIntVolatile") == 0) {
+      target->SetField32Volatile<false>(member_offset, new_value);
+    } else {
+      target->SetField32<false>(member_offset, new_value);
+    }
+    return;
+  }
+
+  if (!method->IsStatic() &&
+      shorty == "LLJ" &&
+      strcmp(method->GetName(), "getReferenceVolatile") == 0 &&
+      method->GetDeclaringClass()->DescriptorEquals("Ljdk/internal/misc/Unsafe;")) {
+    ObjPtr<mirror::Object> target = ObjArg(args[0]);
+    const jlong offset = (static_cast<uint64_t>(args[2]) << 32) | args[1];
+    if (UNLIKELY(target == nullptr ||
+                 PFCutIsBogusInterpreterUnsafeObject(target) ||
+                 offset < 0 ||
+                 offset > (1LL << 30))) {
+      static thread_local int bad_count = 0;
+      if (bad_count < 32) {
+        bad_count++;
+        fprintf(stderr,
+                "[PFCUT] InterpreterJni jdk.Unsafe getReferenceVolatile bad target=%p offset=%lld\n",
+                target.Ptr(),
+                static_cast<long long>(offset));
+        fflush(stderr);
+      }
+      result->SetL(nullptr);
+      return;
+    }
+    int32_t array_index = -1;
+    ObjPtr<mirror::Object> value = nullptr;
+    if (PFCutUnsafeObjectArrayIndexFromOffset(target, offset, &array_index)) {
+      value = PFCutUnsafeGetObjectArraySlot(target, array_index);
+    } else {
+      value = target->GetFieldObjectVolatile<mirror::Object>(MemberOffset(offset));
+    }
+    if (UNLIKELY(PFCutIsBogusInterpreterUnsafeObject(value))) {
+      static thread_local int bogus_count = 0;
+      if (bogus_count < 32) {
+        bogus_count++;
+        fprintf(stderr,
+                "[PFCUT] InterpreterJni jdk.Unsafe getReferenceVolatile bogus target=%p offset=%lld value=%p\n",
+                target.Ptr(),
+                static_cast<long long>(offset),
+                value.Ptr());
+        fflush(stderr);
+      }
+      result->SetL(nullptr);
+      return;
+    }
+    static thread_local int get_ref_count = 0;
+    if (get_ref_count < 48) {
+      get_ref_count++;
+      fprintf(stderr,
+              "[PFCUT] InterpreterJni jdk.Unsafe getReferenceVolatile target=%p offset=%lld value=%p array_index=%d\n",
+              target.Ptr(),
+              static_cast<long long>(offset),
+              value.Ptr(),
+              array_index);
+      if (get_ref_count <= 8) {
+        PFCutDumpInterpreterUnsafeCallers(self);
+      }
+      fflush(stderr);
+    }
+    result->SetL(value);
+    return;
+  }
+
+  if (!method->IsStatic() &&
+      shorty == "ZLJLL" &&
+      strcmp(method->GetName(), "compareAndSetReference") == 0 &&
+      method->GetDeclaringClass()->DescriptorEquals("Ljdk/internal/misc/Unsafe;")) {
+    ObjPtr<mirror::Object> target = ObjArg(args[0]);
+    const jlong offset = (static_cast<uint64_t>(args[2]) << 32) | args[1];
+    ObjPtr<mirror::Object> expected_value = ObjArg(args[3]);
+    ObjPtr<mirror::Object> new_value = ObjArg(args[4]);
+    if (UNLIKELY(target == nullptr ||
+                 PFCutIsBogusInterpreterUnsafeObject(target) ||
+                 PFCutIsBogusInterpreterUnsafeObject(expected_value) ||
+                 PFCutIsBogusInterpreterUnsafeObject(new_value) ||
+                 offset < 0 ||
+                 offset > (1LL << 30))) {
+      static thread_local int bad_count = 0;
+      if (bad_count < 32) {
+        bad_count++;
+        fprintf(stderr,
+                "[PFCUT] InterpreterJni jdk.Unsafe compareAndSetReference bad target=%p offset=%lld expected=%p new=%p\n",
+                target.Ptr(),
+                static_cast<long long>(offset),
+                expected_value.Ptr(),
+                new_value.Ptr());
+        fflush(stderr);
+      }
+      result->SetZ(JNI_FALSE);
+      return;
+    }
+    int32_t array_index = -1;
+    const bool is_array_slot =
+        PFCutUnsafeObjectArrayIndexFromOffset(target, offset, &array_index);
+    ObjPtr<mirror::Object> current = is_array_slot
+        ? PFCutUnsafeGetObjectArraySlot(target, array_index)
+        : target->GetFieldObjectVolatile<mirror::Object>(MemberOffset(offset));
+    if (UNLIKELY(PFCutIsBogusInterpreterUnsafeObject(current))) {
+      static thread_local int bogus_count = 0;
+      if (bogus_count < 32) {
+        bogus_count++;
+        fprintf(stderr,
+                "[PFCUT] InterpreterJni jdk.Unsafe compareAndSetReference bogus current target=%p offset=%lld current=%p\n",
+                target.Ptr(),
+                static_cast<long long>(offset),
+                current.Ptr());
+        fflush(stderr);
+      }
+      result->SetZ(JNI_FALSE);
+      return;
+    }
+    const bool success = target->CasFieldObject<false>(MemberOffset(offset),
+                                                       expected_value,
+                                                       new_value,
+                                                       CASMode::kStrong,
+                                                       std::memory_order_seq_cst);
+    if (!success) {
+      current = is_array_slot
+          ? PFCutUnsafeGetObjectArraySlot(target, array_index)
+          : target->GetFieldObjectVolatile<mirror::Object>(MemberOffset(offset));
+    }
+    static thread_local int cas_ref_count = 0;
+    if (cas_ref_count < 96) {
+      cas_ref_count++;
+      fprintf(stderr,
+              "[PFCUT] InterpreterJni jdk.Unsafe CAS ref target=%p offset=%lld current=%p expected=%p new=%p success=%d array_index=%d\n",
+              target.Ptr(),
+              static_cast<long long>(offset),
+              current.Ptr(),
+              expected_value.Ptr(),
+              new_value.Ptr(),
+              success ? 1 : 0,
+              array_index);
+      if (cas_ref_count <= 12) {
+        PFCutDumpInterpreterUnsafeCallers(self);
+      }
+      fflush(stderr);
+    }
+    result->SetZ(success ? JNI_TRUE : JNI_FALSE);
     return;
   }
 
@@ -1732,16 +2131,6 @@ void EnterInterpreterFromInvoke(Thread* self,
                                 bool stay_in_interpreter) {
   DCHECK_EQ(self, Thread::Current());
 
-  // Interpreter depth guard — prevents infinite recursion from circular class init
-  static thread_local int invoke_depth = 0;
-  invoke_depth++;
-  struct InvokeDepthGuard { ~InvokeDepthGuard() { invoke_depth--; } } idg;
-  if (invoke_depth > 50) {
-    // Don't decrement here — RAII guard handles it
-    ThrowStackOverflowError(self);
-    return;
-  }
-
   bool implicit_check = Runtime::Current()->GetImplicitStackOverflowChecks();
   if (UNLIKELY(__builtin_frame_address(0) < self->GetStackEndForInterpreter(implicit_check))) {
     ThrowStackOverflowError(self);
@@ -1799,6 +2188,32 @@ void EnterInterpreterFromInvoke(Thread* self,
     self->EndAssertNoThreadSuspension(old_cause);
     method->ThrowInvocationTimeError(receiver);
     return;
+  } else if (UNLIKELY(!method->IsNative())) {
+    // WESTLAKE §637 (2026-08-15): upstream ASSERTS this cannot happen — the `else` branch below
+    // carries `DCHECK(method->IsNative())`, which compiles away in a release build. Execution then
+    // reaches Execute() -> ExecuteSwitchImplCpp with a NULL dex instruction pointer and faults on
+    // the very first opcode fetch:
+    //     975bf8:  ldrh w25, [x28]      with x28 == 0   =>  sig=11 code=1 addr=0
+    // (measured on Toutiao, reached from InvokeMethod -> ArtMethod::Invoke, i.e. reflection).
+    //
+    // So on this port a method can be invokable AND non-native AND have no code item — upstream's
+    // invariant does not hold here. Rather than dereference null, name it and throw the exception
+    // Java already has for "declared but not implemented". The fprintf is the point: it is the
+    // only thing that identifies WHICH method, and there is no other cheap way to get it.
+    self->EndAssertNoThreadSuspension(old_cause);
+    fprintf(stderr,
+            "[WESTLAKE-637] no code item and not native: %s access_flags=0x%x "
+            "abstract=%d default=%d copied=%d proxy=%d obsolete=%d\n",
+            method->PrettyMethod().c_str(),
+            method->GetAccessFlags(),
+            method->IsAbstract() ? 1 : 0,
+            method->IsDefault() ? 1 : 0,
+            method->IsCopied() ? 1 : 0,
+            method->IsProxyMethod() ? 1 : 0,
+            method->IsObsolete() ? 1 : 0);
+    fflush(stderr);
+    ThrowAbstractMethodError(method);
+    return;
   } else {
     DCHECK(method->IsNative()) << method->PrettyMethod();
     num_regs = num_ins = ArtMethod::NumArgRegisters(method->GetShortyView());
@@ -1828,8 +2243,9 @@ void EnterInterpreterFromInvoke(Thread* self,
   }
   uint32_t shorty_len = 0;
   const char* shorty = method->GetShorty(&shorty_len);
-  // DEBUG: trace shorty for non-boot-image methods
-  if (method->IsNative()) {
+  // Optional native-call tracing. Keep this off by default: hot Unsafe/NIO
+  // paths can otherwise flood phone logcat and make proof capture unreliable.
+  if (method->IsNative() && getenv("WESTLAKE_TRACE_INTERP_JNI") != nullptr) {
     std::string class_desc_storage;
     const char* class_desc = method->GetDeclaringClass()->GetDescriptor(&class_desc_storage);
     const char* method_name = method->GetName();

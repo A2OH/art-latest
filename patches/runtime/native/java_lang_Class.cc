@@ -16,6 +16,8 @@
 
 #include "java_lang_Class.h"
 
+#include <cstdio>
+#include <cstring>
 #include <iostream>
 
 #include "art_field-inl.h"
@@ -76,6 +78,35 @@ ALWAYS_INLINE static bool ShouldDenyAccessToMember(T* member, [[maybe_unused]] T
   return false;
 }
 
+static bool PFCutClassForNameFromMcdAnalytics(Thread* self, std::string* caller_summary)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  bool from_mcd_analytics = false;
+  if (caller_summary != nullptr) {
+    caller_summary->clear();
+  }
+  for (uint32_t depth = 0; depth < 10; ++depth) {
+    NthCallerVisitor visitor(self, depth);
+    visitor.WalkStack();
+    ArtMethod* caller = visitor.caller;
+    if (caller == nullptr) {
+      continue;
+    }
+    std::string pretty = caller->PrettyMethod();
+    if (caller_summary != nullptr && caller_summary->size() < 900u) {
+      if (!caller_summary->empty()) {
+        caller_summary->append(" | ");
+      }
+      caller_summary->append(pretty);
+    }
+    if (pretty.find("com.mcdonalds.mcdcoreapp.common.util.AppCoreUtils.getClassInstance") !=
+            std::string::npos ||
+        pretty.find("com.mcdonalds.mcdcoreapp.analytics.") != std::string::npos) {
+      from_mcd_analytics = true;
+    }
+  }
+  return from_mcd_analytics;
+}
+
 ALWAYS_INLINE static inline ObjPtr<mirror::Class> DecodeClass(
     const ScopedFastNativeObjectAccess& soa, jobject java_class)
     REQUIRES_SHARED(Locks::mutator_lock_) {
@@ -103,6 +134,51 @@ static jclass Class_classForName(JNIEnv* env, jclass, jstring javaName, jboolean
   // is especially handy for array types, since we want to avoid
   // auto-generating bogus array classes.
   std::string name = mirror_name->ToModifiedUtf8();
+  std::string pfc_caller_summary;
+  const bool pfc_from_mcd_analytics =
+      PFCutClassForNameFromMcdAnalytics(soa.Self(), &pfc_caller_summary);
+  const bool lifecycle_adapter_probe =
+      name.size() >= strlen("_LifecycleAdapter") &&
+      name.compare(name.size() - strlen("_LifecycleAdapter"),
+                   strlen("_LifecycleAdapter"),
+                   "_LifecycleAdapter") == 0;
+  const bool pfc_trace_class_for_name =
+      lifecycle_adapter_probe ||
+      pfc_from_mcd_analytics ||
+      name.find("androidx.lifecycle") != std::string::npos ||
+      name.find("mcdonalds") != std::string::npos ||
+      name.find("McDonald") != std::string::npos ||
+      name.find("analytics") != std::string::npos ||
+      name.find("Analytics") != std::string::npos ||
+      name.find("newrelic") != std::string::npos ||
+      name.find("NewRelic") != std::string::npos ||
+      name.find("firebase") != std::string::npos ||
+      name.find("Firebase") != std::string::npos;
+  if (pfc_trace_class_for_name) {
+    static thread_local int class_for_name_trace_count = 0;
+    if (class_for_name_trace_count < 240) {
+      class_for_name_trace_count++;
+      fprintf(stderr,
+              "[PFCUT] Class.classForName name=%s initialize=%d loader=%p "
+              "lifecycle_adapter=%d mcd_analytics=%d callers=%s\n",
+              name.c_str(),
+              initialize ? 1 : 0,
+              javaLoader,
+              lifecycle_adapter_probe ? 1 : 0,
+              pfc_from_mcd_analytics ? 1 : 0,
+              pfc_caller_summary.c_str());
+      fflush(stderr);
+    }
+  }
+  if (lifecycle_adapter_probe) {
+    // AndroidX Lifecycling probes for generated adapter classes and falls
+    // back to reflective observers when the class is absent.  In portable
+    // standalone mode, forcing the normal absent-class path avoids touching
+    // stale image/native state while preserving the library's contract.
+    soa.Self()->ThrowNewExceptionF("Ljava/lang/ClassNotFoundException;",
+                                   "Westlake portable fallback: %s", name.c_str());
+    return nullptr;
+  }
   if (!IsValidBinaryClassName(name.c_str())) {
     soa.Self()->ThrowNewExceptionF("Ljava/lang/ClassNotFoundException;",
                                    "Invalid name: %s", name.c_str());
@@ -115,6 +191,14 @@ static jclass Class_classForName(JNIEnv* env, jclass, jstring javaName, jboolean
   ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
   Handle<mirror::Class> c(
       hs.NewHandle(class_linker->FindClass(soa.Self(), descriptor.c_str(), class_loader)));
+  if (lifecycle_adapter_probe || name.find("androidx.lifecycle") != std::string::npos) {
+    fprintf(stderr,
+            "[PFCUT] Class.classForName after FindClass name=%s result=%p pending=%d\n",
+            name.c_str(),
+            c.Get(),
+            soa.Self()->IsExceptionPending() ? 1 : 0);
+    fflush(stderr);
+  }
   if (UNLIKELY(c == nullptr)) {
     StackHandleScope<2> hs2(soa.Self());
     Handle<mirror::Object> cause = hs2.NewHandle(soa.Self()->GetException());
@@ -159,6 +243,34 @@ static jstring Class_getNameNative(JNIEnv* env, jobject javaThis) {
   StackHandleScope<1> hs(soa.Self());
   ObjPtr<mirror::Class> c = DecodeClass(soa, javaThis);
   return soa.AddLocalReference<jstring>(mirror::Class::ComputeName(hs.NewHandle(c)));
+}
+
+static jstring Class_getInnerClassName(JNIEnv* env, jobject javaThis) {
+  ScopedFastNativeObjectAccess soa(env);
+  StackHandleScope<1> hs(soa.Self());
+  ObjPtr<mirror::Class> c = DecodeClass(soa, javaThis);
+  ObjPtr<mirror::String> name = mirror::Class::ComputeName(hs.NewHandle(c));
+  if (name == nullptr) {
+    return nullptr;
+  }
+  std::string binary_name = name->ToModifiedUtf8();
+  size_t dollar = binary_name.rfind('$');
+  if (dollar == std::string::npos || dollar + 1 >= binary_name.size()) {
+    return nullptr;
+  }
+  std::string inner = binary_name.substr(dollar + 1);
+  bool all_digits = true;
+  for (char ch : inner) {
+    if (ch < '0' || ch > '9') {
+      all_digits = false;
+      break;
+    }
+  }
+  if (all_digits) {
+    return nullptr;
+  }
+  return soa.AddLocalReference<jstring>(
+      mirror::String::AllocFromModifiedUtf8(soa.Self(), inner.c_str()));
 }
 
 static jobjectArray Class_getInterfacesInternal(JNIEnv* env, jobject javaThis) {
@@ -594,6 +706,16 @@ static jobject Class_getDeclaredAnnotation(JNIEnv* env, jobject javaThis, jclass
     return nullptr;
   }
   Handle<mirror::Class> annotation_class(hs.NewHandle(soa.Decode<mirror::Class>(annotationClass)));
+  if (annotation_class->DescriptorEquals("Lkotlin/coroutines/jvm/internal/DebugMetadata;")) {
+    static uint32_t log_count = 0;
+    if (log_count < 32) {
+      fprintf(stderr,
+              "[PFCUT-KOTLIN] suppress DebugMetadata annotation for class=%s\n",
+              klass->PrettyClass().c_str());
+      ++log_count;
+    }
+    return nullptr;
+  }
   return soa.AddLocalReference<jobject>(
       annotations::GetAnnotationForClass(klass, annotation_class));
 }
@@ -806,6 +928,14 @@ static jboolean Class_isDeclaredAnnotationPresent(JNIEnv* env, jobject javaThis,
     return false;
   }
   Handle<mirror::Class> annotation_class(hs.NewHandle(soa.Decode<mirror::Class>(annotationType)));
+  if (annotation_class->DescriptorEquals("Lkotlin/coroutines/jvm/internal/DebugMetadata;")) {
+    static uint32_t log_count = 0;
+    if (log_count < 16) {
+      fprintf(stderr, "[PFCUT-KOTLIN] suppress DebugMetadata annotation present\n");
+      ++log_count;
+    }
+    return false;
+  }
   return annotations::IsClassAnnotationPresent(klass, annotation_class);
 }
 
@@ -1025,6 +1155,7 @@ static JNINativeMethod gMethods[] = {
   FAST_NATIVE_METHOD(Class, getEnclosingConstructorNative, "()Ljava/lang/reflect/Constructor;"),
   FAST_NATIVE_METHOD(Class, getEnclosingMethodNative, "()Ljava/lang/reflect/Method;"),
   FAST_NATIVE_METHOD(Class, getInnerClassFlags, "(I)I"),
+  FAST_NATIVE_METHOD(Class, getInnerClassName, "()Ljava/lang/String;"),
   FAST_NATIVE_METHOD(Class, getInterfacesInternal, "()[Ljava/lang/Class;"),
   FAST_NATIVE_METHOD(Class, getPrimitiveClass, "(Ljava/lang/String;)Ljava/lang/Class;"),
   FAST_NATIVE_METHOD(Class, getNameNative, "()Ljava/lang/String;"),

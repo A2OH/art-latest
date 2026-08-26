@@ -257,6 +257,16 @@ jint JNI_OnLoad_framework(void* vm, void* reserved) {
         fprintf(stderr, "[fw_stubs] android.sysprop.TelephonyProperties: %d/1\n", ok);
     }
 
+    /* The eager Locale/CaseMapper bootstrap below is too heavy for the current
+     * standalone imageless Westlake guest path. It re-enters core class/string
+     * init via AllocObject/NewStringUTF/FindClass and currently trips a SIGBUS
+     * before app startup. Keep only the minimal native registrations here; the
+     * runtime and dalvikvm patches handle later Locale stabilization separately.
+     */
+    fprintf(stderr, "[fw_stubs] Skipping eager Locale/CaseMapper bootstrap on standalone guest path\n");
+    fprintf(stderr, "[fw_stubs] Framework native stubs registered\n");
+    return JNI_VERSION_1_6;
+
     /* Pre-set Locale.ROOT/ENGLISH/US using AllocObject (no constructor call) */
     {
         jclass locCls = (*env)->FindClass(env, "java/util/Locale");

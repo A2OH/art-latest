@@ -16,6 +16,8 @@
 
 #include "java_lang_VMClassLoader.h"
 
+#include <cstdlib>
+
 #include "base/zip_archive.h"
 #include "class_linker.h"
 #include "base/transform_iterator.h"
@@ -131,6 +133,38 @@ static jclass VMClassLoader_findLoadedClass(JNIEnv* env, jclass, jobject javaLoa
  * Returns an array of entries from the boot classpath that could contain resources.
  */
 static jobjectArray VMClassLoader_getBootClassPathEntries(JNIEnv* env, jclass) {
+  std::vector<std::string> env_entries;
+  const char* env_bcp = getenv("BOOTCLASSPATH");
+  if (env_bcp != nullptr && env_bcp[0] != '\0') {
+    const char* start = env_bcp;
+    for (const char* p = env_bcp; ; ++p) {
+      if (*p == ':' || *p == '\0') {
+        if (p > start) {
+          env_entries.emplace_back(start, p - start);
+        }
+        if (*p == '\0') {
+          break;
+        }
+        start = p + 1;
+      }
+    }
+  }
+
+  if (!env_entries.empty()) {
+    ScopedObjectAccess soa(Thread::ForEnv(env));
+    static thread_local int bcp_env_count = 0;
+    if (bcp_env_count < 20) {
+      bcp_env_count++;
+      fprintf(stderr,
+              "[PFCUT] VMClassLoader.getBootClassPathEntries env count=%zu first=%s\n",
+              env_entries.size(),
+              env_entries.front().c_str());
+      fflush(stderr);
+    }
+    return soa.AddLocalReference<jobjectArray>(
+        CreateStringArray(soa.Self(), env_entries));
+  }
+
   ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
   const std::vector<const DexFile*>& path = class_linker->GetBootClassPath();
   auto is_base_dex = [](const DexFile* dex_file) {

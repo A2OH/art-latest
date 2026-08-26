@@ -35,6 +35,14 @@ using art::arm64::kNumberOfDRegisters;
 // art_quick_do_long_jump(gprs, fprs) - A11 assembly function
 extern "C" void art_quick_do_long_jump(uintptr_t* gprs, uint64_t* fprs) __attribute__((noreturn));
 
+/* PF-arch-022: A15 asm signature is `art_quick_do_long_jump(Context*)` — it
+ * allocates buffers locally and calls artContextCopyForLongJump to fill them.
+ * The A11-style call site below was passing flat arrays as Context*, which
+ * makes the vtable read at offset 0 return saved register values → NULL vtable
+ * → PF-arch-016 abort. The fix: pass the Context* directly. */
+extern "C" void art_quick_do_long_jump_ctx(art::Context* context) __attribute__((noreturn))
+    __asm__("art_quick_do_long_jump");
+
 namespace art HIDDEN {
 
 // Replicate A11's Context::DoLongJump() logic for A15 Context objects.
@@ -82,6 +90,11 @@ static void DoContextLongJump(Context* context) {
   __builtin_unreachable();
 
 #elif defined(__aarch64__)
+  /* PF-arch-022: A15 art_quick_do_long_jump takes Context* and copies
+   * internally via artContextCopyForLongJump. Pass directly. */
+  art_quick_do_long_jump_ctx(context);
+  __builtin_unreachable();
+#elif defined(__aarch64_disabled__)
   // ARM64: Arm64Context uses pointer-based gprs_/fprs_ arrays.
   // gprs_[kNumberOfXRegisters + 1] = 34 pointers (33 X-regs + 1 for PC)
   // fprs_[kNumberOfDRegisters] = 32 pointers (32 D-regs)

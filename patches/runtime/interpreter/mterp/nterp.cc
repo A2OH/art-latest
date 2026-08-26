@@ -1,3 +1,5 @@
+#include "imtable-inl.h"
+#include <cstdio>
 /*
  * Copyright (C) 2019 The Android Open Source Project
  *
@@ -19,15 +21,19 @@
  */
 #include "nterp.h"
 
+#include <cstring>
+
 #include "arch/instruction_set.h"
 #include "base/quasi_atomic.h"
 #include "class_linker-inl.h"
 #include "dex/dex_instruction_utils.h"
 #include "debugger.h"
+#include "entrypoints/runtime_asm_entrypoints.h"
 #include "entrypoints/entrypoint_utils-inl.h"
 #include "interpreter/interpreter_cache-inl.h"
 #include "interpreter/interpreter_common.h"
 #include "interpreter/shadow_frame-inl.h"
+#include "mirror/array-inl.h"
 #include "mirror/string-alloc-inl.h"
 #include "nterp_helpers.h"
 
@@ -39,6 +45,14 @@ bool IsNterpSupported() {
 }
 
 bool CanRuntimeUseNterp() REQUIRES_SHARED(Locks::mutator_lock_) {
+  // nterp dispatches invoke-interface inline in aarch64 assembly using the IMT, and on this
+  // build that path silently calls the wrong target: XmlPullParser.next() never reaches
+  // XmlBlock$Parser.next() (proved — a marker at the top of the SWITCH interpreter's
+  // INVOKE_INTERFACE handler logs 0 hits while DoInvoke<kInterface> logs ~950, i.e. every
+  // C++-visible interface call arrives via nterp's MterpInvokeInterface fallback).  The
+  // consequence is that no compiled XML ever parses, so no drawable inflates and no frame is
+  // ever drawn.  Forcing everything through the C++ switch interpreter is slower but it is
+  // the only engine whose interface dispatch is correct/instrumentable here.
   Runtime* runtime = Runtime::Current();
   instrumentation::Instrumentation* instr = runtime->GetInstrumentation();
   // If the runtime is interpreter only, we currently don't use nterp as some
@@ -310,6 +324,24 @@ extern "C" size_t NterpGetMethod(Thread* self, ArtMethod* caller, const uint16_t
   uint16_t method_index =
       (opcode >= Instruction::INVOKE_VIRTUAL_RANGE) ? inst->VRegB_3rc() : inst->VRegB_35c();
 
+  // WESTLAKE (2026-07-22) ENTRY DIAG: unconditional -- logs BEFORE any early return, so it
+  // cannot be skipped by a resolution failure or a repair bail-out (that flaw made the earlier
+  // kInterface-branch probe report 0 hits and sent me down the wrong path).
+  {
+    static int wl_en = 0;
+    const DexFile* wl_df0 = caller->GetDexFile();
+    const dex::MethodId& wl_mid0 = wl_df0->GetMethodId(method_index);
+    const char* wl_nm0 = wl_df0->GetStringData(wl_mid0.name_idx_);
+    if (wl_nm0 != nullptr && strcmp(wl_nm0, "next") == 0 && wl_en < 25) {
+      wl_en++;
+      fprintf(stderr, "[WESTLAKE-NTERPENTRY] type=%d %s->next caller=%s\n",
+              static_cast<int>(invoke_type),
+              wl_df0->GetTypeDescriptor(wl_df0->GetTypeId(wl_mid0.class_idx_)),
+              caller->PrettyMethod().c_str());
+      fflush(stderr);
+    }
+  }
+
   ClassLinker* const class_linker = Runtime::Current()->GetClassLinker();
   ArtMethod* resolved_method = caller->SkipAccessChecks()
       ? class_linker->ResolveMethod<ClassLinker::ResolveMode::kNoChecks>(
@@ -318,7 +350,52 @@ extern "C" size_t NterpGetMethod(Thread* self, ArtMethod* caller, const uint16_t
             self, method_index, caller, invoke_type);
   if (resolved_method == nullptr) {
     DCHECK(self->IsExceptionPending());
-    return 0;
+    if (invoke_type == kInterface) {
+      self->ClearException();
+      const DexFile* dex_file = caller->GetDexFile();
+      const dex::MethodId& method_id = dex_file->GetMethodId(method_index);
+      ObjPtr<mirror::Class> expected_class =
+          class_linker->ResolveType(method_id.class_idx_, caller);
+      if (expected_class == nullptr) {
+        DCHECK(self->IsExceptionPending());
+        return 0;
+      }
+      const std::string_view expected_name = dex_file->GetMethodNameView(method_id);
+      const Signature expected_signature = dex_file->GetMethodSignature(method_id);
+      resolved_method = expected_class->FindInterfaceMethod(expected_name,
+                                                            expected_signature,
+                                                            kRuntimePointerSize);
+      if (resolved_method == nullptr) {
+        resolved_method = expected_class->FindClassMethod(expected_name,
+                                                          expected_signature,
+                                                          kRuntimePointerSize);
+      }
+      static thread_local int interface_repair_count = 0;
+      if (interface_repair_count < 80) {
+        interface_repair_count++;
+        fprintf(stderr,
+                "[PFCUT-IFACE] repaired failed interface resolve %s.%.*s%s -> %s\n",
+                expected_class->PrettyDescriptor().c_str(),
+                static_cast<int>(expected_name.size()),
+                expected_name.data(),
+                expected_signature.ToString().c_str(),
+                resolved_method != nullptr ? resolved_method->PrettyMethod().c_str() : "<null>");
+        fflush(stderr);
+      }
+      if (resolved_method != nullptr &&
+          resolved_method->GetNameView() == expected_name &&
+          resolved_method->GetSignature() == expected_signature) {
+        caller->GetDexCache()->SetResolvedMethod(method_index, resolved_method);
+      } else {
+        ThrowNoSuchMethodError(invoke_type,
+                               expected_class,
+                               dex_file->GetStringData(method_id.name_idx_),
+                               expected_signature);
+        return 0;
+      }
+    } else {
+      return 0;
+    }
   }
 
   if (invoke_type == kSuper) {
@@ -331,7 +408,75 @@ extern "C" size_t NterpGetMethod(Thread* self, ArtMethod* caller, const uint16_t
     }
   }
 
+  {
+    const DexFile* dex_file = caller->GetDexFile();
+    const dex::MethodId& method_id = dex_file->GetMethodId(method_index);
+    const std::string_view expected_name = dex_file->GetMethodNameView(method_id);
+    const Signature expected_signature = dex_file->GetMethodSignature(method_id);
+    const bool method_matches =
+        resolved_method->GetNameView() == expected_name &&
+        resolved_method->GetSignature() == expected_signature;
+    if (UNLIKELY(!method_matches)) {
+      caller->GetDexCache()->SetResolvedMethod(method_index, nullptr);
+      ObjPtr<mirror::Class> expected_class =
+          class_linker->ResolveType(method_id.class_idx_, caller);
+      if (UNLIKELY(expected_class == nullptr)) {
+        DCHECK(self->IsExceptionPending());
+        return 0;
+      }
+      ArtMethod* replacement = expected_class->IsInterface()
+          ? expected_class->FindInterfaceMethod(caller->GetDexCache(),
+                                                method_index,
+                                                kRuntimePointerSize)
+          : expected_class->FindClassMethod(expected_name,
+                                            expected_signature,
+                                            kRuntimePointerSize);
+      if (replacement != nullptr &&
+          replacement->GetNameView() == expected_name &&
+          replacement->GetSignature() == expected_signature) {
+        resolved_method = replacement;
+        caller->GetDexCache()->SetResolvedMethod(method_index, resolved_method);
+      } else {
+        self->ThrowNewExceptionF("Ljava/lang/NoSuchMethodError;",
+                                 "Could not repair resolved method %.*s%s on %s",
+                                 static_cast<int>(expected_name.size()),
+                                 expected_name.data(),
+                                 expected_signature.ToString().c_str(),
+                                 expected_class->PrettyDescriptor().c_str());
+        fprintf(stderr, "[WESTLAKE-REPAIRFAIL] %.*s%s on %s (caller=%s)\n",
+                static_cast<int>(expected_name.size()), expected_name.data(),
+                expected_signature.ToString().c_str(),
+                expected_class->PrettyDescriptor().c_str(), caller->PrettyMethod().c_str());
+        fflush(stderr);
+        return 0;
+      }
+    }
+  }
+
   if (invoke_type == kInterface) {
+    // WESTLAKE (2026-07-22) IMT DIAG: the arm64 nterp stub indexes the receiver's IMT with the
+    // interface method's STORED `imt_index_` (unioned with hotness_count_).  If that stored value
+    // disagrees with the freshly computed ImTable::GetImtIndex(), the asm calls the wrong target
+    // and interface dispatch silently no-ops -- which is exactly what XmlPullParser.next() does.
+    {
+      static int wl_imt = 0;
+      if (wl_imt < 60) {
+        const char* wl_nm = resolved_method->GetName();
+        if (wl_nm != nullptr && (strcmp(wl_nm, "next") == 0 || strcmp(wl_nm, "close") == 0 ||
+                                 strcmp(wl_nm, "getEventType") == 0)) {
+          wl_imt++;
+          uint32_t wl_stored = resolved_method->GetImtIndex();
+          uint32_t wl_calc = ImTable::GetImtIndex(resolved_method);
+          fprintf(stderr,
+                  "[WESTLAKE-IMT] %s.%s abstract=%d iface=%d stored_imt=%u computed_imt=%u %s\n",
+                  resolved_method->GetDeclaringClass()->PrettyDescriptor().c_str(), wl_nm,
+                  resolved_method->IsAbstract() ? 1 : 0,
+                  resolved_method->GetDeclaringClass()->IsInterface() ? 1 : 0,
+                  wl_stored, wl_calc, (wl_stored == wl_calc) ? "OK" : "*** MISMATCH ***");
+          fflush(stderr);
+        }
+      }
+    }
     size_t result = 0u;
     if (resolved_method->GetDeclaringClass()->IsObjectClass()) {
       // Set the low bit to notify the interpreter it should do a vtable call.
@@ -359,8 +504,61 @@ extern "C" size_t NterpGetMethod(Thread* self, ArtMethod* caller, const uint16_t
     // calls.
     return reinterpret_cast<size_t>(resolved_method) | 1;
   } else if (invoke_type == kVirtual) {
-    UpdateCache(self, dex_pc_ptr, resolved_method->GetMethodIndex());
-    return resolved_method->GetMethodIndex();
+    uint32_t vtable_index = resolved_method->GetMethodIndex();
+    ObjPtr<mirror::Class> declaring_class = resolved_method->GetDeclaringClass();
+    bool vtable_index_matches = false;
+    if (declaring_class != nullptr && declaring_class->HasVTable()) {
+      const uint32_t vtable_length = declaring_class->GetVTableLength();
+      if (vtable_index < vtable_length) {
+        ArtMethod* slot_method = declaring_class->GetVTableEntry(vtable_index, kRuntimePointerSize);
+        vtable_index_matches =
+            slot_method != nullptr &&
+            slot_method->GetNameView() == resolved_method->GetNameView() &&
+            slot_method->GetSignature() == resolved_method->GetSignature();
+      }
+      if (UNLIKELY(!vtable_index_matches)) {
+        for (uint32_t i = 0; i < vtable_length; ++i) {
+          ArtMethod* slot_method = declaring_class->GetVTableEntry(i, kRuntimePointerSize);
+          if (slot_method != nullptr &&
+              slot_method->GetNameView() == resolved_method->GetNameView() &&
+              slot_method->GetSignature() == resolved_method->GetSignature()) {
+            vtable_index = i;
+            vtable_index_matches = true;
+            break;
+          }
+        }
+      }
+    }
+    const char* caller_name = caller != nullptr ? caller->GetName() : nullptr;
+    const bool repair_lookup_call =
+        caller_name != nullptr &&
+        (strcmp(caller_name, "runLookupProbe") == 0 ||
+         strcmp(caller_name, "findFragmentById") == 0 ||
+         strcmp(caller_name, "findFragmentByTag") == 0 ||
+         strcmp(caller_name, "getFragments") == 0 ||
+         strcmp(caller_name, "sameTag") == 0);
+    if (UNLIKELY(!vtable_index_matches && repair_lookup_call)) {
+      const void* old_quick = resolved_method->GetEntryPointFromQuickCompiledCode();
+      if (!resolved_method->IsNative() && old_quick != GetQuickToInterpreterBridge()) {
+        resolved_method->SetEntryPointFromQuickCompiledCode(GetQuickToInterpreterBridge());
+      }
+      if (declaring_class != nullptr && vtable_index < static_cast<uint32_t>(declaring_class->GetVTableLength())) {
+        if (declaring_class->ShouldHaveEmbeddedVTable()) {
+          declaring_class->SetEmbeddedVTableEntryUnchecked(vtable_index,
+                                                           resolved_method,
+                                                           kRuntimePointerSize);
+        } else {
+          ObjPtr<mirror::PointerArray> vtable = declaring_class->GetVTable();
+          if (vtable != nullptr) {
+            vtable->SetElementPtrSize(vtable_index, resolved_method, kRuntimePointerSize);
+          }
+        }
+      }
+      UpdateCache(self, dex_pc_ptr, vtable_index);
+      return vtable_index;
+    }
+    UpdateCache(self, dex_pc_ptr, vtable_index);
+    return vtable_index;
   } else {
     UpdateCache(self, dex_pc_ptr, resolved_method);
     return reinterpret_cast<size_t>(resolved_method);

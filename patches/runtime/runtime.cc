@@ -126,6 +126,7 @@
 #include "mirror/method_handles_lookup.h"
 #include "mirror/method_type.h"
 #include "mirror/stack_trace_element.h"
+#include "mirror/string.h"
 #include "mirror/throwable.h"
 #include "mirror/var_handle.h"
 #include "monitor.h"
@@ -222,7 +223,6 @@ extern "C" jboolean Westlake_UnixFileSystem_checkAccess(JNIEnv*, jobject, jobjec
 extern "C" jlong Westlake_UnixFileSystem_getLastModifiedTime(JNIEnv*, jobject, jobject);
 extern "C" jlong Westlake_UnixFileSystem_getLength(JNIEnv*, jobject, jobject);
 extern "C" jobjectArray Westlake_UnixFileSystem_list(JNIEnv*, jobject, jobject);
-
 static std::atomic<jint> g_westlake_threadlocal_hash_counter{0};
 
 extern "C" jint Westlake_ThreadLocal_nextHashCode(JNIEnv*, jclass) {
@@ -1961,7 +1961,16 @@ static void WaitUntilSingleThreaded() {
 #endif
 }
 
+// WESTLAKE 2026-07-11: the musl sigchain (stubs/sigchain_musl.cc) runs a raw pthread
+// that re-asserts ART's fault handlers on top of libdfx's. It keeps num_threads == 2,
+// which makes WaitUntilSingleThreaded() below LOG(FATAL). Stop it before the check;
+// atfork_parent restarts it in the surviving zygote.
+extern "C" void SigchainStopReassert() __attribute__((weak));
+
 void Runtime::PreZygoteFork() {
+  if (SigchainStopReassert != nullptr) {
+    SigchainStopReassert();
+  }
   if (GetJit() != nullptr) {
     GetJit()->PreZygoteFork();
   }
@@ -2024,7 +2033,36 @@ void Runtime::PostZygoteFork() {
   ResetStats(0xFFFFFFFF);
 }
 
+// WESTLAKE (2026-07-11): expose "is <needle> on the current thread's Java stack?"
+// to the C openjdk_stub Runtime_nativeExit, so it can swallow the spurious
+// System.exit(1) that sun.misc.Cleaner.clean() fires when a restarted
+// ReferenceQueueDaemon Cleaner thunk throws on this adapter (a native-buffer
+// cleanup failure must not kill the whole app). Uses the same DumpJavaStack that
+// the printStackTrace diag already exercises safely in this daemon state.
+extern "C" int westlake_java_stack_contains(const char* needle) {
+  if (needle == nullptr) return 0;
+  Thread* self = Thread::Current();
+  if (self == nullptr) return 0;
+  std::ostringstream oss;
+  self->DumpJavaStack(oss);
+  return oss.str().find(needle) != std::string::npos ? 1 : 0;
+}
+
 void Runtime::CallExitHook(jint status) {
+  // 2026-07-09 DIAG: the arm64 appspawn-x parent exits(1) ~3s after Ready via a Java
+  // System.exit(1) whose caller is unknown. Dump the calling thread's Java stack here
+  // (thread is kRunnable at entry, before the kNative transition below) to name it.
+  {
+    Thread* self = Thread::Current();
+    fprintf(stderr, "[EXIT-DIAG] Runtime::CallExitHook(status=%d) tid=%d — Java stack:\n",
+            status, self != nullptr ? self->GetTid() : -1);
+    if (self != nullptr) {
+      std::ostringstream oss;
+      self->DumpJavaStack(oss);
+      fprintf(stderr, "%s\n", oss.str().c_str());
+    }
+    fflush(stderr);
+  }
   if (exit_ != nullptr) {
     ScopedThreadStateChange tsc(Thread::Current(), ThreadState::kNative);
     exit_(status);
@@ -2330,16 +2368,29 @@ bool Runtime::Start() {
         if (method == nullptr) {
           return;
         }
+        // WESTLAKE §640 (2026-08-15) REVERTED: I briefly cleared inherited
+        // kAccFastNative/kAccCriticalNative here, on the theory that a critical-native flag
+        // inherited from the BCP jar would make art_quick_generic_jni_trampoline call our shims
+        // with NO JNIEnv*. ⛔The added logging DISPROVED it — every UnixFileSystem method
+        // registers with `fast=0 critical=0` — and the clearing correlated with a regression
+        // (Toutiao 2.86 MB -> 342 KB, wedged in XML parsing). Keep the logging, drop the change.
         method->SetAccessFlags(method->GetAccessFlags() | kAccNative | extra_flags);
         method->SetCodeItem(nullptr, false);
         Runtime::Current()->GetInstrumentation()->InitializeMethodsCode(
             method, /*aot_code=*/nullptr);
         method->SetEntryPointFromJni(fn);
+        // WESTLAKE §645 REVERTED: clearing kAccCriticalNative here (before OR after
+        // InitializeMethodsCode) regressed 3/3 runs to ~360 KB. That bit is ALSO
+        // kAccNterpEntryPointFastPathFlag, and early startup needs it. Fix at the consumption
+        // point instead — see §646 in quick_trampoline_entrypoints.cc.
         if (label != nullptr) {
-          fprintf(stderr, "[RT] %s -> native quick=%p jni=%p\n",
+          fprintf(stderr, "[RT] %s -> native quick=%p jni=%p flags=0x%x fast=%d critical=%d\n",
                   label,
                   method->GetEntryPointFromQuickCompiledCode(),
-                  method->GetEntryPointFromJni());
+                  method->GetEntryPointFromJni(),
+                  method->GetAccessFlags(),
+                  (method->GetAccessFlags() & kAccFastNative) != 0 ? 1 : 0,
+                  (method->GetAccessFlags() & kAccCriticalNative) != 0 ? 1 : 0);
           fflush(stderr);
         }
       };
@@ -2379,6 +2430,47 @@ bool Runtime::Start() {
                                     reinterpret_cast<const void*>(&Unsafe_objectFieldOffsetClassString),
                                     kAccFastNative,
                                     "Unsafe.objectFieldOffset(Class,String)");
+      }
+    }
+    if (self->IsExceptionPending()) self->ClearException();
+  }
+
+  // WESTLAKE §670 (2026-08-16): repair java.lang.invoke.VarHandle.UNSAFE.
+  // Measured: VarHandle reaches status=15 (kVisiblyInitialized) with `UNSAFE == null`, and its
+  // `<clinit>` NEVER runs — it appears on neither the success nor the tolerate path of
+  // InitializeClass, in the zygote or the child (§668). `sun.misc.Unsafe.<clinit>` DOES run and
+  // sets THE_ONE, so the value that VarHandle needed was available the whole time.
+  // Consequence: `VarHandle.acquireFence()` -> `UNSAFE.loadFence()` NPEs, which takes out
+  // ConcurrentSkipListMap (baseHead/findFirst/isEmpty) and hence any java.util.concurrent user —
+  // it blocked Toutiao's MainActivity via HomepageCategoryManager.
+  // Root cause of the missing <clinit> is still open; this sets the ONE field it would have set,
+  // from the same source it would have used (sun.misc.Unsafe.THE_ONE). Idempotent: only writes
+  // when the field is actually null.
+  {
+    ScopedObjectAccess soa(self);
+    ObjPtr<mirror::Class> vh_class =
+        class_linker_->FindSystemClass(self, "Ljava/lang/invoke/VarHandle;");
+    if (vh_class != nullptr) {
+      ArtField* unsafe_field = vh_class->FindDeclaredStaticField("UNSAFE", "Lsun/misc/Unsafe;");
+      if (unsafe_field != nullptr && unsafe_field->GetObject(vh_class) == nullptr) {
+        ObjPtr<mirror::Class> su_class =
+            class_linker_->FindSystemClass(self, "Lsun/misc/Unsafe;");
+        if (su_class != nullptr) {
+          StackHandleScope<1> hs_su(self);
+          Handle<mirror::Class> h_su(hs_su.NewHandle(su_class));
+          class_linker_->EnsureInitialized(self, h_su, true, true);
+          if (self->IsExceptionPending()) self->ClearException();
+          ArtField* the_one = h_su->FindDeclaredStaticField("THE_ONE", "Lsun/misc/Unsafe;");
+          ObjPtr<mirror::Object> inst =
+              (the_one != nullptr) ? the_one->GetObject(h_su.Get()) : nullptr;
+          if (inst != nullptr) {
+            unsafe_field->SetObject</*kTransactionActive=*/false>(vh_class, inst);
+            fprintf(stderr, "[WESTLAKE-670] VarHandle.UNSAFE repaired -> %p\n", inst.Ptr());
+          } else {
+            fprintf(stderr, "[WESTLAKE-670] sun.misc.Unsafe.THE_ONE is null; cannot repair\n");
+          }
+          fflush(stderr);
+        }
       }
     }
     if (self->IsExceptionPending()) self->ClearException();
@@ -2581,6 +2673,13 @@ bool Runtime::Start() {
   // PATCH: Route java.io.UnixFileSystem wrappers directly to native stubs.
   // In imageless standalone mode these methods can lose their native flags or
   // trip Blocker/ThreadLocal before reaching the private *0 natives.
+  //
+  // WESTLAKE (2026-07-22): DEVICE ONLY. The host dex2oat links this same file but the
+  // Westlake_UnixFileSystem_* providers ship only with the target libart, so on host the
+  // references were undefined and the binary died at startup. Stubbing them out is NOT an option
+  // -- they back java.io.UnixFileSystem, so File.exists()/length()/list() would lie and boot-image
+  // construction fails (dex2oat rc=1). On host we simply keep ART's own built-in natives.
+#if defined(__OHOS__)
   {
     ScopedObjectAccess soa(self);
     ObjPtr<mirror::Class> unixfs_class = class_linker_->FindSystemClass(self, "Ljava/io/UnixFileSystem;");
@@ -2613,6 +2712,7 @@ bool Runtime::Start() {
     }
     if (self->IsExceptionPending()) self->ClearException();
   }
+#endif  // __OHOS__ (UnixFileSystem native routing)
 
   // PATCH: Route HashMap.put directly to JNI.
   // This is now opt-in only. The controlled canary proves the native rewrite
@@ -3069,6 +3169,47 @@ bool Runtime::Start() {
       if (self->IsExceptionPending()) self->ClearException();
     }
 
+    // CodingErrorAction is force-marked initialized with the other charset classes above, so its
+    // <clinit> never creates IGNORE, REPLACE, and REPORT.  The interpreter compatibility path can
+    // synthesize REPORT lazily, but compiled CharsetEncoder/CharsetDecoder calls read the static
+    // fields directly.  A null REPLACE then reaches onMalformedInput()/onUnmappableCharacter() and
+    // throws "Null action" while applications construct late fragments (Toutiao's main tabs are a
+    // measured example).  Recreate the three libcore singleton objects during the same generic
+    // bootstrap repair, before application code or JIT compilation can observe the fields.
+    {
+      ObjPtr<mirror::Class> action_class =
+          class_linker_->FindSystemClass(self, "Ljava/nio/charset/CodingErrorAction;");
+      if (action_class != nullptr) {
+        ArtField* name_field =
+            action_class->FindDeclaredInstanceField("name", "Ljava/lang/String;");
+        const char* action_names[] = { "IGNORE", "REPLACE", "REPORT", nullptr };
+        for (size_t i = 0; action_names[i] != nullptr; ++i) {
+          ArtField* action_field = action_class->FindDeclaredStaticField(
+              action_names[i], "Ljava/nio/charset/CodingErrorAction;");
+          if (action_field == nullptr || action_field->GetObject(action_class) != nullptr) {
+            continue;
+          }
+          StackHandleScope<3> hs(self);
+          Handle<mirror::Class> h_action_class(hs.NewHandle(action_class));
+          Handle<mirror::Object> h_action(hs.NewHandle(h_action_class->AllocObject(self)));
+          Handle<mirror::String> h_name(
+              hs.NewHandle(mirror::String::AllocFromModifiedUtf8(self, action_names[i])));
+          if (h_action != nullptr && h_name != nullptr) {
+            if (name_field != nullptr) {
+              name_field->SetObject<false>(h_action.Get(), h_name.Get());
+            }
+            action_field->SetObject<false>(h_action_class.Get(), h_action.Get());
+            fprintf(stderr, "[RT] Set CodingErrorAction.%s singleton\n", action_names[i]);
+            fflush(stderr);
+          }
+          if (self->IsExceptionPending()) {
+            self->ClearException();
+          }
+        }
+      }
+      if (self->IsExceptionPending()) self->ClearException();
+    }
+
     // Set Charset.defaultCharset to UTF-8 so PrintStream can encode strings
     ObjPtr<mirror::Class> charset_class = class_linker_->FindSystemClass(self, "Ljava/nio/charset/Charset;");
     ObjPtr<mirror::Class> standard_charsets_class =
@@ -3184,9 +3325,31 @@ bool Runtime::Start() {
       ArtMethod* print_method = throwable_class->FindClassMethod(
           "printStackTrace", "()V", class_linker_->GetImagePointerSize());
       if (print_method != nullptr && !print_method->IsNative()) {
+        // The hook is installed in the long-lived appspawn parent. JNI object
+        // decoding is unsafe while that parent is inside ZygoteHooks.preFork,
+        // but is valid in the post-fork child where app diagnostics are needed.
+        static const pid_t throwable_hook_parent_pid = getpid();
         static auto log_throwable = +[](JNIEnv* env, jobject thiz) -> void {
           if (thiz == nullptr) {
             fprintf(stderr, "[RT] Throwable.printStackTrace(null)\n");
+            // WESTLAKE-DIAG (2026-07-11): ALWAYS dump the Java call chain that reached
+            // printStackTrace(null) — names the uncaught-handler / daemon path that
+            // precedes the child's exit_group(1). Env-independent (child resets environ).
+            // Pending-exception class first (cheap tls read), then the stack.
+            {
+              Thread* s0 = Thread::Current();
+              if (s0 != nullptr) {
+                ObjPtr<mirror::Throwable> pend = s0->GetException();
+                fprintf(stderr, "[THROW-DIAG] pending-exception=%s tid=%d\n",
+                        pend != nullptr ? pend->GetClass()->PrettyDescriptor().c_str() : "none",
+                        s0->GetTid());
+                fflush(stderr);
+                std::ostringstream oss;
+                s0->DumpJavaStack(oss);
+                fprintf(stderr, "[THROW-DIAG] Java stack at printStackTrace(null):\n%s\n",
+                        oss.str().c_str());
+              }
+            }
             fflush(stderr);
             return;
           }
@@ -3199,6 +3362,32 @@ bool Runtime::Start() {
           // in the "not runnable" string; Runtime::Start()::$_68+116). printStackTrace
           // is best-effort diagnostics — do NO JNI calls so it is safe on any thread
           // state (this was the whole point of the "early-noop" patch).
+          // WESTLAKE-DIAG (2026-07-11): decoding the already-valid `thiz` jobject via
+          // internal ObjPtr (NOT env->FindClass, which is what crashes on stale envs)
+          // is safe on the executing thread and names the exception killing the child.
+          // Env-gated so it can never affect the normal path.
+          if (getenv("ASX_DIAG_THROWABLE") != nullptr &&
+              getpid() != throwable_hook_parent_pid) {
+            Thread* self2 = Thread::Current();
+            if (self2 != nullptr) {
+              ScopedObjectAccess soa(self2);
+              ObjPtr<mirror::Object> obj = self2->DecodeJObject(thiz);
+              if (obj != nullptr) {
+                ObjPtr<mirror::Throwable> throwable = obj->AsThrowable();
+                std::string cls = throwable->GetClass()->PrettyDescriptor();
+                ObjPtr<mirror::String> detail = throwable->GetDetailMessage();
+                std::string message = detail != nullptr ? detail->ToModifiedUtf8() : "<null>";
+                fprintf(stderr,
+                        "[THROW-DIAG] printStackTrace exception class=%s message=%s tid=%d\n",
+                        cls.c_str(), message.c_str(), self2->GetTid());
+                std::ostringstream oss;
+                self2->DumpJavaStack(oss);
+                fprintf(stderr, "[THROW-DIAG] Java stack at printStackTrace:\n%s\n",
+                        oss.str().c_str());
+                fflush(stderr);
+              }
+            }
+          }
           (void)env; (void)thiz;
           fprintf(stderr, "[RT] Throwable.printStackTrace (fork-safe noop)\n");
           fflush(stderr);
@@ -4102,6 +4291,7 @@ inline static uint64_t GetThreadSuspendTimeout(const RuntimeArgumentMap* runtime
 }
 
 bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
+  fprintf(stderr, "[FH-INIT-TOP] Runtime::Init entered\n"); fflush(stderr);
   // (b/30160149): protect subprocesses from modifications to LD_LIBRARY_PATH, etc.
   // Take a snapshot of the environment at the time the runtime was created, for use by Exec, etc.
   env_snapshot_.TakeSnapshot();
@@ -4174,6 +4364,22 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
                 runtime_options.GetOrDefault(Opt::StackDumpLockProfThreshold));
 
   image_locations_ = runtime_options.ReleaseOrDefault(Opt::Image);
+  // WESTLAKE §602: appspawn-x's child passes no -Ximage, so allow WESTLAKE_BOOT_IMAGE=<path/boot.art>
+  // to supply one. Absent/empty -> unchanged (imageless), so this is inert unless explicitly set.
+  {
+    // §602b: OVERRIDE, do not merely fill in -- Opt::Image has a NON-EMPTY default, so the previous
+    // `if (image_locations_.empty())` guard never fired and the image was never loaded.
+    const char* wl_img = getenv("WESTLAKE_BOOT_IMAGE");
+    // §602d: print UNCONDITIONALLY to prove whether this code path executes at all.
+    fprintf(stderr, "[WESTLAKE-AOT] hook reached: env=%s locations=%zu\n",
+            wl_img ? wl_img : "(null)", image_locations_.size());
+    if (wl_img != nullptr && wl_img[0] != '\0') {
+      image_locations_.clear();
+      image_locations_.push_back(std::string(wl_img));
+      fprintf(stderr, "[WESTLAKE-AOT] using boot image: %s (overriding %zu default(s))\n",
+              wl_img, image_locations_.size());
+    }
+  }
 
   SetInstructionSet(runtime_options.GetOrDefault(Opt::ImageInstructionSet));
   boot_class_path_ = runtime_options.ReleaseOrDefault(Opt::BootClassPath);
@@ -4226,8 +4432,18 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
   dump_native_stack_on_sig_quit_ = runtime_options.GetOrDefault(Opt::DumpNativeStackOnSigQuit);
   allow_in_memory_compilation_ = runtime_options.Exists(Opt::AllowInMemoryCompilation);
 
-  if (is_zygote_ || runtime_options.Exists(Opt::OnlyUseTrustedOatFiles)) {
+  // WESTLAKE §603: appspawn-x MUST pass -Xzygote (otherwise Runtime::PreZygoteFork CHECK-aborts),
+  // which turns on the trusted-oat-files policy: OatFileManager::RegisterOatFile then CHECK-fails on
+  // any oat file outside ANDROID_ROOT ("Registering a non /system oat file"). Every artefact on this
+  // port lives in /data/local/tmp/asx (/system is read-only), so a boot image can never satisfy it
+  // and the runtime aborts the moment the image actually loads. The policy guards a production
+  // zygote against untrusted storage; that invariant does not exist here by construction.
+  if (getenv("WESTLAKE_TRUST_ALL_OAT") == nullptr &&
+      (is_zygote_ || runtime_options.Exists(Opt::OnlyUseTrustedOatFiles))) {
     oat_file_manager_->SetOnlyUseTrustedOatFiles();
+  } else if (getenv("WESTLAKE_TRUST_ALL_OAT") != nullptr) {
+    fprintf(stderr, "[WESTLAKE-AOT] trusted-oat policy DISABLED (WESTLAKE_TRUST_ALL_OAT set)\n");
+    fflush(stderr);
   }
 
   vfprintf_ = runtime_options.GetOrDefault(Opt::HookVfprintf);
@@ -4478,7 +4694,11 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
   // Change the implicit checks flags based on runtime architecture.
   switch (kRuntimeISA) {
     case InstructionSet::kArm64:
-      implicit_suspend_checks_ = true;
+      // WESTLAKE §601: this port never installs the implicit suspend-check page, so the compiler's
+      // implicit suspend check loads through an uninitialised register and faults at address 0 on
+      // EVERY loop back-edge (~7,200 SIGSEGV/s measured, each costing a musl sigchain + DFX handler
+      // round trip that unwinds the stack). Use explicit suspend checks instead.
+      implicit_suspend_checks_ = false;
       FALLTHROUGH_INTENDED;
     case InstructionSet::kArm:
     case InstructionSet::kThumb2:
@@ -4500,6 +4720,10 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
     implicit_so_checks_ = false;
     implicit_null_checks_ = false;
   }
+  fprintf(stderr, "[FH-TRACE] reached fault_manager.Init: no_sig_chain_=%d implicit_null=%d "
+                  "HandlesSignals=%d kRuntimeISA_is_arm64=%d\n",
+          (int)no_sig_chain_, (int)implicit_null_checks_, (int)HandlesSignalsInCompiledCode(),
+          (int)(kRuntimeISA == InstructionSet::kArm64)); fflush(stderr);
   fault_manager.Init(!no_sig_chain_);
   if (!no_sig_chain_) {
     if (HandlesSignalsInCompiledCode()) {
@@ -4518,6 +4742,9 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
 
       if (implicit_null_checks_) {
         new NullPointerHandler(&fault_manager);
+        fprintf(stderr, "[FH-SETUP] NullPointerHandler registered (implicit_null_checks_=1, "
+                        "no_sig_chain_=%d, HandlesSignals=%d)\n",
+                (int)no_sig_chain_, (int)HandlesSignalsInCompiledCode()); fflush(stderr);
       }
 
       if (kEnableJavaStackTraceHandler) {
