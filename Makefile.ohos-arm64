@@ -773,6 +773,18 @@ $(BUILDDIR)/runtime/verifier/%.o: $(ART)/runtime/verifier/%.cc
 	@mkdir -p $(dir $@)
 	@$(CXX) $(CXXFLAGS) -O1 -c $< -o $@ 2>&1 && echo "OK: $(notdir $<)" || { echo "FAIL: $(notdir $<)"; rm -f $@; }
 
+# WESTLAKE §607: the OHOS clang-15 prebuilt MISCOMPILES the ART optimizing compiler at -O1/-O2 —
+# it drops the move that materialises the last reference argument of a JIT-emitted invoke into its
+# ABI register (arm64 x3), so the callee reads stale data (a garbage receiver/arg). Root-caused by a
+# low-opt bisect: -O2 and -O1 both reproduce it (guard fires ~6x/session); -O0 on compiler/optimizing
+# eliminates it (0x). No single TU isolates it (the defect is in a header-inlined helper shared across
+# passes — 17 passes at -O0 already suffice, whole dir is the safe superset), so de-optimise the whole
+# optimizing/ dir. Same class as the verifier -O1 workaround above and the WALL5 OHOS-libc++
+# std::array<0> quirk. This only slows JIT *compilation*; the emitted code quality is unchanged.
+$(BUILDDIR)/compiler/optimizing/%.o: $(ART)/compiler/optimizing/%.cc
+	@mkdir -p $(dir $@)
+	@$(CXX) $(CXXFLAGS) -O0 -c $< -o $@ 2>&1 && echo "OK: $(notdir $<) (-O0 §607)" || { echo "FAIL: $(notdir $<)"; rm -f $@; }
+
 # Pattern rule for ART sources
 $(BUILDDIR)/%.o: $(ART)/%.cc
 	@mkdir -p $(dir $@)
