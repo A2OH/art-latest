@@ -2420,6 +2420,164 @@ bool Runtime::Start() {
     if (self->IsExceptionPending()) self->ClearException();
   }
 
+  // PF-arch-018: Patch android.os.SystemClock natives directly. OHBridge
+  // JNI_OnLoad RegisterNatives is observed to "succeed" (return 0) but the
+  // bindings are NOT honored by the JVM — likely due to class identity or
+  // boot image fixup. Patching the ArtMethod entry directly (same mechanism
+  // as PathClassLoader.toString) bypasses RegisterNatives entirely.
+  {
+    ScopedObjectAccess soa(self);
+    ObjPtr<mirror::Class> sc_class = class_linker_->FindSystemClass(self, "Landroid/os/SystemClock;");
+    if (sc_class != nullptr) {
+      struct NativePatch {
+        const char* name;
+        const char* sig;
+        const void* fn;
+      };
+      static auto sc_uptimeMillis = +[](JNIEnv*, jclass) -> jlong {
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        return (jlong)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+      };
+      static auto sc_elapsedRealtime = sc_uptimeMillis;  // same value
+      static auto sc_uptimeNanos = +[](JNIEnv*, jclass) -> jlong {
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        return (jlong)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+      };
+      static auto sc_elapsedRealtimeNanos = sc_uptimeNanos;
+      static auto sc_currentTimeMicro = +[](JNIEnv*, jclass) -> jlong {
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        return (jlong)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+      };
+      static auto sc_currentThreadTimeMicro = sc_currentTimeMicro;
+      const NativePatch methods[] = {
+          {"elapsedRealtime", "()J", reinterpret_cast<const void*>(+sc_elapsedRealtime)},
+          {"uptimeMillis", "()J", reinterpret_cast<const void*>(+sc_uptimeMillis)},
+          {"uptimeNanos", "()J", reinterpret_cast<const void*>(+sc_uptimeNanos)},
+          {"elapsedRealtimeNanos", "()J", reinterpret_cast<const void*>(+sc_elapsedRealtimeNanos)},
+          {"currentTimeMicro", "()J", reinterpret_cast<const void*>(+sc_currentTimeMicro)},
+          {"currentThreadTimeMicro", "()J", reinterpret_cast<const void*>(+sc_currentThreadTimeMicro)},
+      };
+      for (const NativePatch& patch : methods) {
+        ArtMethod* method = sc_class->FindClassMethod(
+            patch.name, patch.sig, class_linker_->GetImagePointerSize());
+        if (method != nullptr) {
+          std::string label = std::string("SystemClock.") + patch.name + patch.sig;
+          patch_runtime_native_method(method, patch.fn, /*extra_flags=*/0u, label.c_str());
+        } else {
+          fprintf(stderr, "[PF-arch-018] SystemClock.%s%s NOT FOUND\n", patch.name, patch.sig);
+        }
+      }
+      fprintf(stderr, "[PF-arch-018] SystemClock natives patched\n");
+    }
+    if (self->IsExceptionPending()) self->ClearException();
+  }
+
+  // PF-arch-018b: Same pattern for android.os.Trace.
+  {
+    ScopedObjectAccess soa(self);
+    ObjPtr<mirror::Class> tr_class = class_linker_->FindSystemClass(self, "Landroid/os/Trace;");
+    if (tr_class != nullptr) {
+      struct NativePatch { const char* name; const char* sig; const void* fn; };
+      static auto tr_isTagEnabled = +[](JNIEnv*, jclass, jlong) -> jboolean { return JNI_FALSE; };
+      static auto tr_traceBegin = +[](JNIEnv*, jclass, jlong, jstring) {};
+      static auto tr_traceEnd = +[](JNIEnv*, jclass, jlong) {};
+      static auto tr_asyncBegin = +[](JNIEnv*, jclass, jlong, jstring, jint) {};
+      static auto tr_asyncEnd = +[](JNIEnv*, jclass, jlong, jstring, jint) {};
+      static auto tr_getEnabledTags = +[](JNIEnv*, jclass) -> jlong { return 0; };
+      static auto tr_setAppTracingAllowed = +[](JNIEnv*, jclass, jboolean) {};
+      static auto tr_traceCounter = +[](JNIEnv*, jclass, jlong, jstring, jint) {};
+      static auto tr_setTracingEnabled = +[](JNIEnv*, jclass, jboolean, jstring) {};
+      const NativePatch methods[] = {
+          {"nativeIsTagEnabled", "(J)Z", reinterpret_cast<const void*>(+tr_isTagEnabled)},
+          {"nativeTraceBegin", "(JLjava/lang/String;)V", reinterpret_cast<const void*>(+tr_traceBegin)},
+          {"nativeTraceEnd", "(J)V", reinterpret_cast<const void*>(+tr_traceEnd)},
+          {"nativeAsyncTraceBegin", "(JLjava/lang/String;I)V", reinterpret_cast<const void*>(+tr_asyncBegin)},
+          {"nativeAsyncTraceEnd", "(JLjava/lang/String;I)V", reinterpret_cast<const void*>(+tr_asyncEnd)},
+          {"nativeGetEnabledTags", "()J", reinterpret_cast<const void*>(+tr_getEnabledTags)},
+          {"nativeSetAppTracingAllowed", "(Z)V", reinterpret_cast<const void*>(+tr_setAppTracingAllowed)},
+          {"nativeTraceCounter", "(JLjava/lang/String;I)V", reinterpret_cast<const void*>(+tr_traceCounter)},
+          {"nativeSetTracingEnabled", "(ZLjava/lang/String;)V", reinterpret_cast<const void*>(+tr_setTracingEnabled)},
+      };
+      int patched = 0;
+      for (const NativePatch& patch : methods) {
+        ArtMethod* method = tr_class->FindClassMethod(
+            patch.name, patch.sig, class_linker_->GetImagePointerSize());
+        if (method != nullptr) {
+          std::string label = std::string("Trace.") + patch.name + patch.sig;
+          patch_runtime_native_method(method, patch.fn, /*extra_flags=*/0u, label.c_str());
+          patched++;
+        }
+      }
+      fprintf(stderr, "[PF-arch-018b] Trace natives patched (%d)\n", patched);
+    }
+    if (self->IsExceptionPending()) self->ClearException();
+  }
+
+  // PF-arch-018c: android.content.res.XmlBlock — same pattern.
+  {
+    ScopedObjectAccess soa(self);
+    ObjPtr<mirror::Class> xb_class = class_linker_->FindSystemClass(self, "Landroid/content/res/XmlBlock;");
+    if (xb_class != nullptr) {
+      struct NativePatch { const char* name; const char* sig; const void* fn; };
+      static auto xb_nativeGetStringBlock = +[](JNIEnv*, jclass, jlong) -> jlong { return (jlong)(intptr_t)calloc(1, 64); };
+      static auto xb_nativeCreate = +[](JNIEnv* e, jclass, jbyteArray, jint, jint) -> jlong { return (jlong)(intptr_t)calloc(1, 64); };
+      static auto xb_nativeCreateParseState = +[](JNIEnv*, jclass, jlong, jint) -> jlong { return (jlong)(intptr_t)calloc(1, 64); };
+      static auto xb_nativeNext = +[](JNIEnv*, jclass, jlong) -> jint { return 1; /* END_DOCUMENT */ };
+      static auto xb_nativeGetNamespace = +[](JNIEnv*, jclass, jlong) -> jint { return -1; };
+      static auto xb_nativeGetName = +[](JNIEnv*, jclass, jlong) -> jint { return -1; };
+      static auto xb_nativeGetText = +[](JNIEnv*, jclass, jlong) -> jint { return -1; };
+      static auto xb_nativeGetLineNumber = +[](JNIEnv*, jclass, jlong) -> jint { return 0; };
+      static auto xb_nativeGetAttributeCount = +[](JNIEnv*, jclass, jlong) -> jint { return 0; };
+      static auto xb_nativeGetAttributeNamespace = +[](JNIEnv*, jclass, jlong, jint) -> jint { return -1; };
+      static auto xb_nativeGetAttributeName = +[](JNIEnv*, jclass, jlong, jint) -> jint { return -1; };
+      static auto xb_nativeGetAttributeResource = +[](JNIEnv*, jclass, jlong, jint) -> jint { return 0; };
+      static auto xb_nativeGetAttributeDataType = +[](JNIEnv*, jclass, jlong, jint) -> jint { return 0; };
+      static auto xb_nativeGetAttributeData = +[](JNIEnv*, jclass, jlong, jint) -> jint { return 0; };
+      static auto xb_nativeGetAttributeStringValue = +[](JNIEnv*, jclass, jlong, jint) -> jint { return -1; };
+      static auto xb_nativeGetIdAttribute = +[](JNIEnv*, jclass, jlong) -> jint { return -1; };
+      static auto xb_nativeGetClassAttribute = +[](JNIEnv*, jclass, jlong) -> jint { return -1; };
+      static auto xb_nativeGetStyleAttribute = +[](JNIEnv*, jclass, jlong) -> jint { return 0; };
+      static auto xb_nativeGetAttributeIndex = +[](JNIEnv*, jclass, jlong, jstring, jstring) -> jint { return -1; };
+      static auto xb_nativeDestroy = +[](JNIEnv*, jclass, jlong) {};
+      static auto xb_nativeDestroyParseState = +[](JNIEnv*, jclass, jlong) {};
+      const NativePatch methods[] = {
+          {"nativeGetStringBlock", "(J)J", reinterpret_cast<const void*>(+xb_nativeGetStringBlock)},
+          {"nativeCreate", "([BII)J", reinterpret_cast<const void*>(+xb_nativeCreate)},
+          {"nativeCreateParseState", "(JI)J", reinterpret_cast<const void*>(+xb_nativeCreateParseState)},
+          {"nativeNext", "(J)I", reinterpret_cast<const void*>(+xb_nativeNext)},
+          {"nativeGetNamespace", "(J)I", reinterpret_cast<const void*>(+xb_nativeGetNamespace)},
+          {"nativeGetName", "(J)I", reinterpret_cast<const void*>(+xb_nativeGetName)},
+          {"nativeGetText", "(J)I", reinterpret_cast<const void*>(+xb_nativeGetText)},
+          {"nativeGetLineNumber", "(J)I", reinterpret_cast<const void*>(+xb_nativeGetLineNumber)},
+          {"nativeGetAttributeCount", "(J)I", reinterpret_cast<const void*>(+xb_nativeGetAttributeCount)},
+          {"nativeGetAttributeNamespace", "(JI)I", reinterpret_cast<const void*>(+xb_nativeGetAttributeNamespace)},
+          {"nativeGetAttributeName", "(JI)I", reinterpret_cast<const void*>(+xb_nativeGetAttributeName)},
+          {"nativeGetAttributeResource", "(JI)I", reinterpret_cast<const void*>(+xb_nativeGetAttributeResource)},
+          {"nativeGetAttributeDataType", "(JI)I", reinterpret_cast<const void*>(+xb_nativeGetAttributeDataType)},
+          {"nativeGetAttributeData", "(JI)I", reinterpret_cast<const void*>(+xb_nativeGetAttributeData)},
+          {"nativeGetAttributeStringValue", "(JI)I", reinterpret_cast<const void*>(+xb_nativeGetAttributeStringValue)},
+          {"nativeGetIdAttribute", "(J)I", reinterpret_cast<const void*>(+xb_nativeGetIdAttribute)},
+          {"nativeGetClassAttribute", "(J)I", reinterpret_cast<const void*>(+xb_nativeGetClassAttribute)},
+          {"nativeGetStyleAttribute", "(J)I", reinterpret_cast<const void*>(+xb_nativeGetStyleAttribute)},
+          {"nativeGetAttributeIndex", "(JLjava/lang/String;Ljava/lang/String;)I", reinterpret_cast<const void*>(+xb_nativeGetAttributeIndex)},
+          {"nativeDestroy", "(J)V", reinterpret_cast<const void*>(+xb_nativeDestroy)},
+          {"nativeDestroyParseState", "(J)V", reinterpret_cast<const void*>(+xb_nativeDestroyParseState)},
+      };
+      int patched = 0;
+      for (const NativePatch& patch : methods) {
+        ArtMethod* method = xb_class->FindClassMethod(
+            patch.name, patch.sig, class_linker_->GetImagePointerSize());
+        if (method != nullptr) {
+          std::string label = std::string("XmlBlock.") + patch.name + patch.sig;
+          patch_runtime_native_method(method, patch.fn, /*extra_flags=*/0u, label.c_str());
+          patched++;
+        }
+      }
+      fprintf(stderr, "[PF-arch-018c] XmlBlock natives patched (%d)\n", patched);
+    }
+    if (self->IsExceptionPending()) self->ClearException();
+  }
+
   // PATCH: Route java.io.UnixFileSystem wrappers directly to native stubs.
   // In imageless standalone mode these methods can lose their native flags or
   // trip Blocker/ThreadLocal before reaching the private *0 natives.
@@ -2586,8 +2744,73 @@ bool Runtime::Start() {
   // The current standalone DexPathList path can NPE while formatting that message.
   {
     ScopedObjectAccess soa(self);
+    /* PF-arch-015: When called via art_quick_generic_jni_trampoline from
+     * MiniActivityManager.startActivity, env->functions->NewStringUTF observed
+     * as NULL (br x2 → pc=0 SIGBUS). Use raw struct access with null guards. */
+    /* PF-arch-055 (CR26, 2026-05-13): bypass the env->functions JNI dispatch
+     * entirely.  Empirical evidence from CR13/CR15/CR24:
+     *   - The compiled `cbz x2` zero-only null-check (pre-CR15) admitted the
+     *     kPFCutStaleNativeEntry sentinel 0xfffffffffffffb17 stored at
+     *     fns->NewStringUTF, and `br x2` branched to it → SIGBUS BUS_ADRALN.
+     *   - CR15 widened the guard to also reject the sentinel via `cmn x2,
+     *     #1257; b.eq .ret_null` — this prevented the SIGBUS but the lambda
+     *     then returned null and the discover-harness hung in a downstream
+     *     toString() loop.  CR24 sidestepped the call site entirely.
+     *   - Underlying root cause (CR26 investigation): the writer of the
+     *     sentinel into fns->NewStringUTF is NOT in art-latest source — no
+     *     assignment to 0xfffffffffffffb17 exists anywhere in /home/dspfac/
+     *     aosp-art-15/ or /home/dspfac/art-latest/.  All ART-side references
+     *     to kPFCutStaleNativeEntry are READERS that detect-and-repair stale
+     *     entries already-present in memory.  The sentinel value must be
+     *     ambient — pre-existing in uninitialized heap/stack/JNI tables
+     *     where the discover-harness's class-link footprint happens to
+     *     reach.  Repeated runs show the value at the same `[env, #1336]`
+     *     slot is unstable (CR13 once observed `0x6f6874656d2063` = ASCII
+     *     "c method " — clearly random data).  Therefore env->functions on
+     *     the failing call path is NOT pointing at `gJniNativeInterface`
+     *     (whose static NewStringUTF slot in dalvikvm's .rodata is the
+     *     correct function pointer 0x6a583c, verified by `od -An -tx8 -N16
+     *     -j 0xdab8f8 dalvikvm`) — it is pointing at corrupted/uninitialized
+     *     memory.
+     *
+     * Source-level fix: don't read `env->functions->NewStringUTF` at all.
+     * Use the ART-internal API mirror::String::AllocFromModifiedUtf8 to
+     * allocate the result string directly, then JNIEnvExt::AddLocalReference
+     * to wrap it as a jstring.  Both calls are C++ runtime entry points;
+     * neither traverses the JNINativeInterface vtable, so neither can be
+     * poisoned by a corrupt env->functions pointer.
+     *
+     * This eliminates the JNI-dispatch hazard entirely instead of merely
+     * guarding against one specific bad value, and is what CR13 §6.3 / CR24
+     * §3 recommended as the proper substrate-level fix.
+     */
     static auto loader_to_string = +[](JNIEnv* env, jobject) -> jstring {
-      return env->NewStringUTF("dalvik.system.PathClassLoader[westlake]");
+      // Sanity-check env so a totally-bogus call (e.g. env == nullptr from
+      // an exception-cleared frame) still returns cleanly rather than
+      // segfaulting in JNIEnvExt cast.  We deliberately do NOT read
+      // *env (env->functions) — see PF-arch-055 comment above.
+      if (env == nullptr) {
+        return nullptr;
+      }
+      Thread* self = Thread::Current();
+      if (self == nullptr) {
+        return nullptr;
+      }
+      ScopedObjectAccess soa(self);
+      ObjPtr<mirror::String> result =
+          mirror::String::AllocFromModifiedUtf8(
+              soa.Self(), "dalvik.system.PathClassLoader[westlake]");
+      if (result == nullptr) {
+        if (soa.Self()->IsExceptionPending()) {
+          soa.Self()->ClearException();
+        }
+        return nullptr;
+      }
+      JNIEnvExt* env_ext = down_cast<JNIEnvExt*>(soa.Self()->GetJniEnv());
+      if (env_ext == nullptr) {
+        return nullptr;
+      }
+      return env_ext->AddLocalReference<jstring>(result);
     };
     auto patch_to_string = [&](const char* class_desc) {
       ObjPtr<mirror::Class> klass = class_linker_->FindSystemClass(self, class_desc);
@@ -2789,6 +3012,63 @@ bool Runtime::Start() {
     }
     fprintf(stderr, "[RT] Pre-initialized I/O + Charset classes\n"); fflush(stderr);
 
+    // [ARM64-OHOS 2026-07-08] The force-init above skips <clinit>, so non-final
+    // static ints that <clinit> would set stay 0. Running real clinit here aborts
+    // (notify-without-lock in early daemon init), so set the load-bearing ones
+    // manually. BufferedWriter/BufferedReader.defaultCharBufferSize == 0 →
+    // "Buffer size <= 0" IllegalArgumentException in the PrintStream output path.
+    {
+      // Only classes already force-init'd above (avoid FindSystemClass loading a
+      // NEW class during early init, which can recurse/hang). BufferedWriter is in
+      // the io_classes list; BufferedReader is not and isn't needed for println.
+      struct { const char* cls; const char* field; int val; } int_statics[] = {
+        { "Ljava/io/BufferedWriter;", "defaultCharBufferSize", 8192 },
+        { nullptr, nullptr, 0 }
+      };
+      for (int k = 0; int_statics[k].cls != nullptr; k++) {
+        ObjPtr<mirror::Class> c = class_linker_->FindSystemClass(self, int_statics[k].cls);
+        if (c != nullptr) {
+          ArtField* f = c->FindDeclaredStaticField(int_statics[k].field, "I");
+          if (f != nullptr && f->GetInt(c) == 0) {
+            f->SetInt<false>(c, int_statics[k].val);
+            fprintf(stderr, "[RT] Set %s.%s = %d\n", int_statics[k].cls, int_statics[k].field, int_statics[k].val);
+            fflush(stderr);
+          }
+        }
+        if (self->IsExceptionPending()) self->ClearException();
+      }
+    }
+
+    // [ARM64-OHOS 2026-07-08] Charset is force-marked initialized above WITHOUT
+    // running its <clinit>, so its static `cache2` (a `final HashMap<String,Charset>
+    // = new HashMap<>()`) stays null → `synchronized(cache2)` in Charset.lookup2
+    // NPEs → Charset.forName / System.out.println fail. Running the real <clinit>
+    // here destabilizes early daemon-thread init (notify-without-lock abort), so
+    // instead set cache2 manually to a valid default HashMap (Alloc + loadFactor
+    // = 0.75f, matching HashMap()'s only side effect; table stays null and is
+    // lazily allocated on first put). This is the same manual-static approach the
+    // defaultCharset/UTF_8 setup below uses.
+    {
+      ObjPtr<mirror::Class> charset_cls2 = class_linker_->FindSystemClass(self, "Ljava/nio/charset/Charset;");
+      ObjPtr<mirror::Class> hashmap_cls = class_linker_->FindSystemClass(self, "Ljava/util/HashMap;");
+      if (charset_cls2 != nullptr && hashmap_cls != nullptr) {
+        ArtField* cache2_field = charset_cls2->FindDeclaredStaticField("cache2", "Ljava/util/HashMap;");
+        if (cache2_field != nullptr && cache2_field->GetObject(charset_cls2) == nullptr) {
+          gc::AllocatorType alloc2 = GetHeap()->GetCurrentAllocator();
+          ObjPtr<mirror::Object> map_obj = hashmap_cls->Alloc(self, alloc2);
+          if (map_obj != nullptr) {
+            ArtField* lf = hashmap_cls->FindDeclaredInstanceField("loadFactor", "F");
+            if (lf != nullptr) {
+              lf->SetFloat<false>(map_obj, 0.75f);
+            }
+            cache2_field->SetObject<false>(charset_cls2, map_obj);
+            fprintf(stderr, "[RT] Set Charset.cache2 = new HashMap (manual)\n"); fflush(stderr);
+          }
+        }
+      }
+      if (self->IsExceptionPending()) self->ClearException();
+    }
+
     // Set Charset.defaultCharset to UTF-8 so PrintStream can encode strings
     ObjPtr<mirror::Class> charset_class = class_linker_->FindSystemClass(self, "Ljava/nio/charset/Charset;");
     ObjPtr<mirror::Class> standard_charsets_class =
@@ -2857,6 +3137,14 @@ bool Runtime::Start() {
     if (self->IsExceptionPending()) self->ClearException();
   }
 
+  // [ARM64-OHOS 2026-07-08] NOTE: constructing System.out here (PrintStream ctor
+  // chain via JNI) HANGS during early Runtime::Start (the constructor path
+  // deadlocks before the runtime is fully up — same fragility that had the older
+  // manual-System.out block disabled). It works fine IN-APP, so System.out is
+  // installed lazily from dalvikvm main instead (see dalvikvm.cc InstallSystemOut),
+  // after Runtime::Start completes. The charset (cache2) + buffer-size static fixes
+  // above are what make that in-app construction succeed.
+
   // PATCH: Replace System.addLegacyLocaleSystemProperties() with native no-op.
   // The Java implementation calls getProperty() which returns null strings in imageless
   // mode (InternStrong fails), causing NPE at String.lastIndexOf. Without this fix,
@@ -2902,40 +3190,18 @@ bool Runtime::Start() {
             fflush(stderr);
             return;
           }
-          jclass throwable_cls = env->FindClass("java/lang/Throwable");
-          if (env->ExceptionCheck()) env->ExceptionClear();
-          jclass class_cls = env->FindClass("java/lang/Class");
-          if (env->ExceptionCheck()) env->ExceptionClear();
-          jmethodID get_name = class_cls != nullptr
-              ? env->GetMethodID(class_cls, "getNameNative", "()Ljava/lang/String;")
-              : nullptr;
-          if (env->ExceptionCheck()) { env->ExceptionClear(); get_name = nullptr; }
-          jfieldID msg_field = throwable_cls != nullptr
-              ? env->GetFieldID(throwable_cls, "detailMessage", "Ljava/lang/String;")
-              : nullptr;
-          if (env->ExceptionCheck()) { env->ExceptionClear(); msg_field = nullptr; }
-          jclass exc_cls = env->GetObjectClass(thiz);
-          if (env->ExceptionCheck()) env->ExceptionClear();
-          jstring name_j = (get_name != nullptr && exc_cls != nullptr)
-              ? reinterpret_cast<jstring>(env->CallObjectMethod(exc_cls, get_name))
-              : nullptr;
-          if (env->ExceptionCheck()) { env->ExceptionClear(); name_j = nullptr; }
-          const char* name = name_j != nullptr ? env->GetStringUTFChars(name_j, nullptr) : nullptr;
-          jstring msg_j = msg_field != nullptr
-              ? reinterpret_cast<jstring>(env->GetObjectField(thiz, msg_field))
-              : nullptr;
-          if (env->ExceptionCheck()) { env->ExceptionClear(); msg_j = nullptr; }
-          const char* msg = msg_j != nullptr ? env->GetStringUTFChars(msg_j, nullptr) : nullptr;
-          fprintf(stderr, "[RT] Throwable.printStackTrace -> %s: %s\n",
-                  name != nullptr ? name : "<unknown>",
-                  msg != nullptr ? msg : "<no message>");
+          // 2026-07-09 FORK-SAFE: the exception-introspection JNI calls below
+          // (env->FindClass/GetMethodID/GetFieldID/GetObjectClass/CallObjectMethod/
+          // GetStringUTFChars) CRASH when this native is invoked during
+          // ZygoteHooks.preFork() on a daemon thread being torn down: the thread's
+          // JNIEnv is stale/freed, so env->FindClass("java/lang/Throwable") jumps
+          // through a corrupted function table into freed memory (SIGBUS, pc lands
+          // in the "not runnable" string; Runtime::Start()::$_68+116). printStackTrace
+          // is best-effort diagnostics — do NO JNI calls so it is safe on any thread
+          // state (this was the whole point of the "early-noop" patch).
+          (void)env; (void)thiz;
+          fprintf(stderr, "[RT] Throwable.printStackTrace (fork-safe noop)\n");
           fflush(stderr);
-          if (msg_j != nullptr && msg != nullptr) {
-            env->ReleaseStringUTFChars(msg_j, msg);
-          }
-          if (name_j != nullptr && name != nullptr) {
-            env->ReleaseStringUTFChars(name_j, name);
-          }
         };
         patch_runtime_native_method(print_method,
                                     reinterpret_cast<const void*>(log_throwable),
@@ -3161,64 +3427,114 @@ bool Runtime::Start() {
     // FIRST: dlopen libandroid_runtime.so and register ALL native methods.
     // Must happen BEFORE JNI_OnLoad calls, because JNI_OnLoad_framework triggers
     // class loading that may invoke AssetManager clinit → needs native methods.
+    // PF-arch-004 (2026-05-11): in the static build, dlopen("libandroid_runtime.so")
+    // fails and dlsym(RTLD_DEFAULT) doesn't find C++-mangled symbols in bionic's
+    // stripped static-link symbol table. The register_android_* functions ARE
+    // statically linked in this binary — call them directly via extern
+    // declarations + function-pointer table (no dlsym). This activates the
+    // ~30 method-registration functions that were previously unreachable,
+    // unlocking framework.jar's core class init (MessageQueue / AssetManager /
+    // Surface / Activity / ActivityThread / etc.). Symbol name comes only
+    // from the linker; the table is now purely a name-for-logging.
     {
-      void* librt = dlopen("libandroid_runtime.so", RTLD_NOW | RTLD_GLOBAL);
-      if (librt) {
-        fprintf(stderr, "[RT] dlopen(libandroid_runtime.so) = %p (EARLY)\n", librt); fflush(stderr);
-        typedef int (*RegFn)(JNIEnv*);
-        struct { const char* sym; const char* name; } regs[] = {
-          {"register_android_graphics_classes", "ALL_GRAPHICS"},
-          {"register_android_functions", "ALL_FUNCTIONS"},
-          {"_Z26register_android_os_BinderP7_JNIEnv", "Binder"},
-          {"_ZN7android26register_android_os_ParcelEP7_JNIEnv", "Parcel"},
-          {"_ZN7android36register_android_os_SystemPropertiesEP7_JNIEnv", "SystemProperties"},
-          {"_ZN7android31register_android_os_SystemClockEP7_JNIEnv", "SystemClock"},
-          {"_Z27register_android_os_ProcessP7_JNIEnv", "Process"},
-          {"_ZN7android25register_android_os_TraceEP7_JNIEnv", "Trace"},
-          {"_ZN7android25register_android_os_DebugEP7_JNIEnv", "Debug"},
-          {"_ZN7android32register_android_os_MessageQueueEP7_JNIEnv", "MessageQueue"},
-          {"_ZN7android34register_android_os_ServiceManagerEP7_JNIEnv", "ServiceManager"},
-          {"_ZN7android40register_android_os_ServiceManagerNativeEP7_JNIEnv", "ServiceManagerNative"},
-          {"_ZN7android37register_android_content_AssetManagerEP7_JNIEnv", "AssetManager"},
-          {"_ZN7android38register_android_content_res_ApkAssetsEP7_JNIEnv", "ApkAssets"},
-          {"_ZN7android36register_android_content_StringBlockEP7_JNIEnv", "StringBlock"},
-          {"_ZN7android33register_android_content_XmlBlockEP7_JNIEnv", "XmlBlock"},
-          {"_ZN7android42register_android_content_res_ConfigurationEP7_JNIEnv", "Configuration"},
-          {"_ZN7android29register_android_view_SurfaceEP7_JNIEnv", "Surface"},
-          {"_ZN7android36register_android_view_SurfaceControlEP7_JNIEnv", "SurfaceControl"},
-          {"_ZN7android36register_android_view_SurfaceSessionEP7_JNIEnv", "SurfaceSession"},
-          {"_ZN7android33register_android_view_InputDeviceEP7_JNIEnv", "InputDevice"},
-          {"_ZN7android34register_android_view_InputChannelEP7_JNIEnv", "InputChannel"},
-          {"_ZN7android30register_android_view_KeyEventEP7_JNIEnv", "KeyEvent"},
-          {"_ZN7android33register_android_view_MotionEventEP7_JNIEnv", "MotionEvent"},
-          {"_ZN7android41register_android_view_WindowManagerGlobalEP7_JNIEnv", "WindowManagerGlobal"},
-          {"_ZN7android29register_android_app_ActivityEP7_JNIEnv", "Activity"},
-          {"_ZN7android35register_android_app_ActivityThreadEP7_JNIEnv", "ActivityThread"},
-          {"_ZN7android47register_android_animation_PropertyValuesHolderEP7_JNIEnv", "PropertyValuesHolder"},
-          {"_ZN7android42register_android_database_SQLiteConnectionEP7_JNIEnv", "SQLiteConnection"},
-          {"_ZN7android38register_android_database_CursorWindowEP7_JNIEnv", "CursorWindow"},
-          {"_ZN7android25register_android_util_LogEP7_JNIEnv", "Log"},
-          {nullptr, nullptr}
-        };
-        int registered = 0, failed = 0;
-        for (int i = 0; regs[i].sym; i++) {
-          RegFn fn = (RegFn)dlsym(librt, regs[i].sym);
+      // Forward declarations for the statically-linked register functions.
+      // At function scope C++ disallows `extern "C"` linkage specs, so use
+      // plain `extern` with __asm__ to bind to the exact linker symbol
+      // (which may be C-mangled OR C++-mangled). __attribute__((weak)) lets
+      // the build skip linking if a particular symbol is unavailable.
+      typedef int (*RegFn)(JNIEnv*);
+      extern int register_android_graphics_classes(JNIEnv*) __attribute__((weak)) __asm__("register_android_graphics_classes");
+      extern int register_android_functions(JNIEnv*) __attribute__((weak)) __asm__("register_android_functions");
+      extern int register_android_os_Binder(JNIEnv*) __attribute__((weak)) __asm__("_Z26register_android_os_BinderP7_JNIEnv");
+      extern int register_android_os_Process(JNIEnv*) __attribute__((weak)) __asm__("_Z27register_android_os_ProcessP7_JNIEnv");
+      extern int register_android_os_Parcel(JNIEnv*) __attribute__((weak)) __asm__("_ZN7android26register_android_os_ParcelEP7_JNIEnv");
+      extern int register_android_os_SystemProperties(JNIEnv*) __attribute__((weak)) __asm__("_ZN7android36register_android_os_SystemPropertiesEP7_JNIEnv");
+      extern int register_android_os_SystemClock(JNIEnv*) __attribute__((weak)) __asm__("_ZN7android31register_android_os_SystemClockEP7_JNIEnv");
+      extern int register_android_os_Trace(JNIEnv*) __attribute__((weak)) __asm__("_ZN7android25register_android_os_TraceEP7_JNIEnv");
+      extern int register_android_os_Debug(JNIEnv*) __attribute__((weak)) __asm__("_ZN7android25register_android_os_DebugEP7_JNIEnv");
+      extern int register_android_os_MessageQueue(JNIEnv*) __attribute__((weak)) __asm__("_ZN7android32register_android_os_MessageQueueEP7_JNIEnv");
+      extern int register_android_os_ServiceManager(JNIEnv*) __attribute__((weak)) __asm__("_ZN7android34register_android_os_ServiceManagerEP7_JNIEnv");
+      extern int register_android_os_ServiceManagerNative(JNIEnv*) __attribute__((weak)) __asm__("_ZN7android40register_android_os_ServiceManagerNativeEP7_JNIEnv");
+      extern int register_android_content_AssetManager(JNIEnv*) __attribute__((weak)) __asm__("_ZN7android37register_android_content_AssetManagerEP7_JNIEnv");
+      extern int register_android_content_res_ApkAssets(JNIEnv*) __attribute__((weak)) __asm__("_ZN7android38register_android_content_res_ApkAssetsEP7_JNIEnv");
+      extern int register_android_content_StringBlock(JNIEnv*) __attribute__((weak)) __asm__("_ZN7android36register_android_content_StringBlockEP7_JNIEnv");
+      extern int register_android_content_XmlBlock(JNIEnv*) __attribute__((weak)) __asm__("_ZN7android33register_android_content_XmlBlockEP7_JNIEnv");
+      extern int register_android_content_res_Configuration(JNIEnv*) __attribute__((weak)) __asm__("_ZN7android42register_android_content_res_ConfigurationEP7_JNIEnv");
+      extern int register_android_view_Surface(JNIEnv*) __attribute__((weak)) __asm__("_ZN7android29register_android_view_SurfaceEP7_JNIEnv");
+      extern int register_android_view_SurfaceControl(JNIEnv*) __attribute__((weak)) __asm__("_ZN7android36register_android_view_SurfaceControlEP7_JNIEnv");
+      extern int register_android_view_SurfaceSession(JNIEnv*) __attribute__((weak)) __asm__("_ZN7android36register_android_view_SurfaceSessionEP7_JNIEnv");
+      extern int register_android_view_InputDevice(JNIEnv*) __attribute__((weak)) __asm__("_ZN7android33register_android_view_InputDeviceEP7_JNIEnv");
+      extern int register_android_view_InputChannel(JNIEnv*) __attribute__((weak)) __asm__("_ZN7android34register_android_view_InputChannelEP7_JNIEnv");
+      extern int register_android_view_KeyEvent(JNIEnv*) __attribute__((weak)) __asm__("_ZN7android30register_android_view_KeyEventEP7_JNIEnv");
+      extern int register_android_view_MotionEvent(JNIEnv*) __attribute__((weak)) __asm__("_ZN7android33register_android_view_MotionEventEP7_JNIEnv");
+      extern int register_android_view_WindowManagerGlobal(JNIEnv*) __attribute__((weak)) __asm__("_ZN7android41register_android_view_WindowManagerGlobalEP7_JNIEnv");
+      extern int register_android_app_Activity(JNIEnv*) __attribute__((weak)) __asm__("_ZN7android29register_android_app_ActivityEP7_JNIEnv");
+      extern int register_android_app_ActivityThread(JNIEnv*) __attribute__((weak)) __asm__("_ZN7android35register_android_app_ActivityThreadEP7_JNIEnv");
+      extern int register_android_animation_PropertyValuesHolder(JNIEnv*) __attribute__((weak)) __asm__("_ZN7android47register_android_animation_PropertyValuesHolderEP7_JNIEnv");
+      extern int register_android_database_SQLiteConnection(JNIEnv*) __attribute__((weak)) __asm__("_ZN7android42register_android_database_SQLiteConnectionEP7_JNIEnv");
+      extern int register_android_database_CursorWindow(JNIEnv*) __attribute__((weak)) __asm__("_ZN7android38register_android_database_CursorWindowEP7_JNIEnv");
+      extern int register_android_util_Log(JNIEnv*) __attribute__((weak)) __asm__("_ZN7android25register_android_util_LogEP7_JNIEnv");
+
+      struct { RegFn fn; const char* name; } regs[] = {
+        {register_android_graphics_classes,        "ALL_GRAPHICS"},
+        {register_android_functions,               "ALL_FUNCTIONS"},
+        {register_android_os_Binder,               "Binder"},
+        {register_android_os_Process,              "Process"},
+        {register_android_os_Parcel,               "Parcel"},
+        {register_android_os_SystemProperties,     "SystemProperties"},
+        {register_android_os_SystemClock,          "SystemClock"},
+        {register_android_os_Trace,                "Trace"},
+        {register_android_os_Debug,                "Debug"},
+        {register_android_os_MessageQueue,         "MessageQueue"},
+        {register_android_os_ServiceManager,       "ServiceManager"},
+        {register_android_os_ServiceManagerNative, "ServiceManagerNative"},
+        {register_android_content_AssetManager,    "AssetManager"},
+        {register_android_content_res_ApkAssets,   "ApkAssets"},
+        {register_android_content_StringBlock,     "StringBlock"},
+        {register_android_content_XmlBlock,        "XmlBlock"},
+        {register_android_content_res_Configuration, "Configuration"},
+        {register_android_view_Surface,            "Surface"},
+        {register_android_view_SurfaceControl,     "SurfaceControl"},
+        {register_android_view_SurfaceSession,     "SurfaceSession"},
+        {register_android_view_InputDevice,        "InputDevice"},
+        {register_android_view_InputChannel,       "InputChannel"},
+        {register_android_view_KeyEvent,           "KeyEvent"},
+        {register_android_view_MotionEvent,        "MotionEvent"},
+        {register_android_view_WindowManagerGlobal, "WindowManagerGlobal"},
+        {register_android_app_Activity,            "Activity"},
+        {register_android_app_ActivityThread,      "ActivityThread"},
+        {register_android_animation_PropertyValuesHolder, "PropertyValuesHolder"},
+        {register_android_database_SQLiteConnection, "SQLiteConnection"},
+        {register_android_database_CursorWindow,   "CursorWindow"},
+        {register_android_util_Log,                "Log"},
+        {nullptr, nullptr}
+      };
+
+      fprintf(stderr, "[RT] PF-arch-004: direct-extern register-table (no dlsym)\n"); fflush(stderr);
+      {
+        int registered = 0, failed = 0, missing = 0;
+        for (int i = 0; regs[i].name; i++) {
+          RegFn fn = regs[i].fn;
           if (fn) {
             jni_env->PushLocalFrame(128);
             int rc = fn(jni_env);
             jni_env->PopLocalFrame(nullptr);
             if (self->IsExceptionPending()) self->ClearException();
-            if (rc == 0) registered++;
+            if (rc == 0) { registered++; }
             else { fprintf(stderr, "[RT]   WARN: %s returned %d\n", regs[i].name, rc); failed++; }
-          } else { failed++; }
+          } else {
+            missing++;
+            fprintf(stderr, "[RT]   missing: %s (weak symbol not linked)\n", regs[i].name);
+          }
         }
-        fprintf(stderr, "[RT] libandroid_runtime EARLY: %d/%d registrations OK\n",
-                registered, registered + failed);
-        fflush(stderr);
-      } else {
-        fprintf(stderr, "[RT] dlopen(libandroid_runtime.so) failed: %s (expected in static)\n", dlerror());
+        fprintf(stderr, "[RT] libandroid_runtime EARLY: %d/%d registrations OK (missing=%d)\n",
+                registered, registered + failed, missing);
         fflush(stderr);
       }
+      // (PF-arch-004) The librt-failure else-branch is unreachable now because
+      // we always have a non-null pseudo-handle (RTLD_DEFAULT). Keep the
+      // structural close-brace below balanced with the outer `{` at the start
+      // of this dlopen/registration block.
     }
     if (self->IsExceptionPending()) self->ClearException();
 
@@ -3756,7 +4072,16 @@ void Runtime::InitializeApexVersions() {
 }
 
 void Runtime::ReloadAllFlags(const std::string& caller) {
+  // 2026-07-09: suppress the verbose flag DUMP here. With -verbose:startup this
+  // fires on every ZygoteHooks_nativePostForkChild and the DumpFlags loop
+  // (libartbase/base/flags.h:117) SPINS in the forked child (single-thread,
+  // state R, log halts mid-dump) so the child never reaches launchActivityThread.
+  // The flag Reload() itself is kept; only the spinning dump is skipped by
+  // clearing gLogVerbosity.startup across the call.
+  bool saved_startup = gLogVerbosity.startup;
+  gLogVerbosity.startup = false;
   FlagBase::ReloadAllFlags(caller);
+  gLogVerbosity.startup = saved_startup;
 }
 
 static std::vector<File> FileFdsToFileObjects(std::vector<int>&& fds) {
